@@ -1,0 +1,28 @@
+[package]
+name = "dm8-export-tauri"
+version = "0.1.0"
+description = "Tauri shell for DM8 Export Tool"
+authors = ["DM8 Export Maintainers"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "1", features = [] }
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "1", features = ["dialog-message"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+dirs = "5"
+dm8-export-backend = { path = "../backend" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = { version = "0.52", default-features = false }
+
+[features]
+default = []
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = "s"
