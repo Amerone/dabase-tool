@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Form, Checkbox, InputNumber, Space, message, Progress, Typography, Row, Col } from 'antd'
+import { Form, Checkbox, Input, InputNumber, Space, message, Progress, Typography, Row, Col } from 'antd'
 import { ClockCircleOutlined, FileTextOutlined, DatabaseOutlined, RocketOutlined } from '@ant-design/icons'
 import { animate } from 'animejs'
 import type { ExportRequest } from '@/types'
@@ -51,6 +51,14 @@ export default function ExportConfig() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loading])
 
+  useEffect(() => {
+    if (config) {
+      form.setFieldsValue({
+        export_schema: config.export_schema ?? config.schema,
+      })
+    }
+  }, [config, form])
+
   const formatTime = (ms: number) => {
     const totalSeconds = Math.floor(ms / 1000)
     const m = Math.floor(totalSeconds / 60)
@@ -73,6 +81,7 @@ export default function ExportConfig() {
 
       const request: ExportRequest = {
         config,
+        export_schema: values.export_schema?.trim() || undefined,
         tables: selectedTables,
         include_ddl: values.include_ddl,
         include_data: values.include_data,
@@ -158,6 +167,13 @@ export default function ExportConfig() {
             min={100} max={10000} step={100} 
             style={{ width: '100%', fontFamily: 'JetBrains Mono' }} 
           />
+        </Form.Item>
+
+        <Form.Item
+          label={<span style={{ fontFamily: 'JetBrains Mono' }}>导出模式 (EXPORT SCHEMA)</span>}
+          name="export_schema"
+        >
+          <Input placeholder="留空默认同 SCHEMA" style={{ width: '100%', fontFamily: 'JetBrains Mono' }} />
         </Form.Item>
 
         <Form.Item>
