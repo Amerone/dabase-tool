@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Form, Checkbox, Input, InputNumber, Space, message, Progress, Typography, Row, Col } from 'antd'
+import { Form, Checkbox, Input, InputNumber, Space, message, Progress, Typography, Row, Col, Select } from 'antd'
 import { ClockCircleOutlined, FileTextOutlined, DatabaseOutlined, RocketOutlined } from '@ant-design/icons'
 import { animate } from 'animejs'
 import type { ExportRequest } from '@/types'
@@ -87,6 +87,7 @@ export default function ExportConfig() {
       const request: ExportRequest = {
         config,
         export_schema: values.export_schema?.trim() || undefined,
+        export_compat: values.export_compat,
         tables: selectedTables,
         include_ddl: values.include_ddl,
         include_data: values.include_data,
@@ -241,6 +242,21 @@ export default function ExportConfig() {
           <InputNumber 
             min={100} max={10000} step={100} 
             style={{ width: '100%', fontFamily: 'JetBrains Mono' }} 
+          />
+        </Form.Item>
+
+        <Form.Item
+          label={<span style={{ fontFamily: 'JetBrains Mono' }}>导出兼容模式</span>}
+          name="export_compat"
+          rules={[{ required: true, message: '请选择导出兼容模式' }]}
+        >
+          <Select
+            placeholder="请选择导出兼容模式"
+            style={{ width: '100%', fontFamily: 'JetBrains Mono' }}
+            options={[
+              { value: 'datagrip', label: 'DataGrip (END; 不含 /)' },
+              { value: 'script', label: 'DBeaver/SQLark (END; + /)' },
+            ]}
           />
         </Form.Item>
 
