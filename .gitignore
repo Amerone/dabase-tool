@@ -41,3 +41,6 @@ exports/
 
 # Debian packages
 *.deb
+
+# Git worktrees
+.worktrees/
