@@ -87,6 +87,7 @@ export interface TriggerDefinition {
 export interface ExportRequest {
   config: ConnectionConfig;
   export_schema?: string;
+  export_compat?: string;
   tables: string[];
   include_ddl: boolean;
   include_data: boolean;

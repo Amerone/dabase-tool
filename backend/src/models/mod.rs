@@ -102,6 +102,7 @@ pub struct Index {
 pub struct ExportRequest {
     pub config: ConnectionConfig,
     pub export_schema: Option<String>,
+    pub export_compat: Option<String>,
     pub tables: Vec<String>,
     pub include_ddl: bool,
     pub include_data: bool,

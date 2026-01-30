@@ -385,6 +385,7 @@ pub fn export_schema_ddl(
     tables: &[String],
     output_path: &Path,
     drop_existing: bool,
+    trigger_terminator: TriggerTerminator,
 ) -> Result<()> {
     let source_schema = source_schema.to_uppercase();
     let target_schema = target_schema.to_uppercase();
@@ -513,7 +514,7 @@ pub fn export_schema_ddl(
         trig_stmts.extend(generate_triggers(
             &target_schema,
             &render_table.triggers,
-            TriggerTerminator::DataGrip,
+            trigger_terminator,
         ));
     }
     if !trig_stmts.is_empty() {

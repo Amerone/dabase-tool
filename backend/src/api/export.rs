@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use crate::{
     db::connection::ConnectionPool,
-    export::{data::export_schema_data, ddl::export_schema_ddl},
+    export::data::export_schema_data,
+    export::ddl::{export_schema_ddl, TriggerTerminator},
     models::{ApiResponse, ConnectionConfig, ExportRequest, ExportResponse},
 };
 
@@ -17,6 +18,14 @@ fn normalize_schema_value(value: Option<&str>) -> Option<String> {
 
 fn resolve_target_schema(source: &str, export_schema: Option<&str>) -> String {
     normalize_schema_value(export_schema).unwrap_or_else(|| source.trim().to_string())
+}
+
+fn resolve_compat(value: Option<&str>) -> TriggerTerminator {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(mode) if mode.eq_ignore_ascii_case("script") => TriggerTerminator::Script,
+        Some(mode) if mode.eq_ignore_ascii_case("datagrip") => TriggerTerminator::DataGrip,
+        _ => TriggerTerminator::DataGrip,
+    }
 }
 
 fn format_export_filename(source: &str, target: &str, kind: &str, suffix: &str) -> String {
@@ -35,7 +44,8 @@ fn format_error_chain(err: &anyhow::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_error_chain, format_export_filename, resolve_target_schema};
+    use super::{format_error_chain, format_export_filename, resolve_compat, resolve_target_schema};
+    use crate::export::ddl::TriggerTerminator;
 
     #[test]
     fn resolve_target_schema_falls_back_to_source() {
@@ -64,6 +74,12 @@ mod tests {
         assert!(rendered.contains("top context"));
         assert!(rendered.contains("middle context"));
         assert!(rendered.contains("root cause"));
+    }
+
+    #[test]
+    fn resolve_compat_defaults_to_datagrip() {
+        let mode = resolve_compat(None);
+        assert_eq!(mode, TriggerTerminator::DataGrip);
     }
 }
 
@@ -121,6 +137,7 @@ pub async fn export_ddl(
         &req.tables,
         &output_path,
         req.drop_existing,
+        resolve_compat(req.export_compat.as_deref()),
     ) {
         Ok(_) => Ok(Json(ApiResponse::success(ExportResponse {
             success: true,
