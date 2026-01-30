@@ -130,11 +130,13 @@ pub fn generate_indexes(table: &TableDetails) -> Vec<String> {
 
 pub fn export_schema_ddl(
     connection: &Connection<'_>,
-    schema: &str,
+    source_schema: &str,
+    target_schema: &str,
     tables: &[String],
     output_path: &Path,
 ) -> Result<()> {
-    let schema = schema.to_uppercase();
+    let source_schema = source_schema.to_uppercase();
+    let target_schema = target_schema.to_uppercase();
 
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
@@ -152,12 +154,12 @@ pub fn export_schema_ddl(
 
     for (i, table_name) in tables.iter().enumerate() {
         let table_details =
-            get_table_details(connection, &schema, table_name).with_context(|| {
+            get_table_details(connection, &source_schema, table_name).with_context(|| {
                 format!("Failed to fetch table metadata for '{}'", table_name)
             })?;
 
         let mut render_table = table_details.clone();
-        render_table.name = format!("{}.{}", schema, table_details.name);
+        render_table.name = format!("{}.{}", target_schema, table_details.name);
 
         if i > 0 {
             writeln!(writer)?;

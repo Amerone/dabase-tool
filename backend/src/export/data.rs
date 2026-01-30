@@ -11,24 +11,27 @@ use crate::db::schema::get_table_details;
 
 pub fn export_table_data(
     connection: &Connection<'_>,
-    schema: &str,
+    source_schema: &str,
+    target_schema: &str,
     table: &str,
     writer: &mut impl Write,
     batch_size: usize,
 ) -> Result<()> {
-    let schema_upper = schema.to_uppercase();
+    let source_schema_upper = source_schema.to_uppercase();
+    let target_schema_upper = target_schema.to_uppercase();
     let table_upper = table.to_uppercase();
-    let qualified_table = format!("{}.{}", schema_upper, table_upper);
+    let source_qualified_table = format!("{}.{}", source_schema_upper, table_upper);
+    let target_qualified_table = format!("{}.{}", target_schema_upper, table_upper);
 
-    let table_details = get_table_details(connection, &schema_upper, &table_upper)
-        .with_context(|| format!("Failed to get table details for {}", qualified_table))?;
+    let table_details = get_table_details(connection, &source_schema_upper, &table_upper)
+        .with_context(|| format!("Failed to get table details for {}", source_qualified_table))?;
 
-    let query = format!("SELECT * FROM {}", qualified_table);
+    let query = format!("SELECT * FROM {}", source_qualified_table);
 
     let mut cursor = match connection.execute(&query, ())? {
         Some(cursor) => cursor,
         None => {
-            tracing::info!("No data to export for table {}", qualified_table);
+            tracing::info!("No data to export for table {}", source_qualified_table);
             return Ok(());
         }
     };
@@ -63,23 +66,28 @@ pub fn export_table_data(
             row_count += 1;
 
             if batch.len() >= batch_size {
-                write_batch(writer, &qualified_table, &batch)?;
+                write_batch(writer, &target_qualified_table, &batch)?;
                 batch.clear();
             }
         }
     }
 
     if !batch.is_empty() {
-        write_batch(writer, &qualified_table, &batch)?;
+        write_batch(writer, &target_qualified_table, &batch)?;
     }
 
-    tracing::info!("Exported {} rows from {}", row_count, qualified_table);
+    tracing::info!(
+        "Exported {} rows from {}",
+        row_count,
+        source_qualified_table
+    );
     Ok(())
 }
 
 pub fn export_schema_data(
     connection: &Connection<'_>,
-    schema: &str,
+    source_schema: &str,
+    target_schema: &str,
     tables: &[String],
     output_path: &Path,
     batch_size: usize,
@@ -103,9 +111,14 @@ pub fn export_schema_data(
             writeln!(writer)?;
         }
 
-        writeln!(writer, "-- Data for table: {}.{}", schema.to_uppercase(), table_name.to_uppercase())?;
+        writeln!(
+            writer,
+            "-- Data for table: {}.{}",
+            target_schema.to_uppercase(),
+            table_name.to_uppercase()
+        )?;
 
-        export_table_data(connection, schema, table_name, &mut writer, batch_size)
+        export_table_data(connection, source_schema, target_schema, table_name, &mut writer, batch_size)
             .with_context(|| format!("Failed to export data for table '{}'", table_name))?;
     }
 
