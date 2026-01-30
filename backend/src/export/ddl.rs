@@ -15,6 +15,12 @@ use crate::{
     models::{Column, Index, Sequence, TableDetails, TriggerDefinition},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTerminator {
+    DataGrip,
+    Script,
+}
+
 pub fn generate_create_table(table: &TableDetails) -> String {
     let table_ident = quote_identifier(&table.name);
 
@@ -287,7 +293,11 @@ pub fn generate_sequences(schema: &str, sequences: &[Sequence]) -> Vec<String> {
         .collect()
 }
 
-pub fn generate_triggers(schema: &str, triggers: &[TriggerDefinition]) -> Vec<String> {
+pub fn generate_triggers(
+    schema: &str,
+    triggers: &[TriggerDefinition],
+    terminator: TriggerTerminator,
+) -> Vec<String> {
     triggers
         .iter()
         .map(|tr| {
@@ -297,9 +307,7 @@ pub fn generate_triggers(schema: &str, triggers: &[TriggerDefinition]) -> Vec<St
                 || body_upper.starts_with("CREATE OR REPLACE TRIGGER")
             {
                 let mut stmt = normalize_trigger_body(body_trimmed);
-                if !stmt.trim_end().ends_with(';') {
-                    stmt.push(';');
-                }
+                apply_trigger_terminator(&mut stmt, terminator);
                 return stmt;
             }
 
@@ -348,9 +356,26 @@ pub fn generate_triggers(schema: &str, triggers: &[TriggerDefinition]) -> Vec<St
             if !stmt.trim_end().ends_with(';') {
                 stmt.push(';');
             }
+            apply_trigger_terminator(&mut stmt, terminator);
             stmt
         })
         .collect()
+}
+
+fn apply_trigger_terminator(stmt: &mut String, terminator: TriggerTerminator) {
+    if !stmt.trim_end().ends_with(';') {
+        stmt.push(';');
+    }
+
+    if terminator == TriggerTerminator::Script {
+        let trimmed = stmt.trim_end();
+        if !trimmed.ends_with('/') {
+            if !stmt.ends_with('\n') {
+                stmt.push('\n');
+            }
+            stmt.push('/');
+        }
+    }
 }
 
 pub fn export_schema_ddl(
@@ -485,7 +510,11 @@ pub fn export_schema_ddl(
     for table_details in &table_cache {
         let mut render_table = table_details.clone();
         render_table.name = format!("{}.{}", target_schema, table_details.name);
-        trig_stmts.extend(generate_triggers(&target_schema, &render_table.triggers));
+        trig_stmts.extend(generate_triggers(
+            &target_schema,
+            &render_table.triggers,
+            TriggerTerminator::DataGrip,
+        ));
     }
     if !trig_stmts.is_empty() {
         writeln!(writer)?;
@@ -869,7 +898,7 @@ fn normalize_trigger_references(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_foreign_keys, generate_indexes, generate_triggers};
+    use super::{generate_foreign_keys, generate_indexes, generate_triggers, TriggerTerminator};
     use crate::models::{CheckConstraint, ForeignKey, Index, TableDetails, TriggerDefinition, UniqueConstraint};
 
     fn base_table_details(name: &str, indexes: Vec<Index>) -> TableDetails {
@@ -963,7 +992,7 @@ mod tests {
             body: body.to_string(),
         }];
 
-        let statements = generate_triggers("PLATFORM_V3", &triggers);
+        let statements = generate_triggers("PLATFORM_V3", &triggers, TriggerTerminator::DataGrip);
         assert_eq!(statements.len(), 1);
         let stmt = &statements[0].to_uppercase();
         let count = stmt.matches("CREATE OR REPLACE TRIGGER").count();
@@ -1029,7 +1058,7 @@ mod tests {
             body: "WHEN (NEW.ID IS NULL)\nBEGIN\nSELECT SEQ.NEXTVAL INTO :NEW.ID FROM DUAL;\nEND".to_string(),
         }];
 
-        let statements = generate_triggers("PLATFORM", &triggers);
+        let statements = generate_triggers("PLATFORM", &triggers, TriggerTerminator::DataGrip);
         assert_eq!(statements.len(), 1);
         let stmt = &statements[0];
 
@@ -1059,7 +1088,7 @@ mod tests {
             body: "DECLARE\n  v_count NUMBER;\nBEGIN\n  SELECT COUNT(*) INTO v_count FROM DUAL;\nEND".to_string(),
         }];
 
-        let statements = generate_triggers("PLATFORM", &triggers);
+        let statements = generate_triggers("PLATFORM", &triggers, TriggerTerminator::DataGrip);
         assert_eq!(statements.len(), 1);
         let stmt = &statements[0];
 
@@ -1084,7 +1113,7 @@ mod tests {
             body: "WHEN (1=1)\nBEGIN\nNULL;\nEND".to_string(),
         }];
 
-        let statements = generate_triggers("PLATFORM", &triggers);
+        let statements = generate_triggers("PLATFORM", &triggers, TriggerTerminator::DataGrip);
         assert_eq!(statements.len(), 1);
         let stmt = &statements[0];
 
@@ -1092,5 +1121,58 @@ mod tests {
         assert!(!stmt.contains("FOR EACH ROW"));
         // WHEN should remain in body or be ignored
         // (In this case, it stays in body since we don't extract it)
+    }
+
+    #[test]
+    fn generate_triggers_normalizes_new_references_in_body() {
+        let triggers = vec![TriggerDefinition {
+            name: "TRG_NEW_REF".to_string(),
+            table_name: "TEST_TABLE".to_string(),
+            timing: "BEFORE".to_string(),
+            events: vec!["UPDATE".to_string()],
+            each_row: true,
+            body: "BEGIN\nNEW.UPDATE_TIME := SYSDATE\nEND".to_string(),
+        }];
+
+        let statements = generate_triggers("PLATFORM", &triggers, TriggerTerminator::DataGrip);
+        assert_eq!(statements.len(), 1);
+        let stmt = &statements[0];
+        assert!(stmt.contains(":NEW.UPDATE_TIME"));
+    }
+
+    #[test]
+    fn generate_triggers_datagrip_has_no_slash_terminator() {
+        let triggers = vec![TriggerDefinition {
+            name: "TRG_TEST_ID".to_string(),
+            table_name: "TEST_TABLE".to_string(),
+            timing: "BEFORE".to_string(),
+            events: vec!["INSERT".to_string()],
+            each_row: true,
+            body: "BEGIN\n:NEW.ID := 1;\nEND".to_string(),
+        }];
+
+        let statements = generate_triggers("PLATFORM", &triggers, TriggerTerminator::DataGrip);
+        assert_eq!(statements.len(), 1);
+        let stmt = &statements[0];
+        assert!(stmt.trim_end().ends_with(';'));
+        assert!(!stmt.contains("\n/"));
+    }
+
+    #[test]
+    fn generate_triggers_script_adds_slash_terminator() {
+        let triggers = vec![TriggerDefinition {
+            name: "TRG_TEST_ID".to_string(),
+            table_name: "TEST_TABLE".to_string(),
+            timing: "BEFORE".to_string(),
+            events: vec!["INSERT".to_string()],
+            each_row: true,
+            body: "BEGIN\n:NEW.ID := 1;\nEND".to_string(),
+        }];
+
+        let statements = generate_triggers("PLATFORM", &triggers, TriggerTerminator::Script);
+        assert_eq!(statements.len(), 1);
+        let stmt = &statements[0];
+        assert!(stmt.contains("\n/"), "Expected script mode to include '/' terminator");
+        assert!(stmt.trim_end().ends_with('/'));
     }
 }
