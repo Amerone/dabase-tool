@@ -12,7 +12,7 @@ use odbc_api::Connection;
 
 use crate::{
     db::schema::{fetch_sequences, get_table_details},
-    models::{Column, Sequence, TableDetails, TriggerDefinition},
+    models::{Column, Index, Sequence, TableDetails, TriggerDefinition},
 };
 
 pub fn generate_create_table(table: &TableDetails) -> String {
@@ -114,6 +114,8 @@ pub fn generate_indexes(table: &TableDetails) -> Vec<String> {
                 .collect::<Vec<_>>()
                 .join(", ");
 
+            let index_name = normalize_index_name(&table.name, index);
+
             let prefix = if index.unique {
                 "CREATE UNIQUE INDEX"
             } else {
@@ -123,12 +125,43 @@ pub fn generate_indexes(table: &TableDetails) -> Vec<String> {
             Some(format!(
                 "{} {} ON {} ({});",
                 prefix,
-                quote_identifier(&index.name),
+                quote_identifier(&index_name),
                 quote_identifier(&table.name),
                 columns
             ))
         })
         .collect()
+}
+
+fn normalize_index_name(table_name: &str, index: &Index) -> String {
+    let upper = index.name.to_uppercase();
+    let is_plain_index_number = upper.starts_with("INDEX")
+        && upper[5..].chars().all(|c| c.is_ascii_digit());
+
+    if !is_plain_index_number {
+        return index.name.clone();
+    }
+
+    let table_base = table_name
+        .rsplit('.')
+        .next()
+        .unwrap_or(table_name)
+        .to_uppercase();
+    let columns = index
+        .columns
+        .iter()
+        .map(|col| col.to_uppercase())
+        .collect::<Vec<_>>()
+        .join("_");
+    let mut name = format!("IDX_{}_{}", table_base, columns);
+
+    // Keep names at a reasonable length to avoid exceeding identifier limits.
+    const MAX_LEN: usize = 128;
+    if name.len() > MAX_LEN {
+        name.truncate(MAX_LEN);
+    }
+
+    name
 }
 
 pub fn generate_unique_constraints(table: &TableDetails) -> Vec<String> {
@@ -267,8 +300,6 @@ pub fn generate_triggers(schema: &str, triggers: &[TriggerDefinition]) -> Vec<St
                 if !stmt.trim_end().ends_with(';') {
                     stmt.push(';');
                 }
-                // Add DM8 trigger terminator
-                stmt.push_str("\n/");
                 return stmt;
             }
 
@@ -289,15 +320,20 @@ pub fn generate_triggers(schema: &str, triggers: &[TriggerDefinition]) -> Vec<St
                 quote_identifier(&format!("{}.{}", schema, tr.table_name))
             );
             if tr.each_row {
+                stmt.push_str(" REFERENCING OLD AS OLD NEW AS NEW");
+            }
+            if tr.each_row {
                 stmt.push_str("\nFOR EACH ROW");
             }
 
             // Add WHEN clause after FOR EACH ROW if present
+            let when_clause = normalize_trigger_references(&when_clause);
             if !when_clause.is_empty() {
                 stmt.push_str(&format!("\nWHEN ({})", when_clause));
             }
 
             stmt.push('\n');
+            let body_without_when = normalize_trigger_references(&body_without_when);
             let normalized_body = normalize_trigger_body(&body_without_when);
             let body_start_upper = normalized_body.trim_start().to_uppercase();
 
@@ -312,8 +348,6 @@ pub fn generate_triggers(schema: &str, triggers: &[TriggerDefinition]) -> Vec<St
             if !stmt.trim_end().ends_with(';') {
                 stmt.push(';');
             }
-            // Add DM8 trigger terminator - required for SQL clients to recognize end of trigger
-            stmt.push_str("\n/");
             stmt
         })
         .collect()
@@ -799,6 +833,40 @@ fn normalize_trigger_body(body: &str) -> String {
     lines.join("\n")
 }
 
+fn normalize_trigger_references(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len() + 8);
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if i + 4 <= bytes.len() {
+            let b0 = bytes[i].to_ascii_uppercase();
+            let b1 = bytes[i + 1].to_ascii_uppercase();
+            let b2 = bytes[i + 2].to_ascii_uppercase();
+            let b3 = bytes[i + 3];
+
+            let is_new = b0 == b'N' && b1 == b'E' && b2 == b'W' && b3 == b'.';
+            let is_old = b0 == b'O' && b1 == b'L' && b2 == b'D' && b3 == b'.';
+
+            if is_new || is_old {
+                let prev = if i == 0 { None } else { Some(bytes[i - 1]) };
+                let prev_is_word = prev.map_or(false, |c| c.is_ascii_alphanumeric() || c == b'_');
+                let prev_is_colon = prev == Some(b':');
+                if !prev_is_word && !prev_is_colon {
+                    out.push_str(if is_new { ":NEW." } else { ":OLD." });
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{generate_foreign_keys, generate_indexes, generate_triggers};
@@ -836,8 +904,8 @@ mod tests {
         let statements = generate_indexes(&table);
         assert_eq!(statements.len(), 1);
         let stmt = &statements[0];
-        assert!(stmt.contains("CREATE INDEX \"INDEX33561145\""));
-        assert!(!stmt.contains("\"PLATFORM_V3\".\"INDEX33561145\""));
+        assert!(stmt.contains("CREATE INDEX \"IDX_QRTZ_BLOB_TRIGGERS_SCHED_NAME_TRIGGER_NAME_TRIGGER_GROUP\""));
+        assert!(!stmt.contains("\"PLATFORM_V3\".\"IDX_QRTZ_BLOB_TRIGGERS_SCHED_NAME_TRIGGER_NAME_TRIGGER_GROUP\""));
     }
 
     #[test]
@@ -971,10 +1039,13 @@ mod tests {
         assert!(for_each_row_pos < when_pos, "FOR EACH ROW should come before WHEN");
 
         // Verify WHEN clause content
-        assert!(stmt.contains("WHEN (NEW.ID IS NULL)"));
+        assert!(stmt.contains("WHEN (:NEW.ID IS NULL)"));
 
-        // Verify DM8 trigger terminator
-        assert!(stmt.trim_end().ends_with('/'), "Trigger should end with / terminator");
+        // Verify referencing clause
+        assert!(stmt.contains("REFERENCING OLD AS OLD NEW AS NEW"));
+
+        // Verify trigger terminator
+        assert!(stmt.trim_end().ends_with(';'), "Trigger should end with ';'");
     }
 
     #[test]
