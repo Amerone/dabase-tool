@@ -7,6 +7,7 @@ export interface ConnectionConfig {
   username: string;
   password: string;
   schema: string;
+  export_schema?: string;
   source?: ConfigSource;
   updated_at?: string;
 }
@@ -47,6 +48,7 @@ export interface TableDetails {
 
 export interface ExportRequest {
   config: ConnectionConfig;
+  export_schema?: string;
   tables: string[];
   include_ddl: boolean;
   include_data: boolean;

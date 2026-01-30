@@ -24,6 +24,11 @@ export default function ConnectionForm() {
   const driverInfo = useExportStore((state) => state.driverInfo)
   const setDriverInfo = useExportStore((state) => state.setDriverInfo)
 
+  const normalizeExportSchema = (value?: string) => {
+    const trimmed = value?.trim()
+    return trimmed ? trimmed : undefined
+  }
+
   const handleTest = async () => {
     try {
       const values = await form.validateFields()
@@ -36,6 +41,7 @@ export default function ConnectionForm() {
         username: values.username,
         password: values.password,
         schema: values.schema,
+        export_schema: normalizeExportSchema(values.export_schema),
       }
 
       const result = await testConnection(config)
@@ -100,6 +106,7 @@ export default function ConnectionForm() {
         username: values.username,
         password: values.password,
         schema: values.schema,
+        export_schema: normalizeExportSchema(values.export_schema),
       }
       const result = await saveConnection(payload)
       if (result.success && result.data) {
@@ -171,6 +178,7 @@ export default function ConnectionForm() {
           username: 'SYSDBA',
           password: '',
           schema: 'SYSDBA',
+          export_schema: '',
         }}
         onValuesChange={() => {
           setHasUnsavedChanges(true)
@@ -226,6 +234,13 @@ export default function ConnectionForm() {
           rules={[{ required: true, message: '请输入模式名' }]}
         >
           <Input placeholder="SYSDBA" style={{ fontFamily: 'JetBrains Mono' }} />
+        </Form.Item>
+
+        <Form.Item
+          label={<span style={{ fontFamily: 'JetBrains Mono' }}>导出模式 (EXPORT SCHEMA)</span>}
+          name="export_schema"
+        >
+          <Input placeholder="留空默认同 SCHEMA" style={{ fontFamily: 'JetBrains Mono' }} />
         </Form.Item>
 
         <div style={{ marginTop: 32, display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: 24 }}>
