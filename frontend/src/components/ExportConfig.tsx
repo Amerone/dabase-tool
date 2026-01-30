@@ -4,6 +4,7 @@ import { ClockCircleOutlined, FileTextOutlined, DatabaseOutlined, RocketOutlined
 import { animate } from 'animejs'
 import type { ExportRequest } from '@/types'
 import { exportDDL, exportData } from '@/services/api'
+import { calcProgress } from '@/utils/exportProgress'
 import { useExportStore } from '@/store/useExportStore'
 import { TechCard } from './common/TechCard'
 import { TechButton } from './common/TechButton'
@@ -19,6 +20,8 @@ export default function ExportConfig() {
   const [loading, setLoading] = useState(false)
   const [progress, setProgress] = useState(0)
   const [animatedProgress, setAnimatedProgress] = useState(0)
+  const [progressStatus, setProgressStatus] = useState<'normal' | 'active' | 'success' | 'exception'>('normal')
+  const [hasError, setHasError] = useState(false)
   const [elapsedTime, setElapsedTime] = useState(0)
   const [exportResult, setExportResult] = useState<{ ddl?: string; data?: string } | null>(null)
 
@@ -76,6 +79,8 @@ export default function ExportConfig() {
       const values = await form.validateFields()
       setLoading(true)
       setProgress(0)
+      setProgressStatus('active')
+      setHasError(false)
       setElapsedTime(0)
       setExportResult(null)
 
@@ -86,42 +91,93 @@ export default function ExportConfig() {
         include_ddl: values.include_ddl,
         include_data: values.include_data,
         batch_size: values.batch_size || 1000,
+        drop_existing: values.drop_existing,
+        include_row_counts: values.include_row_counts,
       }
 
       const results: { ddl?: string; data?: string } = {}
+      const totalSteps = (values.include_ddl ? 1 : 0) + (values.include_data ? 1 : 0)
+      let completedSteps = 0
+      let hadError = false
 
       if (values.include_ddl) {
-        setProgress(25)
         const ddlResult = await exportDDL(request)
         if (ddlResult.success && ddlResult.data) {
           results.ddl = ddlResult.data.file_path
           message.success('DDL 已提取')
+          completedSteps += 1
+          const ddlProgress = calcProgress({
+            includeDdl: true,
+            includeData: values.include_data,
+            completedSteps,
+            hasError: false,
+          })
+          setProgress(ddlProgress.percent)
+          setProgressStatus(ddlProgress.status)
         } else {
           message.error(ddlResult.error || 'DDL 提取失败')
+          hadError = true
+          setHasError(true)
+          const ddlProgress = calcProgress({
+            includeDdl: true,
+            includeData: values.include_data,
+            completedSteps,
+            hasError: true,
+          })
+          setProgress(ddlProgress.percent)
+          setProgressStatus(ddlProgress.status)
         }
-        setProgress(50)
       }
 
       if (values.include_data) {
-        setProgress(values.include_ddl ? 50 : 25)
         const dataResult = await exportData(request)
         if (dataResult.success && dataResult.data) {
           results.data = dataResult.data.file_path
           message.success('数据已迁移')
+          completedSteps += 1
+          const dataProgress = calcProgress({
+            includeDdl: values.include_ddl,
+            includeData: true,
+            completedSteps,
+            hasError: false,
+          })
+          setProgress(dataProgress.percent)
+          setProgressStatus(dataProgress.status)
         } else {
           message.error(dataResult.error || '数据迁移失败')
+          hadError = true
+          setHasError(true)
+          const dataProgress = calcProgress({
+            includeDdl: values.include_ddl,
+            includeData: true,
+            completedSteps,
+            hasError: true,
+          })
+          setProgress(dataProgress.percent)
+          setProgressStatus(dataProgress.status)
         }
-        setProgress(100)
       }
 
       if (!values.include_ddl && !values.include_data) {
         message.warning('请选择导出模块')
         setProgress(0)
+        setProgressStatus('normal')
       } else {
-        setExportResult(results)
+        if (!hadError && completedSteps === totalSteps) {
+          setExportResult(results)
+        }
       }
     } catch (error) {
       message.error('严重错误')
+      setHasError(true)
+      const errorProgress = calcProgress({
+        includeDdl: true,
+        includeData: true,
+        completedSteps: 0,
+        hasError: true,
+      })
+      setProgress(errorProgress.percent)
+      setProgressStatus(errorProgress.status)
     } finally {
       setLoading(false)
     }
@@ -138,6 +194,8 @@ export default function ExportConfig() {
           include_ddl: true,
           include_data: true,
           batch_size: 1000,
+          drop_existing: true,
+          include_row_counts: false,
         }}
       >
         <Row gutter={24}>
@@ -154,6 +212,23 @@ export default function ExportConfig() {
               <Checkbox style={{ fontFamily: 'Orbitron', color: '#fff' }}>
                  <DatabaseOutlined style={{ marginRight: 8, color: '#00b96b' }} />
                  提取数据 (INSERT)
+              </Checkbox>
+            </Form.Item>
+          </Col>
+        </Row>
+
+        <Row gutter={24}>
+          <Col span={12}>
+            <Form.Item name="drop_existing" valuePropName="checked">
+              <Checkbox style={{ fontFamily: 'Orbitron', color: '#fff' }}>
+                生成 DROP TABLE IF EXISTS
+              </Checkbox>
+            </Form.Item>
+          </Col>
+          <Col span={12}>
+            <Form.Item name="include_row_counts" valuePropName="checked">
+              <Checkbox style={{ fontFamily: 'Orbitron', color: '#fff' }}>
+                统计行数写入文件头
               </Checkbox>
             </Form.Item>
           </Col>
@@ -201,7 +276,7 @@ export default function ExportConfig() {
                 </div>
                 <Progress 
                   percent={animatedProgress} 
-                  status={loading ? 'active' : (progress === 100 ? 'success' : 'normal')} 
+                  status={loading ? 'active' : progressStatus} 
                   strokeColor={{ '0%': '#108ee9', '100%': '#87d068' }}
                   trailColor="rgba(255,255,255,0.1)"
                 />

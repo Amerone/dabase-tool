@@ -5,9 +5,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use odbc_api::{Connection, Cursor, buffers::TextRowSet};
+use chrono::Local;
+use odbc_api::{buffers::TextRowSet, Connection, Cursor};
 
-use crate::db::schema::get_table_details;
+use crate::db::schema::{fetch_row_count, fetch_sequences, get_table_details};
 
 pub fn export_table_data(
     connection: &Connection<'_>,
@@ -16,23 +17,25 @@ pub fn export_table_data(
     table: &str,
     writer: &mut impl Write,
     batch_size: usize,
-) -> Result<()> {
+) -> Result<usize> {
     let source_schema_upper = source_schema.to_uppercase();
     let target_schema_upper = target_schema.to_uppercase();
     let table_upper = table.to_uppercase();
     let source_qualified_table = format!("{}.{}", source_schema_upper, table_upper);
     let target_qualified_table = format!("{}.{}", target_schema_upper, table_upper);
+    let source_ident = quote_identifier(&source_qualified_table);
+    let target_ident = quote_identifier(&target_qualified_table);
 
     let table_details = get_table_details(connection, &source_schema_upper, &table_upper)
         .with_context(|| format!("Failed to get table details for {}", source_qualified_table))?;
 
-    let query = format!("SELECT * FROM {}", source_qualified_table);
+    let query = format!("SELECT * FROM {}", source_ident);
 
     let mut cursor = match connection.execute(&query, ())? {
         Some(cursor) => cursor,
         None => {
             tracing::info!("No data to export for table {}", source_qualified_table);
-            return Ok(());
+            return Ok(0);
         }
     };
 
@@ -50,13 +53,7 @@ pub fn export_table_data(
 
                 let formatted_value = match value {
                     None => "NULL".to_string(),
-                    Some(v) => {
-                        if is_numeric_type(&column.data_type) {
-                            v.to_string()
-                        } else {
-                            format!("'{}'", escape_single_quotes(v))
-                        }
-                    }
+                    Some(v) => format_literal(&column.data_type, v),
                 };
 
                 values.push(formatted_value);
@@ -66,14 +63,14 @@ pub fn export_table_data(
             row_count += 1;
 
             if batch.len() >= batch_size {
-                write_batch(writer, &target_qualified_table, &batch)?;
+                write_batch(writer, &target_ident, &batch)?;
                 batch.clear();
             }
         }
     }
 
     if !batch.is_empty() {
-        write_batch(writer, &target_qualified_table, &batch)?;
+        write_batch(writer, &target_ident, &batch)?;
     }
 
     tracing::info!(
@@ -81,7 +78,7 @@ pub fn export_table_data(
         row_count,
         source_qualified_table
     );
-    Ok(())
+    Ok(row_count)
 }
 
 pub fn export_schema_data(
@@ -91,7 +88,12 @@ pub fn export_schema_data(
     tables: &[String],
     output_path: &Path,
     batch_size: usize,
-) -> Result<()> {
+    include_row_counts: bool,
+) -> Result<usize> {
+    let source_schema_upper = source_schema.to_uppercase();
+    let target_schema_upper = target_schema.to_uppercase();
+    let sequences = fetch_sequences(connection, &source_schema_upper).unwrap_or_default();
+
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -106,24 +108,107 @@ pub fn export_schema_data(
     })?;
     let mut writer = BufWriter::new(file);
 
-    for (i, table_name) in tables.iter().enumerate() {
+    // Pre-compute row counts for header (optional)
+    let mut total_rows: i64 = 0;
+    let mut table_row_counts = Vec::new();
+    if include_row_counts {
+        for table in tables {
+            match fetch_row_count(connection, &source_schema_upper, table) {
+                Ok(cnt) => {
+                    total_rows += cnt;
+                    table_row_counts.push((table.clone(), Some(cnt)));
+                }
+                Err(_) => table_row_counts.push((table.clone(), None)),
+            }
+        }
+    } else {
+        for table in tables {
+            table_row_counts.push((table.clone(), None));
+        }
+    }
+
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    writeln!(writer, "-- DM8 Data Export")?;
+    writeln!(writer, "-- Tables: {}", tables.len())?;
+    if include_row_counts {
+        writeln!(writer, "-- Rows (estimated): {}", total_rows)?;
+    } else {
+        writeln!(writer, "-- Rows (estimated): skipped (per request)")?;
+    }
+    writeln!(writer, "-- Generated at: {}", timestamp)?;
+    writeln!(writer, "-- Warning: This script truncates tables before inserting data.")?;
+    if !sequences.is_empty() {
+        writeln!(writer, "-- Sequences will be reset to START values before inserts")?;
+    }
+    writeln!(writer)?;
+
+    if !sequences.is_empty() {
+        writeln!(writer, "-- Reset sequences")?;
+        for seq in &sequences {
+            let start = seq.start_with.unwrap_or(1);
+            writeln!(
+                writer,
+                "ALTER SEQUENCE {} RESTART WITH {};",
+                quote_identifier(&format!("{}.{}", target_schema_upper, seq.name)),
+                start
+            )?;
+        }
+        writeln!(writer)?;
+    }
+
+    let mut exported_total: usize = 0;
+
+    for (i, (table_name, expected_rows)) in table_row_counts.iter().enumerate() {
         if i > 0 {
             writeln!(writer)?;
         }
 
         writeln!(
             writer,
-            "-- Data for table: {}.{}",
-            target_schema.to_uppercase(),
-            table_name.to_uppercase()
+            "-- Data for table: {}.{}{}",
+            target_schema_upper,
+            table_name.to_uppercase(),
+            expected_rows
+                .map(|c| format!(" ({} rows)", c))
+                .unwrap_or_else(|| " (rows unknown)".to_string())
         )?;
+        let qualified = quote_identifier(&format!(
+            "{}.{}",
+            target_schema_upper,
+            table_name.to_uppercase()
+        ));
+        writeln!(writer, "TRUNCATE TABLE {};", qualified)?;
 
-        export_table_data(connection, source_schema, target_schema, table_name, &mut writer, batch_size)
-            .with_context(|| format!("Failed to export data for table '{}'", table_name))?;
+        // Reset identity columns if present (read from source, apply to target)
+        if let Ok(details) = get_table_details(connection, &source_schema_upper, table_name) {
+            let identity_cols: Vec<_> = details.columns.iter().filter(|c| c.identity).collect();
+            for col in identity_cols {
+                let start = col.identity_start.unwrap_or(1);
+                writeln!(
+                    writer,
+                    "ALTER TABLE {} ALTER COLUMN {} RESTART WITH {};",
+                    qualified,
+                    quote_identifier(&col.name),
+                    start
+                )?;
+            }
+        }
+
+        let count = export_table_data(
+            connection,
+            &source_schema_upper,
+            &target_schema_upper,
+            table_name,
+            &mut writer,
+            batch_size,
+        )
+        .with_context(|| format!("Failed to export data for table '{}'", table_name))?;
+
+        exported_total += count;
     }
 
     writer.flush().context("Failed to flush data export to disk")?;
-    Ok(())
+    Ok(exported_total)
 }
 
 fn write_batch(writer: &mut impl Write, table: &str, batch: &[String]) -> Result<()> {
@@ -146,4 +231,51 @@ fn is_numeric_type(data_type: &str) -> bool {
 
 fn escape_single_quotes(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    identifier
+        .split('.')
+        .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn is_date_type(dt: &str) -> bool {
+    matches!(dt.to_uppercase().as_str(), "DATE")
+}
+
+fn is_timestamp_type(dt: &str) -> bool {
+    matches!(
+        dt.to_uppercase().as_str(),
+        "TIMESTAMP" | "TIMESTAMP WITH TIME ZONE" | "TIMESTAMP WITH LOCAL TIME ZONE"
+    )
+}
+
+fn is_binary_type(dt: &str) -> bool {
+    matches!(dt.to_uppercase().as_str(), "RAW" | "BINARY" | "VARBINARY" | "BLOB")
+}
+
+fn format_literal(data_type: &str, raw: &str) -> String {
+    let upper = data_type.to_uppercase();
+    if is_numeric_type(&upper) {
+        return raw.to_string();
+    }
+    if is_binary_type(&upper) {
+        let trimmed = raw.trim_start_matches("0x").trim_start_matches("0X");
+        return format!("HEXTORAW('{}')", trimmed);
+    }
+    if is_date_type(&upper) {
+        return format!(
+            "TO_DATE('{}','YYYY-MM-DD HH24:MI:SS')",
+            escape_single_quotes(raw)
+        );
+    }
+    if is_timestamp_type(&upper) {
+        return format!(
+            "TO_TIMESTAMP('{}','YYYY-MM-DD HH24:MI:SS.FF')",
+            escape_single_quotes(raw)
+        );
+    }
+    format!("'{}'", escape_single_quotes(raw))
 }

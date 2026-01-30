@@ -28,8 +28,15 @@ export interface Column {
   name: string;
   data_type: string;
   length?: number;
+  precision?: number;
+  scale?: number;
+  char_semantics?: string;
   nullable: boolean;
   comment?: string;
+  default_value?: string;
+  identity?: boolean;
+  identity_start?: number;
+  identity_increment?: number;
 }
 
 export interface Index {
@@ -44,6 +51,37 @@ export interface TableDetails {
   columns: Column[];
   primary_keys: string[];
   indexes: Index[];
+  unique_constraints: UniqueConstraint[];
+  foreign_keys: ForeignKey[];
+  check_constraints: CheckConstraint[];
+  triggers: TriggerDefinition[];
+}
+
+export interface UniqueConstraint {
+  name: string;
+  columns: string[];
+}
+
+export interface CheckConstraint {
+  name: string;
+  condition: string;
+}
+
+export interface ForeignKey {
+  name: string;
+  columns: string[];
+  referenced_table: string;
+  referenced_columns: string[];
+  delete_rule?: string;
+}
+
+export interface TriggerDefinition {
+  name: string;
+  table_name: string;
+  timing: string;
+  events: string[];
+  each_row: boolean;
+  body: string;
 }
 
 export interface ExportRequest {
@@ -53,6 +91,8 @@ export interface ExportRequest {
   include_ddl: boolean;
   include_data: boolean;
   batch_size?: number;
+  drop_existing?: boolean;
+  include_row_counts?: boolean;
 }
 
 export interface ExportResponse {

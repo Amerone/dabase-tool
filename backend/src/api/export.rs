@@ -1,4 +1,5 @@
 use axum::{extract::Json, http::StatusCode};
+use chrono::Local;
 use std::path::PathBuf;
 
 use crate::{
@@ -18,18 +19,23 @@ fn resolve_target_schema(source: &str, export_schema: Option<&str>) -> String {
     normalize_schema_value(export_schema).unwrap_or_else(|| source.trim().to_string())
 }
 
-fn format_export_filename(source: &str, target: &str, kind: &str) -> String {
+fn format_export_filename(source: &str, target: &str, kind: &str, suffix: &str) -> String {
     format!(
-        "exports/{}_to_{}_{}.sql",
+        "exports/{}_to_{}_{}_{}.sql",
         source.trim(),
         target.trim(),
-        kind
+        kind,
+        suffix
     )
+}
+
+fn format_error_chain(err: &anyhow::Error) -> String {
+    format!("{:#}", err)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_export_filename, resolve_target_schema};
+    use super::{format_error_chain, format_export_filename, resolve_target_schema};
 
     #[test]
     fn resolve_target_schema_falls_back_to_source() {
@@ -45,8 +51,19 @@ mod tests {
 
     #[test]
     fn format_export_filename_includes_source_and_target() {
-        let name = format_export_filename("SRC", "TGT", "ddl");
-        assert_eq!(name, "exports/SRC_to_TGT_ddl.sql");
+        let name = format_export_filename("SRC", "TGT", "ddl", "20260130_120000_000");
+        assert_eq!(name, "exports/SRC_to_TGT_ddl_20260130_120000_000.sql");
+    }
+
+    #[test]
+    fn format_error_chain_includes_contexts() {
+        let err = anyhow::anyhow!("root cause")
+            .context("middle context")
+            .context("top context");
+        let rendered = format_error_chain(&err);
+        assert!(rendered.contains("top context"));
+        assert!(rendered.contains("middle context"));
+        assert!(rendered.contains("root cause"));
     }
 }
 
@@ -89,7 +106,13 @@ pub async fn export_ddl(
             .as_deref()
             .or(req.config.export_schema.as_deref()),
     );
-    let output_path = PathBuf::from(format_export_filename(&source_schema, &target_schema, "ddl"));
+    let date_suffix = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let output_path = PathBuf::from(format_export_filename(
+        &source_schema,
+        &target_schema,
+        "ddl",
+        &date_suffix,
+    ));
 
     match export_schema_ddl(
         &connection,
@@ -97,6 +120,7 @@ pub async fn export_ddl(
         &target_schema,
         &req.tables,
         &output_path,
+        req.drop_existing,
     ) {
         Ok(_) => Ok(Json(ApiResponse::success(ExportResponse {
             success: true,
@@ -105,7 +129,7 @@ pub async fn export_ddl(
         }))),
         Err(e) => Ok(Json(ApiResponse::error(format!(
             "Failed to export DDL: {}",
-            e
+            format_error_chain(&e)
         )))),
     }
 }
@@ -149,7 +173,13 @@ pub async fn export_data(
             .as_deref()
             .or(req.config.export_schema.as_deref()),
     );
-    let output_path = PathBuf::from(format_export_filename(&source_schema, &target_schema, "data"));
+    let date_suffix = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let output_path = PathBuf::from(format_export_filename(
+        &source_schema,
+        &target_schema,
+        "data",
+        &date_suffix,
+    ));
     let batch_size = req.batch_size.unwrap_or(1000);
 
     match export_schema_data(
@@ -159,6 +189,7 @@ pub async fn export_data(
         &req.tables,
         &output_path,
         batch_size,
+        req.include_row_counts,
     ) {
         Ok(_) => Ok(Json(ApiResponse::success(ExportResponse {
             success: true,
@@ -167,7 +198,7 @@ pub async fn export_data(
         }))),
         Err(e) => Ok(Json(ApiResponse::error(format!(
             "Failed to export data: {}",
-            e
+            format_error_chain(&e)
         )))),
     }
 }
