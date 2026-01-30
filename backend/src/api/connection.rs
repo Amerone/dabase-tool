@@ -31,6 +31,7 @@ pub async fn test_connection(
         username: req.username,
         password: req.password,
         schema: req.schema,
+        export_schema: None,
     };
 
     match ConnectionPool::new(config) {

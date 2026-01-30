@@ -16,6 +16,7 @@ pub async fn export_ddl(
         username: req.config.username,
         password: req.config.password,
         schema: req.config.schema.clone(),
+        export_schema: req.config.export_schema.clone(),
     };
 
     let pool = match ConnectionPool::new(config) {
@@ -62,6 +63,7 @@ pub async fn export_data(
         username: req.config.username,
         password: req.config.password,
         schema: req.config.schema.clone(),
+        export_schema: req.config.export_schema.clone(),
     };
 
     let pool = match ConnectionPool::new(config) {

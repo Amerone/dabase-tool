@@ -67,6 +67,7 @@ fn env_connection_config() -> Result<ConnectionConfig, String> {
         username,
         password,
         schema,
+        export_schema: None,
     })
 }
 

@@ -36,6 +36,7 @@ pub async fn list_tables(
         username: query.username,
         password: query.password,
         schema: query.schema.clone(),
+        export_schema: None,
     };
 
     let pool = match ConnectionPool::new(config) {
@@ -77,6 +78,7 @@ pub async fn get_table_details_handler(
         username: query.username,
         password: query.password,
         schema: query.schema.clone(),
+        export_schema: None,
     };
 
     let pool = match ConnectionPool::new(config) {

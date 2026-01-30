@@ -41,7 +41,7 @@ impl ConfigStore {
             .with_context(|| format!("Failed to open SQLite at {:?}", self.db_path))?;
 
         let mut stmt = conn.prepare(
-            "SELECT db_type, host, port, username, password, schema, updated_at \
+            "SELECT db_type, host, port, username, password, schema, export_schema, updated_at \
              FROM connections WHERE name = ?1 LIMIT 1",
         )?;
 
@@ -56,9 +56,10 @@ impl ConfigStore {
                         username: row.get(3)?,
                         password: row.get(4)?,
                         schema: row.get(5)?,
+                        export_schema: row.get(6)?,
                     },
                     source: ConfigSource::Sqlite,
-                    updated_at: row.get(6)?,
+                    updated_at: row.get(7)?,
                 })
             })
             .optional()?;
@@ -73,12 +74,12 @@ impl ConfigStore {
         let updated_at = Utc::now().to_rfc3339();
 
         conn.execute(
-            "INSERT INTO connections (name, db_type, host, port, username, password, schema, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+            "INSERT INTO connections (name, db_type, host, port, username, password, schema, export_schema, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
              ON CONFLICT(name) DO UPDATE SET \
              db_type=excluded.db_type, host=excluded.host, port=excluded.port, \
              username=excluded.username, password=excluded.password, schema=excluded.schema, \
-             updated_at=excluded.updated_at",
+             export_schema=excluded.export_schema, updated_at=excluded.updated_at",
             params![
                 "default-dm8",
                 "dm8",
@@ -87,6 +88,7 @@ impl ConfigStore {
                 &config.username,
                 &config.password,
                 &config.schema,
+                &config.export_schema,
                 &updated_at
             ],
         )?;
@@ -112,13 +114,36 @@ impl ConfigStore {
                 username TEXT NOT NULL,
                 password TEXT NOT NULL,
                 schema TEXT NOT NULL,
+                export_schema TEXT,
                 updated_at TEXT NOT NULL
             )",
             [],
         )?;
 
+        ensure_export_schema_column(&conn)?;
+
         Ok(())
     }
+}
+
+fn ensure_export_schema_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(connections)")?;
+    let mut rows = stmt.query([])?;
+    let mut has_column = false;
+
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "export_schema" {
+            has_column = true;
+            break;
+        }
+    }
+
+    if !has_column {
+        conn.execute("ALTER TABLE connections ADD COLUMN export_schema TEXT", [])?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -134,6 +159,7 @@ mod tests {
             username: "SYSDBA".into(),
             password: "SYSDBA".into(),
             schema: "SYSDBA".into(),
+            export_schema: Some("APP".into()),
         }
     }
 
@@ -157,12 +183,14 @@ mod tests {
         let saved = store.upsert_default(&config).unwrap();
         assert_eq!(saved.config.host, "localhost");
         assert_eq!(saved.source, ConfigSource::Sqlite);
+        assert_eq!(saved.config.export_schema.as_deref(), Some("APP"));
         assert!(saved.updated_at.is_some());
 
         let fetched = store.get_default().unwrap().unwrap();
         assert_eq!(fetched.config.username, "SYSDBA");
         assert_eq!(fetched.source, ConfigSource::Sqlite);
         assert_eq!(fetched.config.schema, "SYSDBA");
+        assert_eq!(fetched.config.export_schema.as_deref(), Some("APP"));
         assert!(fetched.updated_at.is_some());
     }
 

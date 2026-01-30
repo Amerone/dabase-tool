@@ -14,6 +14,7 @@ pub struct ConnectionConfig {
     pub username: String,
     pub password: String,
     pub schema: String,
+    pub export_schema: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
