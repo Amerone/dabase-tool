@@ -1132,13 +1132,14 @@ mod tests {
             timing: "BEFORE".to_string(),
             events: vec!["UPDATE".to_string()],
             each_row: true,
-            body: "BEGIN\nNEW.UPDATE_TIME := SYSDATE\nEND".to_string(),
+            body: "BEGIN\nNEW.UPDATE_TIME := OLD.UPDATE_TIME\nEND".to_string(),
         }];
 
         let statements = generate_triggers("PLATFORM", &triggers, TriggerTerminator::DataGrip);
         assert_eq!(statements.len(), 1);
         let stmt = &statements[0];
         assert!(stmt.contains(":NEW.UPDATE_TIME"));
+        assert!(stmt.contains(":OLD.UPDATE_TIME"));
     }
 
     #[test]
