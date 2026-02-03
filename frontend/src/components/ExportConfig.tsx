@@ -254,8 +254,9 @@ export default function ExportConfig() {
             placeholder="请选择导出兼容模式"
             style={{ width: '100%', fontFamily: 'JetBrains Mono' }}
             options={[
-              { value: 'datagrip', label: 'DataGrip (END; 不含 /)' },
-              { value: 'script', label: 'DBeaver/SQLark (END; + /)' },
+              { value: 'datagrip', label: 'DataGrip 逐语句运行 (END; 不含 /)' },
+              { value: 'datagrip-script', label: 'DataGrip 脚本模式 (触发器单独导出)' },
+              { value: 'script', label: 'DBeaver/SQLark/DIsql (END; + /)' },
             ]}
           />
         </Form.Item>

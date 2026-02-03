@@ -9,12 +9,14 @@ use chrono::Local;
 use odbc_api::{buffers::TextRowSet, Connection, Cursor};
 
 use crate::db::schema::{fetch_row_count, fetch_sequences, get_table_details};
+use crate::models::TableDetails;
 
 pub fn export_table_data(
     connection: &Connection<'_>,
     source_schema: &str,
     target_schema: &str,
     table: &str,
+    table_details: &TableDetails,
     writer: &mut impl Write,
     batch_size: usize,
 ) -> Result<usize> {
@@ -26,10 +28,15 @@ pub fn export_table_data(
     let source_ident = quote_identifier(&source_qualified_table);
     let target_ident = quote_identifier(&target_qualified_table);
 
-    let table_details = get_table_details(connection, &source_schema_upper, &table_upper)
-        .with_context(|| format!("Failed to get table details for {}", source_qualified_table))?;
+    let column_idents: Vec<String> = table_details
+        .columns
+        .iter()
+        .map(|col| quote_identifier(&col.name))
+        .collect();
 
-    let query = format!("SELECT * FROM {}", source_ident);
+    // Use explicit column list to ensure SELECT and INSERT column order match
+    let select_columns = column_idents.join(", ");
+    let query = format!("SELECT {} FROM {}", select_columns, source_ident);
 
     let mut cursor = match connection.execute(&query, ())? {
         Some(cursor) => cursor,
@@ -63,14 +70,14 @@ pub fn export_table_data(
             row_count += 1;
 
             if batch.len() >= batch_size {
-                write_batch(writer, &target_ident, &batch)?;
+                write_batch(writer, &target_ident, &column_idents, &batch)?;
                 batch.clear();
             }
         }
     }
 
     if !batch.is_empty() {
-        write_batch(writer, &target_ident, &batch)?;
+        write_batch(writer, &target_ident, &column_idents, &batch)?;
     }
 
     tracing::info!(
@@ -143,12 +150,12 @@ pub fn export_schema_data(
     writeln!(writer)?;
 
     if !sequences.is_empty() {
-        writeln!(writer, "-- Reset sequences")?;
+        writeln!(writer, "-- Reset sequences (DM8 uses CURRENT VALUE, not RESTART WITH)")?;
         for seq in &sequences {
             let start = seq.start_with.unwrap_or(1);
             writeln!(
                 writer,
-                "ALTER SEQUENCE {} RESTART WITH {};",
+                "ALTER SEQUENCE {} CURRENT VALUE {};",
                 quote_identifier(&format!("{}.{}", target_schema_upper, seq.name)),
                 start
             )?;
@@ -163,35 +170,27 @@ pub fn export_schema_data(
             writeln!(writer)?;
         }
 
+        let table_upper = table_name.to_uppercase();
+        let source_qualified = format!("{}.{}", source_schema_upper, table_upper);
+        let table_details = get_table_details(connection, &source_schema_upper, &table_upper)
+            .with_context(|| format!("Failed to get table details for {}", source_qualified))?;
+        let has_identity = table_details.columns.iter().any(|col| col.identity);
+
         writeln!(
             writer,
             "-- Data for table: {}.{}{}",
             target_schema_upper,
-            table_name.to_uppercase(),
+            table_upper,
             expected_rows
                 .map(|c| format!(" ({} rows)", c))
                 .unwrap_or_else(|| " (rows unknown)".to_string())
         )?;
-        let qualified = quote_identifier(&format!(
-            "{}.{}",
-            target_schema_upper,
-            table_name.to_uppercase()
-        ));
+        let qualified = quote_identifier(&format!("{}.{}", target_schema_upper, table_upper));
+        // TRUNCATE TABLE resets IDENTITY columns to their original seed value in DM8
         writeln!(writer, "TRUNCATE TABLE {};", qualified)?;
 
-        // Reset identity columns if present (read from source, apply to target)
-        if let Ok(details) = get_table_details(connection, &source_schema_upper, table_name) {
-            let identity_cols: Vec<_> = details.columns.iter().filter(|c| c.identity).collect();
-            for col in identity_cols {
-                let start = col.identity_start.unwrap_or(1);
-                writeln!(
-                    writer,
-                    "ALTER TABLE {} ALTER COLUMN {} RESTART WITH {};",
-                    qualified,
-                    quote_identifier(&col.name),
-                    start
-                )?;
-            }
+        if has_identity {
+            write_identity_insert(&mut writer, &qualified, true)?;
         }
 
         let count = export_table_data(
@@ -199,10 +198,15 @@ pub fn export_schema_data(
             &source_schema_upper,
             &target_schema_upper,
             table_name,
+            &table_details,
             &mut writer,
             batch_size,
         )
         .with_context(|| format!("Failed to export data for table '{}'", table_name))?;
+
+        if has_identity {
+            write_identity_insert(&mut writer, &qualified, false)?;
+        }
 
         exported_total += count;
     }
@@ -211,13 +215,25 @@ pub fn export_schema_data(
     Ok(exported_total)
 }
 
-fn write_batch(writer: &mut impl Write, table: &str, batch: &[String]) -> Result<()> {
+fn write_batch(
+    writer: &mut impl Write,
+    table: &str,
+    columns: &[String],
+    batch: &[String],
+) -> Result<()> {
     writeln!(
         writer,
-        "INSERT INTO {} VALUES\n{};",
+        "INSERT INTO {} ({}) VALUES\n{};",
         table,
+        columns.join(", "),
         batch.join(",\n")
     )?;
+    Ok(())
+}
+
+fn write_identity_insert(writer: &mut impl Write, table: &str, enabled: bool) -> Result<()> {
+    let mode = if enabled { "ON" } else { "OFF" };
+    writeln!(writer, "SET IDENTITY_INSERT {} {};", table, mode)?;
     Ok(())
 }
 
@@ -256,6 +272,44 @@ fn is_binary_type(dt: &str) -> bool {
     matches!(dt.to_uppercase().as_str(), "RAW" | "BINARY" | "VARBINARY" | "BLOB")
 }
 
+/// Normalize ISO 8601 timestamp to DM8-compatible format.
+/// Handles: T→space, comma→dot, Z→+00:00, +HH→+HH:00, +HHMM→+HH:MM
+fn normalize_iso8601_timestamp(raw: &str) -> String {
+    let mut normalized = raw.replace('T', " ");
+    // ISO 8601 allows comma as decimal separator
+    if normalized.contains(',') {
+        normalized = normalized.replace(',', ".");
+    }
+    // Handle Z suffix (UTC)
+    if normalized.ends_with('Z') || normalized.ends_with('z') {
+        normalized.pop();
+        normalized.push_str("+00:00");
+        return normalized;
+    }
+    // Normalize timezone offset formats: +HH → +HH:00, +HHMM → +HH:MM
+    if let Some(pos) = normalized.rfind(|c| c == '+' || c == '-') {
+        // Only process if this is after the time part (contains :)
+        if normalized[..pos].contains(':') {
+            let sign = &normalized[pos..pos + 1];
+            let offset = &normalized[pos + 1..];
+            if offset.len() == 2 && offset.chars().all(|c| c.is_ascii_digit()) {
+                // +HH or -HH → +HH:00 or -HH:00
+                normalized = format!("{}{}{}:00", &normalized[..pos], sign, offset);
+            } else if offset.len() == 4 && offset.chars().all(|c| c.is_ascii_digit()) {
+                // +HHMM or -HHMM → +HH:MM or -HH:MM
+                normalized = format!(
+                    "{}{}{}:{}",
+                    &normalized[..pos],
+                    sign,
+                    &offset[..2],
+                    &offset[2..]
+                );
+            }
+        }
+    }
+    normalized
+}
+
 fn format_literal(data_type: &str, raw: &str) -> String {
     let upper = data_type.to_uppercase();
     if is_numeric_type(&upper) {
@@ -266,16 +320,99 @@ fn format_literal(data_type: &str, raw: &str) -> String {
         return format!("HEXTORAW('{}')", trimmed);
     }
     if is_date_type(&upper) {
+        // Choose format based on actual value content
+        let format_str = if raw.contains(':') {
+            "YYYY-MM-DD HH24:MI:SS"
+        } else {
+            "YYYY-MM-DD"
+        };
         return format!(
-            "TO_DATE('{}','YYYY-MM-DD HH24:MI:SS')",
-            escape_single_quotes(raw)
+            "TO_DATE('{}','{}')",
+            escape_single_quotes(raw),
+            format_str
         );
     }
     if is_timestamp_type(&upper) {
+        // Normalize ISO 8601 format to DM8-compatible format
+        let normalized = normalize_iso8601_timestamp(raw.trim());
+
+        // Detect timezone offset (+HH:MM or -HH:MM after time part)
+        let has_tz = has_timezone_offset(&normalized);
+
+        // Extract main part (without timezone) for format string analysis
+        let main_part = if has_tz {
+            normalized
+                .rfind(|c| c == '+' || c == '-')
+                .filter(|&pos| normalized[..pos].contains(':'))
+                .map(|pos| &normalized[..pos])
+                .unwrap_or(&normalized)
+        } else {
+            &normalized
+        };
+
+        // Build format string based on actual value content
+        let mut format_str = if let Some(space_pos) = main_part.find(' ') {
+            let time_part = &main_part[space_pos + 1..];
+            let colon_count = time_part.chars().filter(|c| *c == ':').count();
+            if colon_count >= 2 {
+                "YYYY-MM-DD HH24:MI:SS".to_string()
+            } else if colon_count == 1 {
+                "YYYY-MM-DD HH24:MI".to_string()
+            } else {
+                "YYYY-MM-DD".to_string()
+            }
+        } else {
+            "YYYY-MM-DD".to_string()
+        };
+
+        // Check for fractional seconds (. followed by digits in main part)
+        if let Some(dot_pos) = main_part.rfind('.') {
+            let after_dot = &main_part[dot_pos + 1..];
+            if after_dot.chars().take_while(|c| c.is_ascii_digit()).count() > 0 {
+                format_str.push_str(".FF");
+            }
+        }
+        if has_tz {
+            format_str.push_str(" TZH:TZM");
+        }
+
+        // Use TO_TIMESTAMP_TZ for TIMESTAMP WITH TIME ZONE types or values with timezone
+        if upper.contains("TIME ZONE") || has_tz {
+            return format!(
+                "TO_TIMESTAMP_TZ('{}','{}')",
+                escape_single_quotes(&normalized),
+                format_str
+            );
+        }
         return format!(
-            "TO_TIMESTAMP('{}','YYYY-MM-DD HH24:MI:SS.FF')",
-            escape_single_quotes(raw)
+            "TO_TIMESTAMP('{}','{}')",
+            escape_single_quotes(&normalized),
+            format_str
         );
     }
     format!("'{}'", escape_single_quotes(raw))
+}
+
+/// Check if the string has a timezone offset (+HH:MM or -HH:MM).
+/// Expects normalized format from normalize_iso8601_timestamp.
+fn has_timezone_offset(s: &str) -> bool {
+    // Look for +HH:MM or -HH:MM pattern after the time part
+    if let Some(pos) = s.rfind(|c| c == '+' || c == '-') {
+        // Must be after the time part (contains :) to avoid date separators
+        if !s[..pos].contains(':') {
+            return false;
+        }
+        let offset = &s[pos + 1..];
+        // Expect exactly HH:MM format (5 chars)
+        if offset.len() != 5 {
+            return false;
+        }
+        let (hh, rest) = offset.split_at(2);
+        if let Some(mm) = rest.strip_prefix(':') {
+            return hh.chars().all(|c| c.is_ascii_digit())
+                && mm.len() == 2
+                && mm.chars().all(|c| c.is_ascii_digit());
+        }
+    }
+    false
 }

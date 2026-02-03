@@ -139,8 +139,19 @@ fn fetch_columns(
     // When INFO2 & 0x01 = 0x01, the column is an identity column
     // Use IDENT_SEED() and IDENT_INCR() functions to get seed and increment values
     // Note: DM8 allows only ONE identity column per table
+    //
+    // Length selection for string types:
+    // - CHAR_USED = 'C' (CHAR semantics): use CHAR_LENGTH (character count)
+    // - CHAR_USED = 'B' (BYTE semantics): use DATA_LENGTH (byte count)
+    // - For non-string types: use DATA_LENGTH
     let sql = format!(
-        "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.DATA_LENGTH, c.DATA_PRECISION, c.DATA_SCALE, c.CHAR_USED, \
+        "SELECT c.COLUMN_NAME, c.DATA_TYPE, \
+                CASE WHEN c.DATA_TYPE IN ('CHAR','NCHAR','VARCHAR','VARCHAR2','NVARCHAR','NVARCHAR2') \
+                          AND c.CHAR_USED = 'C' \
+                     THEN c.CHAR_LENGTH \
+                     ELSE c.DATA_LENGTH \
+                END AS LENGTH, \
+                c.DATA_PRECISION, c.DATA_SCALE, c.CHAR_USED, \
                 c.NULLABLE, c.DATA_DEFAULT, \
                 CASE WHEN sc.INFO2 & 1 = 1 THEN 'YES' ELSE 'NO' END AS IDENTITY_COLUMN, \
                 cc.COMMENTS \
@@ -663,7 +674,7 @@ fn fetch_referenced_columns(
 
 pub fn fetch_sequences(connection: &Connection<'_>, schema: &str) -> Result<Vec<Sequence>> {
     let sql = format!(
-        "SELECT SEQUENCE_NAME, MIN_VALUE, MAX_VALUE, INCREMENT_BY, CACHE_SIZE, CYCLE_FLAG, ORDER_FLAG, START_WITH \
+        "SELECT SEQUENCE_NAME, MIN_VALUE, MAX_VALUE, INCREMENT_BY, CACHE_SIZE, CYCLE_FLAG, ORDER_FLAG, LAST_NUMBER \
          FROM ALL_SEQUENCES WHERE SEQUENCE_OWNER = '{}' ORDER BY SEQUENCE_NAME",
         schema.replace("'", "''")
     );
@@ -688,7 +699,7 @@ pub fn fetch_sequences(connection: &Connection<'_>, schema: &str) -> Result<Vec<
             let cache_size = batch.at_as_str(4, row_index)?.and_then(|s| s.parse::<i64>().ok());
             let cycle = matches!(batch.at_as_str(5, row_index)?, Some(v) if v.eq_ignore_ascii_case("Y"));
             let order = matches!(batch.at_as_str(6, row_index)?, Some(v) if v.eq_ignore_ascii_case("Y"));
-            let start_with = batch.at_as_str(7, row_index)?.and_then(|s| s.parse::<i64>().ok());
+            let last_number = batch.at_as_str(7, row_index)?.and_then(|s| s.parse::<i64>().ok());
 
             seqs.push(Sequence {
                 name,
@@ -698,7 +709,7 @@ pub fn fetch_sequences(connection: &Connection<'_>, schema: &str) -> Result<Vec<
                 cache_size,
                 cycle,
                 order,
-                start_with,
+                start_with: last_number,
             });
         }
     }

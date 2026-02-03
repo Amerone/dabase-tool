@@ -23,6 +23,9 @@ fn resolve_target_schema(source: &str, export_schema: Option<&str>) -> String {
 fn resolve_compat(value: Option<&str>) -> TriggerTerminator {
     match value.map(str::trim).filter(|v| !v.is_empty()) {
         Some(mode) if mode.eq_ignore_ascii_case("script") => TriggerTerminator::Script,
+        Some(mode) if mode.eq_ignore_ascii_case("datagrip-script") => {
+            TriggerTerminator::DataGripScript
+        }
         Some(mode) if mode.eq_ignore_ascii_case("datagrip") => TriggerTerminator::DataGrip,
         _ => TriggerTerminator::DataGrip,
     }
@@ -80,6 +83,12 @@ mod tests {
     fn resolve_compat_defaults_to_datagrip() {
         let mode = resolve_compat(None);
         assert_eq!(mode, TriggerTerminator::DataGrip);
+    }
+
+    #[test]
+    fn resolve_compat_datagrip_script_maps_to_datagrip_script() {
+        let mode = resolve_compat(Some("datagrip-script"));
+        assert_eq!(mode, TriggerTerminator::DataGripScript);
     }
 }
 
