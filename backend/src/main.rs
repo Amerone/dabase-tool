@@ -1,17 +1,11 @@
-mod db;
-mod export;
-mod api;
-mod models;
-mod config_store;
-
 #[tokio::main]
 async fn main() {
     dm8_export_backend::init_tracing();
     match dm8_export_backend::start_server(None).await {
         Ok(addr) => {
-            tracing::info!("Starting server on {}", addr);
-            // Hold the process open.
-            futures::future::pending::<()>().await;
+            tracing::info!("Server listening on {}", addr);
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("Received shutdown signal, exiting");
         }
         Err(err) => {
             eprintln!("Failed to start server: {err:?}");

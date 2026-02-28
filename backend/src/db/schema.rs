@@ -2,12 +2,28 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::{anyhow, ensure, Context, Result};
-use odbc_api::{Connection, Cursor, buffers::TextRowSet};
+use odbc_api::{buffers::TextRowSet, Connection, Cursor};
 
 use crate::models::{
     CheckConstraint, Column, ForeignKey, Index, Sequence, Table, TableDetails, TriggerDefinition,
     UniqueConstraint,
 };
+
+/// Read a cell from a `TextRowSet` batch as an owned `String`.
+///
+/// DM8's Windows ODBC driver may return bytes in GBK / GB18030 even when
+/// `CHARSET=1` is in the connection string (driver-version dependent).
+/// We try UTF-8 first; on failure we re-decode with GB18030 so Chinese text
+/// is never garbled or raises a hard error.
+pub(crate) fn decode_cell(batch: &TextRowSet, col: usize, row: usize) -> Option<String> {
+    match batch.at_as_str(col, row) {
+        Ok(Some(s)) => Some(s.to_string()),
+        Ok(None) => None,
+        Err(_) => batch
+            .at(col, row)
+            .map(|bytes| encoding_rs::GB18030.decode(bytes).0.into_owned()),
+    }
+}
 
 pub fn get_tables(connection: &Connection<'_>, schema: &str) -> Result<Vec<Table>> {
     let owner = schema.to_uppercase();
@@ -34,11 +50,10 @@ pub fn get_tables(connection: &Connection<'_>, schema: &str) -> Result<Vec<Table
 
     while let Some(batch) = row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
-            let name = batch.at_as_str(0, row_index)?
-                .ok_or_else(|| anyhow!("Encountered table without a name in DM8 metadata"))?
-                .to_string();
-            let comment = batch.at_as_str(1, row_index)?.map(|s| s.to_string());
-            let row_count = batch.at_as_str(2, row_index)?
+            let name = decode_cell(batch, 0, row_index)
+                .ok_or_else(|| anyhow!("Encountered table without a name in DM8 metadata"))?;
+            let comment = decode_cell(batch, 1, row_index);
+            let row_count = decode_cell(batch, 2, row_index)
                 .and_then(|s| s.parse::<i64>().ok());
 
             tables.push(Table {
@@ -122,7 +137,7 @@ fn fetch_table_comment(
 
     if let Some(batch) = row_set_cursor.fetch()? {
         if batch.num_rows() > 0 {
-            let comment = batch.at_as_str(0, 0)?.map(|s| s.to_string());
+            let comment = decode_cell(batch, 0, 0);
             return Ok(comment);
         }
     }
@@ -130,11 +145,7 @@ fn fetch_table_comment(
     Ok(None)
 }
 
-fn fetch_columns(
-    connection: &Connection<'_>,
-    schema: &str,
-    table: &str,
-) -> Result<Vec<Column>> {
+fn fetch_columns(connection: &Connection<'_>, schema: &str, table: &str) -> Result<Vec<Column>> {
     // DM8 stores identity column info in SYS.SYSCOLUMNS.INFO2 field
     // When INFO2 & 0x01 = 0x01, the column is an identity column
     // Use IDENT_SEED() and IDENT_INCR() functions to get seed and increment values
@@ -166,7 +177,10 @@ fn fetch_columns(
         table.replace("'", "''")
     );
 
-    let mut cursor = match connection.execute(&sql, ()).context("Failed to query DM8 columns")? {
+    let mut cursor = match connection
+        .execute(&sql, ())
+        .context("Failed to query DM8 columns")?
+    {
         Some(cursor) => cursor,
         None => return Ok(vec![]),
     };
@@ -177,25 +191,28 @@ fn fetch_columns(
 
     let mut columns = Vec::new();
 
-    while let Some(batch) = row_set_cursor.fetch().context("Failed to fetch column metadata")? {
+    while let Some(batch) = row_set_cursor
+        .fetch()
+        .context("Failed to fetch column metadata")?
+    {
         for row_index in 0..batch.num_rows() {
-            let name = batch.at_as_str(0, row_index)?
-                .ok_or_else(|| anyhow!("Encountered column without a name"))?
-                .to_string();
-            let data_type = batch.at_as_str(1, row_index)?
-                .ok_or_else(|| anyhow!("Encountered column without data type"))?
-                .to_string();
-            let length = batch.at_as_str(2, row_index)?
+            let name = decode_cell(batch, 0, row_index)
+                .ok_or_else(|| anyhow!("Encountered column without a name"))?;
+            let data_type = decode_cell(batch, 1, row_index)
+                .ok_or_else(|| anyhow!("Encountered column without data type"))?;
+            let length = decode_cell(batch, 2, row_index)
                 .and_then(|s| s.parse::<i32>().ok());
-            let precision = batch.at_as_str(3, row_index)?.and_then(|s| s.parse::<i32>().ok());
-            let scale = batch.at_as_str(4, row_index)?.and_then(|s| s.parse::<i32>().ok());
-            let char_used = batch.at_as_str(5, row_index)?.map(|s| s.to_string());
-            let nullable_flag = batch.at_as_str(6, row_index)?;
-            let default_value = batch.at_as_str(7, row_index)?.map(|s| s.to_string());
-            let identity_flag = batch.at_as_str(8, row_index)?;
-            let comment = batch.at_as_str(9, row_index)?.map(|s| s.to_string());
-            let nullable = matches!(nullable_flag, Some(flag) if flag.eq_ignore_ascii_case("Y"));
-            let identity = matches!(identity_flag, Some(flag) if flag.eq_ignore_ascii_case("YES") || flag.eq_ignore_ascii_case("Y"));
+            let precision = decode_cell(batch, 3, row_index)
+                .and_then(|s| s.parse::<i32>().ok());
+            let scale = decode_cell(batch, 4, row_index)
+                .and_then(|s| s.parse::<i32>().ok());
+            let char_used = decode_cell(batch, 5, row_index);
+            let nullable_flag = decode_cell(batch, 6, row_index);
+            let default_value = decode_cell(batch, 7, row_index);
+            let identity_flag = decode_cell(batch, 8, row_index);
+            let comment = decode_cell(batch, 9, row_index);
+            let nullable = matches!(nullable_flag, Some(ref flag) if flag.eq_ignore_ascii_case("Y"));
+            let identity = matches!(identity_flag, Some(ref flag) if flag.eq_ignore_ascii_case("YES") || flag.eq_ignore_ascii_case("Y"));
 
             columns.push(Column {
                 name,
@@ -245,7 +262,10 @@ fn fetch_identity_info(
         table.replace("'", "''")
     );
 
-    let mut cursor = match connection.execute(&sql, ()).context("Failed to query identity info")? {
+    let mut cursor = match connection
+        .execute(&sql, ())
+        .context("Failed to query identity info")?
+    {
         Some(cursor) => cursor,
         None => return Ok(None),
     };
@@ -255,8 +275,8 @@ fn fetch_identity_info(
 
     if let Some(batch) = row_set_cursor.fetch()? {
         if batch.num_rows() > 0 {
-            let seed = batch.at_as_str(0, 0)?.and_then(|s| s.parse::<i64>().ok());
-            let incr = batch.at_as_str(1, 0)?.and_then(|s| s.parse::<i64>().ok());
+            let seed = decode_cell(batch, 0, 0).and_then(|s| s.parse::<i64>().ok());
+            let incr = decode_cell(batch, 1, 0).and_then(|s| s.parse::<i64>().ok());
             if let (Some(seed), Some(incr)) = (seed, incr) {
                 return Ok(Some((seed, incr)));
             }
@@ -343,7 +363,7 @@ pub fn fetch_row_count(connection: &Connection<'_>, schema: &str, table: &str) -
 
     if let Some(batch) = row_set_cursor.fetch()? {
         if batch.num_rows() > 0 {
-            if let Some(val) = batch.at_as_str(0, 0)? {
+            if let Some(val) = decode_cell(batch, 0, 0) {
                 if let Ok(count) = val.parse::<i64>() {
                     return Ok(count);
                 }
@@ -416,9 +436,8 @@ fn fetch_primary_keys(
 
     while let Some(batch) = row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
-            let name = batch.at_as_str(0, row_index)?
-                .ok_or_else(|| anyhow!("Primary key column name missing"))?
-                .to_string();
+            let name = decode_cell(batch, 0, row_index)
+                .ok_or_else(|| anyhow!("Primary key column name missing"))?;
             keys.push(name);
         }
     }
@@ -454,12 +473,10 @@ fn fetch_unique_constraints(
 
     while let Some(batch) = row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
-            let name = batch.at_as_str(0, row_index)?
-                .ok_or_else(|| anyhow!("Unique constraint name missing"))?
-                .to_string();
-            let column = batch.at_as_str(1, row_index)?
-                .ok_or_else(|| anyhow!("Unique constraint column missing"))?
-                .to_string();
+            let name = decode_cell(batch, 0, row_index)
+                .ok_or_else(|| anyhow!("Unique constraint name missing"))?;
+            let column = decode_cell(batch, 1, row_index)
+                .ok_or_else(|| anyhow!("Unique constraint column missing"))?;
 
             if current_name.as_ref() != Some(&name) {
                 constraints.push(UniqueConstraint {
@@ -502,12 +519,10 @@ fn fetch_check_constraints(
 
     while let Some(batch) = row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
-            let name = batch.at_as_str(0, row_index)?
-                .ok_or_else(|| anyhow!("Check constraint name missing"))?
-                .to_string();
-            let condition = batch.at_as_str(1, row_index)?
-                .ok_or_else(|| anyhow!("Check constraint condition missing"))?
-                .to_string();
+            let name = decode_cell(batch, 0, row_index)
+                .ok_or_else(|| anyhow!("Check constraint name missing"))?;
+            let condition = decode_cell(batch, 1, row_index)
+                .ok_or_else(|| anyhow!("Check constraint condition missing"))?;
             constraints.push(CheckConstraint { name, condition });
         }
     }
@@ -523,7 +538,7 @@ fn fetch_foreign_keys(
     // Try with UPDATE_RULE first, fallback without it if not supported
     // DM8 may not have UPDATE_RULE column in ALL_CONSTRAINTS
     let sql_with_update = format!(
-        "SELECT ac.CONSTRAINT_NAME, ac.R_CONSTRAINT_NAME, ac.DELETE_RULE, ac.UPDATE_RULE \
+        "SELECT ac.CONSTRAINT_NAME, ac.R_CONSTRAINT_NAME, ac.R_OWNER, ac.DELETE_RULE, ac.UPDATE_RULE \
          FROM ALL_CONSTRAINTS ac \
          WHERE ac.CONSTRAINT_TYPE = 'R' AND ac.OWNER = '{}' AND ac.TABLE_NAME = '{}' \
          ORDER BY ac.CONSTRAINT_NAME",
@@ -532,7 +547,7 @@ fn fetch_foreign_keys(
     );
 
     let sql_without_update = format!(
-        "SELECT ac.CONSTRAINT_NAME, ac.R_CONSTRAINT_NAME, ac.DELETE_RULE, NULL AS UPDATE_RULE \
+        "SELECT ac.CONSTRAINT_NAME, ac.R_CONSTRAINT_NAME, ac.R_OWNER, ac.DELETE_RULE, NULL AS UPDATE_RULE \
          FROM ALL_CONSTRAINTS ac \
          WHERE ac.CONSTRAINT_TYPE = 'R' AND ac.OWNER = '{}' AND ac.TABLE_NAME = '{}' \
          ORDER BY ac.CONSTRAINT_NAME",
@@ -559,7 +574,9 @@ fn fetch_foreign_keys(
         .ok_or_else(|| anyhow!("DM8 returned no cursor for foreign key constraint query"))?;
 
     if !has_update_rule {
-        tracing::debug!("DM8 ALL_CONSTRAINTS does not have UPDATE_RULE column, using fallback query");
+        tracing::debug!(
+            "DM8 ALL_CONSTRAINTS does not have UPDATE_RULE column, using fallback query"
+        );
     }
 
     let mut buffers = TextRowSet::for_cursor(200, &mut cursor, Some(8192))?;
@@ -569,21 +586,20 @@ fn fetch_foreign_keys(
 
     while let Some(batch) = row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
-            let name = batch.at_as_str(0, row_index)?
-                .ok_or_else(|| anyhow!("Foreign key name missing"))?
-                .to_string();
-            let ref_constraint = batch.at_as_str(1, row_index)?
-                .ok_or_else(|| anyhow!("Referenced constraint name missing"))?
-                .to_string();
-            let delete_rule = batch.at_as_str(2, row_index)?.map(|s| s.to_string());
-            let update_rule = batch.at_as_str(3, row_index)?.map(|s| s.to_string());
+            let name = decode_cell(batch, 0, row_index)
+                .ok_or_else(|| anyhow!("Foreign key name missing"))?;
+            let ref_constraint = decode_cell(batch, 1, row_index)
+                .ok_or_else(|| anyhow!("Referenced constraint name missing"))?;
+            let ref_owner = decode_cell(batch, 2, row_index);
+            let delete_rule = decode_cell(batch, 3, row_index);
+            let update_rule = decode_cell(batch, 4, row_index);
 
             // Columns in FK
             let fk_cols = fetch_constraint_columns(connection, schema, &name)?;
 
             // Referenced table & columns
             let (ref_table, ref_cols) =
-                fetch_referenced_columns(connection, &ref_constraint)?;
+                fetch_referenced_columns(connection, ref_owner.as_deref(), &ref_constraint)?;
 
             fks.push(ForeignKey {
                 name,
@@ -624,9 +640,8 @@ fn fetch_constraint_columns(
     let mut cols = Vec::new();
     while let Some(batch) = row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
-            let name = batch.at_as_str(0, row_index)?
-                .ok_or_else(|| anyhow!("Constraint column missing"))?
-                .to_string();
+            let name = decode_cell(batch, 0, row_index)
+                .ok_or_else(|| anyhow!("Constraint column missing"))?;
             cols.push(name);
         }
     }
@@ -635,14 +650,28 @@ fn fetch_constraint_columns(
 
 fn fetch_referenced_columns(
     connection: &Connection<'_>,
+    referenced_owner: Option<&str>,
     referenced_constraint: &str,
 ) -> Result<(String, Vec<String>)> {
-    let sql = format!(
-        "SELECT ac.OWNER, ac.TABLE_NAME \
-         FROM ALL_CONSTRAINTS ac \
-         WHERE ac.CONSTRAINT_NAME = '{}'",
-        referenced_constraint.replace("'", "''")
-    );
+    let sql = if let Some(owner) = referenced_owner
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty())
+    {
+        format!(
+            "SELECT ac.OWNER, ac.TABLE_NAME \
+             FROM ALL_CONSTRAINTS ac \
+             WHERE ac.OWNER = '{}' AND ac.CONSTRAINT_NAME = '{}'",
+            owner.replace("'", "''"),
+            referenced_constraint.replace("'", "''")
+        )
+    } else {
+        format!(
+            "SELECT ac.OWNER, ac.TABLE_NAME \
+             FROM ALL_CONSTRAINTS ac \
+             WHERE ac.CONSTRAINT_NAME = '{}'",
+            referenced_constraint.replace("'", "''")
+        )
+    };
 
     let mut cursor = connection
         .execute(&sql, ())
@@ -654,18 +683,22 @@ fn fetch_referenced_columns(
 
     let (owner, table) = if let Some(batch) = row_set_cursor.fetch()? {
         if batch.num_rows() > 0 {
-            let owner = batch.at_as_str(0, 0)?
-                .ok_or_else(|| anyhow!("Referenced owner missing"))?
-                .to_string();
-            let table = batch.at_as_str(1, 0)?
-                .ok_or_else(|| anyhow!("Referenced table missing"))?
-                .to_string();
+            let owner = decode_cell(batch, 0, 0)
+                .ok_or_else(|| anyhow!("Referenced owner missing"))?;
+            let table = decode_cell(batch, 1, 0)
+                .ok_or_else(|| anyhow!("Referenced table missing"))?;
             (owner, table)
         } else {
-            return Err(anyhow!("Referenced constraint {} not found", referenced_constraint));
+            return Err(anyhow!(
+                "Referenced constraint {} not found",
+                referenced_constraint
+            ));
         }
     } else {
-        return Err(anyhow!("Referenced constraint {} not found", referenced_constraint));
+        return Err(anyhow!(
+            "Referenced constraint {} not found",
+            referenced_constraint
+        ));
     };
 
     let columns = fetch_constraint_columns(connection, &owner, referenced_constraint)?;
@@ -690,16 +723,23 @@ pub fn fetch_sequences(connection: &Connection<'_>, schema: &str) -> Result<Vec<
     let mut seqs = Vec::new();
     while let Some(batch) = row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
-            let name = batch.at_as_str(0, row_index)?
-                .ok_or_else(|| anyhow!("Sequence name missing"))?
-                .to_string();
-            let min_value = batch.at_as_str(1, row_index)?.and_then(|s| s.parse::<i64>().ok());
-            let max_value = batch.at_as_str(2, row_index)?.and_then(|s| s.parse::<i64>().ok());
-            let increment_by = batch.at_as_str(3, row_index)?.and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
-            let cache_size = batch.at_as_str(4, row_index)?.and_then(|s| s.parse::<i64>().ok());
-            let cycle = matches!(batch.at_as_str(5, row_index)?, Some(v) if v.eq_ignore_ascii_case("Y"));
-            let order = matches!(batch.at_as_str(6, row_index)?, Some(v) if v.eq_ignore_ascii_case("Y"));
-            let last_number = batch.at_as_str(7, row_index)?.and_then(|s| s.parse::<i64>().ok());
+            let name = decode_cell(batch, 0, row_index)
+                .ok_or_else(|| anyhow!("Sequence name missing"))?;
+            let min_value = decode_cell(batch, 1, row_index)
+                .and_then(|s| s.parse::<i64>().ok());
+            let max_value = decode_cell(batch, 2, row_index)
+                .and_then(|s| s.parse::<i64>().ok());
+            let increment_by = decode_cell(batch, 3, row_index)
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(1);
+            let cache_size = decode_cell(batch, 4, row_index)
+                .and_then(|s| s.parse::<i64>().ok());
+            let cycle =
+                matches!(decode_cell(batch, 5, row_index), Some(ref v) if v.eq_ignore_ascii_case("Y"));
+            let order =
+                matches!(decode_cell(batch, 6, row_index), Some(ref v) if v.eq_ignore_ascii_case("Y"));
+            let last_number = decode_cell(batch, 7, row_index)
+                .and_then(|s| s.parse::<i64>().ok());
 
             seqs.push(Sequence {
                 name,
@@ -806,15 +846,20 @@ fn fetch_triggers(
     let mut triggers = Vec::new();
     while let Some(batch) = row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
-            let name = batch.at_as_str(0, row_index)?
-                .ok_or_else(|| anyhow!("Trigger name missing"))?
-                .to_string();
-            let trigger_type = batch.at_as_str(1, row_index)?.unwrap_or("BEFORE");
-            let triggering_event = batch.at_as_str(2, row_index)?.unwrap_or("INSERT");
-            let table_name = batch.at_as_str(3, row_index)?.unwrap_or(table).to_string();
-            let when_clause = batch.at_as_str(4, row_index)?.unwrap_or("").to_string();
-            let body = batch.at_as_str(5, row_index)?.unwrap_or("").to_string();
-            let description = batch.at_as_str(6, row_index)?.unwrap_or("").to_string();
+            let name = decode_cell(batch, 0, row_index)
+                .ok_or_else(|| anyhow!("Trigger name missing"))?;
+            let trigger_type = decode_cell(batch, 1, row_index)
+                .unwrap_or_else(|| "BEFORE".to_string());
+            let triggering_event = decode_cell(batch, 2, row_index)
+                .unwrap_or_else(|| "INSERT".to_string());
+            let table_name = decode_cell(batch, 3, row_index)
+                .unwrap_or_else(|| table.to_string());
+            let when_clause = decode_cell(batch, 4, row_index)
+                .unwrap_or_default();
+            let body = decode_cell(batch, 5, row_index)
+                .unwrap_or_default();
+            let description = decode_cell(batch, 6, row_index)
+                .unwrap_or_default();
 
             // DM8 uses " OR " as separator (e.g., "INSERT OR UPDATE OR DELETE")
             // Also support comma separator for compatibility
@@ -861,11 +906,7 @@ fn fetch_triggers(
 
     Ok(triggers)
 }
-fn fetch_indexes(
-    connection: &Connection<'_>,
-    schema: &str,
-    table: &str,
-) -> Result<Vec<Index>> {
+fn fetch_indexes(connection: &Connection<'_>, schema: &str, table: &str) -> Result<Vec<Index>> {
     let sql = format!(
         "SELECT ai.INDEX_NAME, ai.UNIQUENESS \
          FROM ALL_INDEXES ai \
@@ -888,13 +929,12 @@ fn fetch_indexes(
 
     while let Some(batch) = row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
-            let name = batch.at_as_str(0, row_index)?
-                .ok_or_else(|| anyhow!("Index name missing"))?
-                .to_string();
-            let uniqueness = batch.at_as_str(1, row_index)?;
+            let name = decode_cell(batch, 0, row_index)
+                .ok_or_else(|| anyhow!("Index name missing"))?;
+            let uniqueness = decode_cell(batch, 1, row_index);
             let unique = matches!(
                 uniqueness,
-                Some(flag) if flag.eq_ignore_ascii_case("UNIQUE") || flag.eq_ignore_ascii_case("Y")
+                Some(ref flag) if flag.eq_ignore_ascii_case("UNIQUE") || flag.eq_ignore_ascii_case("Y")
             );
 
             order.push(name.clone());
@@ -924,7 +964,12 @@ fn fetch_indexes(
         .context("Failed to query index columns")?
     {
         Some(cursor) => cursor,
-        None => return Ok(order.into_iter().filter_map(|name| indexes.remove(&name)).collect()),
+        None => {
+            return Ok(order
+                .into_iter()
+                .filter_map(|name| indexes.remove(&name))
+                .collect())
+        }
     };
 
     let mut col_buffers = TextRowSet::for_cursor(100, &mut column_cursor, Some(8192))?;
@@ -932,16 +977,16 @@ fn fetch_indexes(
 
     while let Some(batch) = col_row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
-            let index_name = match batch.at_as_str(0, row_index)? {
+            let index_name = match decode_cell(batch, 0, row_index) {
                 Some(val) => val,
                 None => continue,
             };
-            let column_name = match batch.at_as_str(1, row_index)? {
-                Some(val) => val.to_string(),
+            let column_name = match decode_cell(batch, 1, row_index) {
+                Some(val) => val,
                 None => continue,
             };
 
-            if let Some(index) = indexes.get_mut(index_name) {
+            if let Some(index) = indexes.get_mut(&index_name) {
                 index.columns.push(column_name);
             }
         }

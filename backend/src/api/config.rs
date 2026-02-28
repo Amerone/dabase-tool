@@ -54,7 +54,10 @@ fn env_connection_config() -> Result<ConnectionConfig, String> {
     let host = env::var("DATABASE_HOST").map_err(|_| "DATABASE_HOST not set".to_string())?;
     let port = env::var("DATABASE_PORT")
         .map_err(|_| "DATABASE_PORT not set".to_string())
-        .and_then(|v| v.parse::<u16>().map_err(|_| "DATABASE_PORT is not a valid u16".to_string()))?;
+        .and_then(|v| {
+            v.parse::<u16>()
+                .map_err(|_| "DATABASE_PORT is not a valid u16".to_string())
+        })?;
     let username =
         env::var("DATABASE_USERNAME").map_err(|_| "DATABASE_USERNAME not set".to_string())?;
     let password =

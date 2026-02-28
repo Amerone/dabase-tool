@@ -1,6 +1,10 @@
 use std::{fs, path::PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use aes_gcm::aead::rand_core::RngCore;
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+use anyhow::{anyhow, ensure, Context, Result};
+use base64::Engine;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -16,7 +20,72 @@ pub struct StoredConnection {
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     db_path: PathBuf,
+    encryption_key: [u8; 32],
 }
+
+// --------------- encryption helpers ---------------
+
+const ENC_PREFIX: &str = "enc:";
+
+fn load_or_create_key(key_path: &std::path::Path) -> Result<[u8; 32]> {
+    if key_path.exists() {
+        let bytes = fs::read(key_path)
+            .with_context(|| format!("Failed to read encryption key at {:?}", key_path))?;
+        ensure!(bytes.len() == 32, "Encryption key must be 32 bytes");
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        Ok(key)
+    } else {
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        fs::write(key_path, key)
+            .with_context(|| format!("Failed to write encryption key to {:?}", key_path))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(key_path, fs::Permissions::from_mode(0o600)).ok();
+        }
+        Ok(key)
+    }
+}
+
+fn encrypt_value(plaintext: &str, key: &[u8; 32]) -> Result<String> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .map_err(|_| anyhow!("AES-GCM encryption failed"))?;
+    let mut combined = Vec::with_capacity(12 + ciphertext.len());
+    combined.extend_from_slice(&nonce_bytes);
+    combined.extend_from_slice(&ciphertext);
+    Ok(format!(
+        "{}{}",
+        ENC_PREFIX,
+        base64::engine::general_purpose::STANDARD.encode(&combined)
+    ))
+}
+
+fn decrypt_value(stored: &str, key: &[u8; 32]) -> Result<String> {
+    if !stored.starts_with(ENC_PREFIX) {
+        // Legacy plaintext — return as-is for backward compatibility.
+        return Ok(stored.to_string());
+    }
+    let encoded = &stored[ENC_PREFIX.len()..];
+    let combined = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("Invalid base64 in encrypted password")?;
+    ensure!(combined.len() > 12, "Encrypted value too short");
+    let (nonce_bytes, ciphertext) = combined.split_at(12);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+        .map_err(|_| anyhow!("AES-GCM decryption failed (wrong key or corrupt data)"))?;
+    String::from_utf8(plaintext).context("Decrypted value is not valid UTF-8")
+}
+
+// --------------- ConfigStore ---------------
 
 impl ConfigStore {
     pub fn new_with_path(db_path: PathBuf) -> Result<Self> {
@@ -25,13 +94,23 @@ impl ConfigStore {
                 .with_context(|| format!("Failed to create config directory {:?}", parent))?;
         }
 
-        let store = Self { db_path };
+        let key_path = db_path
+            .parent()
+            .ok_or_else(|| anyhow!("DB path has no parent directory"))?
+            .join(".key");
+        let encryption_key = load_or_create_key(&key_path)?;
+
+        let store = Self {
+            db_path,
+            encryption_key,
+        };
         store.init_db()?;
         Ok(store)
     }
 
     pub fn ensure_default_path() -> Result<Self> {
-        let home_dir = dirs::home_dir().ok_or_else(|| anyhow!("Unable to determine home directory"))?;
+        let home_dir =
+            dirs::home_dir().ok_or_else(|| anyhow!("Unable to determine home directory"))?;
         let db_path = home_dir.join(".amarone").join("config.db");
         Self::new_with_path(db_path)
     }
@@ -49,22 +128,37 @@ impl ConfigStore {
             .query_row(params!["default-dm8"], |row| {
                 let port: i64 = row.get(2)?;
                 let port = u16::try_from(port).unwrap_or_default();
-                Ok(StoredConnection {
-                    config: ConnectionConfig {
-                        host: row.get(1)?,
-                        port,
-                        username: row.get(3)?,
-                        password: row.get(4)?,
-                        schema: row.get(5)?,
-                        export_schema: row.get(6)?,
-                    },
-                    source: ConfigSource::Sqlite,
-                    updated_at: row.get(7)?,
-                })
+                Ok((
+                    row.get::<_, String>(1)?,
+                    port,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
             })
             .optional()?;
 
-        Ok(row)
+        match row {
+            Some((host, port, username, stored_password, schema, export_schema, updated_at)) => {
+                let password = decrypt_value(&stored_password, &self.encryption_key)
+                    .unwrap_or(stored_password);
+                Ok(Some(StoredConnection {
+                    config: ConnectionConfig {
+                        host,
+                        port,
+                        username,
+                        password,
+                        schema,
+                        export_schema,
+                    },
+                    source: ConfigSource::Sqlite,
+                    updated_at,
+                }))
+            }
+            None => Ok(None),
+        }
     }
 
     pub fn upsert_default(&self, config: &ConnectionConfig) -> Result<StoredConnection> {
@@ -72,6 +166,7 @@ impl ConfigStore {
             .with_context(|| format!("Failed to open SQLite at {:?}", self.db_path))?;
 
         let updated_at = Utc::now().to_rfc3339();
+        let encrypted_password = encrypt_value(&config.password, &self.encryption_key)?;
 
         conn.execute(
             "INSERT INTO connections (name, db_type, host, port, username, password, schema, export_schema, updated_at) \
@@ -86,7 +181,7 @@ impl ConfigStore {
                 &config.host,
                 config.port as i64,
                 &config.username,
-                &config.password,
+                &encrypted_password,
                 &config.schema,
                 &config.export_schema,
                 &updated_at
@@ -170,7 +265,10 @@ mod tests {
         let store = ConfigStore::new_with_path(db_path).unwrap();
 
         let result = store.get_default().unwrap();
-        assert!(result.is_none(), "Expected no record when database is empty");
+        assert!(
+            result.is_none(),
+            "Expected no record when database is empty"
+        );
     }
 
     #[test]
@@ -188,6 +286,7 @@ mod tests {
 
         let fetched = store.get_default().unwrap().unwrap();
         assert_eq!(fetched.config.username, "SYSDBA");
+        assert_eq!(fetched.config.password, "SYSDBA");
         assert_eq!(fetched.source, ConfigSource::Sqlite);
         assert_eq!(fetched.config.schema, "SYSDBA");
         assert_eq!(fetched.config.export_schema.as_deref(), Some("APP"));
@@ -209,9 +308,56 @@ mod tests {
         config.host = "127.0.0.1".into();
         let second = store.upsert_default(&config).unwrap();
 
-        assert_ne!(first_ts, second.updated_at, "timestamp should update on overwrite");
+        assert_ne!(
+            first_ts, second.updated_at,
+            "timestamp should update on overwrite"
+        );
 
         let fetched = store.get_default().unwrap().unwrap();
         assert_eq!(fetched.config.host, "127.0.0.1");
+    }
+
+    #[test]
+    fn encrypt_decrypt_round_trip() {
+        let key = [42u8; 32];
+        let original = "my_secret_password";
+        let encrypted = encrypt_value(original, &key).unwrap();
+        assert!(encrypted.starts_with("enc:"));
+        assert_ne!(encrypted, original);
+        let decrypted = decrypt_value(&encrypted, &key).unwrap();
+        assert_eq!(decrypted, original);
+    }
+
+    #[test]
+    fn decrypt_handles_legacy_plaintext() {
+        let key = [42u8; 32];
+        let plaintext = "old_plain_password";
+        let result = decrypt_value(plaintext, &key).unwrap();
+        assert_eq!(result, plaintext);
+    }
+
+    #[test]
+    fn password_stored_encrypted_in_sqlite() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("config.db");
+        let store = ConfigStore::new_with_path(db_path.clone()).unwrap();
+
+        let config = sample_config();
+        store.upsert_default(&config).unwrap();
+
+        // Read raw password from SQLite — should be encrypted, not plaintext.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT password FROM connections WHERE name = 'default-dm8'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            raw.starts_with("enc:"),
+            "password should be encrypted in DB"
+        );
+        assert!(!raw.contains("SYSDBA"));
     }
 }

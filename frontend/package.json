@@ -6,14 +6,16 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "tauri": "tauri",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write ."
   },
   "dependencies": {
-    "@tauri-apps/api": "^1.6.0",
     "@ant-design/icons": "^6.1.0",
     "@tanstack/react-query": "^5.90.20",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2",
     "animejs": "^4.3.5",
     "antd": "^6.2.2",
     "axios": "^1.13.3",
@@ -24,6 +26,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.9.0",
+    "@tauri-apps/cli": "^2.10.0",
     "@types/animejs": "^3.1.13",
     "@types/node": "^22.0.0",
     "@types/react": "^19.2.9",

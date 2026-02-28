@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use std::env;
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::path::{Path, PathBuf};
+use tauri::Manager;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum DriverSource {
@@ -26,9 +28,31 @@ pub fn discover_and_apply(app: &tauri::AppHandle) -> Result<ResolvedDriver> {
 
 fn driver_filename() -> &'static str {
     if cfg!(target_os = "windows") {
-        "dmodbc.dll"
+        "dodbc.dll"
     } else {
         "libdodbc.so"
+    }
+}
+
+/// Platform-specific subdirectory under `drivers/dm8/` holding driver files.
+/// Windows DLLs live in `drivers/dm8/windows/`; Linux SOs live directly in `drivers/dm8/`.
+fn driver_subdir() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        ""
+    }
+}
+
+/// Relative path to the driver file, e.g.:
+///   Windows → `drivers/dm8/windows/dodbc.dll`
+///   Linux   → `drivers/dm8/libdodbc.so`
+fn driver_rel_path() -> String {
+    let sub = driver_subdir();
+    if sub.is_empty() {
+        format!("drivers/dm8/{}", driver_filename())
+    } else {
+        format!("drivers/dm8/{}/{}", sub, driver_filename())
     }
 }
 
@@ -54,11 +78,12 @@ fn discover_driver(app: &tauri::AppHandle) -> Result<ResolvedDriver> {
 }
 
 fn bundled_driver(app: &tauri::AppHandle) -> Option<ResolvedDriver> {
-    let filename = driver_filename();
-    // Packaged or dev mode via path resolver
-    if let Some(path) = app
-        .path_resolver()
-        .resolve_resource(format!("drivers/dm8/{}", filename))
+    let rel = driver_rel_path();
+
+    // Packaged or dev mode via Tauri v2 path resolver
+    if let Ok(path) = app
+        .path()
+        .resolve(&rel, tauri::path::BaseDirectory::Resource)
     {
         if path.exists() {
             let search_dir = path.parent()?.to_path_buf();
@@ -70,10 +95,10 @@ fn bundled_driver(app: &tauri::AppHandle) -> Option<ResolvedDriver> {
         }
     }
 
-    // Dev fallback: relative to repo root
+    // Dev fallback: cwd is typically `src-tauri/` when running via `cargo run`
     let dev_path = std::env::current_dir()
         .ok()
-        .map(|pwd| pwd.join(format!("../drivers/dm8/{}", filename)));
+        .map(|pwd| pwd.join("..").join(&rel));
     if let Some(path) = dev_path {
         if path.exists() {
             let search_dir = path.parent()?.to_path_buf();
@@ -123,13 +148,10 @@ fn system_driver() -> Option<ResolvedDriver> {
 #[cfg(target_os = "linux")]
 fn linux_system_driver() -> Option<ResolvedDriver> {
     let filename = driver_filename();
-    let candidates = [
-        "/etc/odbcinst.ini",
-        "~/.odbcinst.ini",
-    ];
+    let candidates = ["/etc/odbcinst.ini", "~/.odbcinst.ini"];
 
     for candidate in candidates {
-        let expanded = if candidate.starts_with("~") {
+        let expanded = if candidate.starts_with('~') {
             dirs::home_dir().map(|home| home.join(candidate.trim_start_matches("~/")))
         } else {
             Some(PathBuf::from(candidate))
@@ -159,7 +181,8 @@ pub(crate) fn parse_odbcinst_for_dm8(content: &str) -> Option<PathBuf> {
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            current_section = Some(trimmed.trim_matches(&['[', ']'][..]).to_ascii_lowercase());
+            current_section =
+                Some(trimmed.trim_matches(&['[', ']'][..]).to_ascii_lowercase());
             continue;
         }
 
@@ -167,8 +190,7 @@ pub(crate) fn parse_odbcinst_for_dm8(content: &str) -> Option<PathBuf> {
             if let Some((key, value)) = trimmed.split_once('=') {
                 let key = key.trim().to_ascii_lowercase();
                 if key.starts_with("driver") {
-                    let path = PathBuf::from(value.trim());
-                    return Some(path);
+                    return Some(PathBuf::from(value.trim()));
                 }
             }
         }
@@ -178,33 +200,34 @@ pub(crate) fn parse_odbcinst_for_dm8(content: &str) -> Option<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn windows_system_driver() -> Option<ResolvedDriver> {
-    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
     use winreg::RegKey;
 
-    let hives = [
-        (HKEY_LOCAL_MACHINE, "SOFTWARE\\ODBC\\ODBCINST.INI\\DM8 ODBC DRIVER"),
-        (HKEY_CURRENT_USER, "SOFTWARE\\ODBC\\ODBCINST.INI\\DM8 ODBC DRIVER"),
-    ];
     let filename = driver_filename();
-
-    for (hive, path) in hives {
-        if let Ok(key) = RegKey::predef(hive).open_subkey_with_flags(path, KEY_READ) {
-            if let Ok(value): Result<String, _> = key.get_value("Driver") {
-                let driver_path = PathBuf::from(value.trim());
-                if driver_path.exists() && driver_path.file_name()?.to_string_lossy() == filename {
-                    let search_dir = driver_path.parent()?.to_path_buf();
-                    return Some(ResolvedDriver {
-                        driver_path,
-                        search_dir,
-                        source: DriverSource::System,
-                    });
-                }
+    // Only check HKLM — Windows ODBC Driver Manager ignores HKCU for driver definitions
+    let reg_path = "SOFTWARE\\ODBC\\ODBCINST.INI\\DM8 ODBC Driver";
+    if let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(reg_path, KEY_READ)
+    {
+        if let Ok(value) = key.get_value::<String, _>("Driver") {
+            let driver_path = PathBuf::from(value.trim());
+            if driver_path.exists() && driver_path.file_name()?.to_string_lossy() == filename {
+                let search_dir = driver_path.parent()?.to_path_buf();
+                return Some(ResolvedDriver {
+                    driver_path,
+                    search_dir,
+                    source: DriverSource::System,
+                });
             }
         }
     }
     None
 }
 
+/// Set environment variables so the ODBC layer can find the DM8 driver.
+///
+/// SAFETY: `env::set_var` must be called before spawning additional threads.
+/// In Tauri 2.x the `setup` hook runs on the main thread before the event loop,
+/// so this is safe as long as no prior async work has been spawned.
 fn apply_env(driver: &ResolvedDriver) -> Result<()> {
     env::set_var("DM8_DRIVER_PATH", &driver.driver_path);
 

@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use chrono::Local;
 use odbc_api::{buffers::TextRowSet, Connection, Cursor};
 
-use crate::db::schema::{fetch_row_count, fetch_sequences, get_table_details};
+use crate::db::schema::{decode_cell, fetch_row_count, fetch_sequences, get_table_details};
 use crate::models::TableDetails;
 
 pub fn export_table_data(
@@ -56,11 +56,9 @@ pub fn export_table_data(
             let mut values = Vec::new();
 
             for (col_index, column) in table_details.columns.iter().enumerate() {
-                let value = batch_result.at_as_str(col_index, row_index)?;
-
-                let formatted_value = match value {
+                let formatted_value = match decode_cell(batch_result, col_index, row_index) {
                     None => "NULL".to_string(),
-                    Some(v) => format_literal(&column.data_type, v),
+                    Some(v) => format_literal(&column.data_type, &v),
                 };
 
                 values.push(formatted_value);
@@ -111,7 +109,10 @@ pub fn export_schema_data(
     }
 
     let file = File::create(output_path).with_context(|| {
-        format!("Failed to create data export file at {}", output_path.display())
+        format!(
+            "Failed to create data export file at {}",
+            output_path.display()
+        )
     })?;
     let mut writer = BufWriter::new(file);
 
@@ -135,22 +136,20 @@ pub fn export_schema_data(
     }
 
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    writeln!(writer, "-- DM8 Data Export")?;
-    writeln!(writer, "-- Tables: {}", tables.len())?;
-    if include_row_counts {
-        writeln!(writer, "-- Rows (estimated): {}", total_rows)?;
-    } else {
-        writeln!(writer, "-- Rows (estimated): skipped (per request)")?;
-    }
-    writeln!(writer, "-- Generated at: {}", timestamp)?;
-    writeln!(writer, "-- Warning: This script truncates tables before inserting data.")?;
-    if !sequences.is_empty() {
-        writeln!(writer, "-- Sequences will be reset to START values before inserts")?;
-    }
-    writeln!(writer)?;
+    write_data_export_header(
+        &mut writer,
+        tables.len(),
+        include_row_counts,
+        total_rows,
+        &timestamp,
+        !sequences.is_empty(),
+    )?;
 
     if !sequences.is_empty() {
-        writeln!(writer, "-- Reset sequences (DM8 uses CURRENT VALUE, not RESTART WITH)")?;
+        writeln!(
+            writer,
+            "-- 重置序列（DM8 使用 CURRENT VALUE，而非 RESTART WITH）"
+        )?;
         for seq in &sequences {
             let start = seq.start_with.unwrap_or(1);
             writeln!(
@@ -178,12 +177,12 @@ pub fn export_schema_data(
 
         writeln!(
             writer,
-            "-- Data for table: {}.{}{}",
+            "-- 表数据：{}.{}{}",
             target_schema_upper,
             table_upper,
             expected_rows
-                .map(|c| format!(" ({} rows)", c))
-                .unwrap_or_else(|| " (rows unknown)".to_string())
+                .map(|c| format!("（{} 行）", c))
+                .unwrap_or_else(|| "（行数未知）".to_string())
         )?;
         let qualified = quote_identifier(&format!("{}.{}", target_schema_upper, table_upper));
         // TRUNCATE TABLE resets IDENTITY columns to their original seed value in DM8
@@ -211,8 +210,34 @@ pub fn export_schema_data(
         exported_total += count;
     }
 
-    writer.flush().context("Failed to flush data export to disk")?;
+    writer
+        .flush()
+        .context("Failed to flush data export to disk")?;
     Ok(exported_total)
+}
+
+fn write_data_export_header(
+    writer: &mut impl Write,
+    table_count: usize,
+    include_row_counts: bool,
+    total_rows: i64,
+    timestamp: &str,
+    has_sequences: bool,
+) -> Result<()> {
+    writeln!(writer, "-- DM8 数据导出脚本")?;
+    writeln!(writer, "-- 表数量: {}", table_count)?;
+    if include_row_counts {
+        writeln!(writer, "-- 预计总行数: {}", total_rows)?;
+    } else {
+        writeln!(writer, "-- 预计总行数: 已跳过（按请求）")?;
+    }
+    writeln!(writer, "-- 生成时间: {}", timestamp)?;
+    writeln!(writer, "-- 警告: 本脚本会先 TRUNCATE 表，再执行数据插入。")?;
+    if has_sequences {
+        writeln!(writer, "-- 说明: 插入前会将序列重置到 START 值。")?;
+    }
+    writeln!(writer)?;
+    Ok(())
 }
 
 fn write_batch(
@@ -241,7 +266,16 @@ fn is_numeric_type(data_type: &str) -> bool {
     let upper = data_type.to_uppercase();
     matches!(
         upper.as_str(),
-        "NUMBER" | "INTEGER" | "INT" | "SMALLINT" | "BIGINT" | "DECIMAL" | "NUMERIC" | "FLOAT" | "DOUBLE" | "REAL"
+        "NUMBER"
+            | "INTEGER"
+            | "INT"
+            | "SMALLINT"
+            | "BIGINT"
+            | "DECIMAL"
+            | "NUMERIC"
+            | "FLOAT"
+            | "DOUBLE"
+            | "REAL"
     )
 }
 
@@ -269,7 +303,10 @@ fn is_timestamp_type(dt: &str) -> bool {
 }
 
 fn is_binary_type(dt: &str) -> bool {
-    matches!(dt.to_uppercase().as_str(), "RAW" | "BINARY" | "VARBINARY" | "BLOB")
+    matches!(
+        dt.to_uppercase().as_str(),
+        "RAW" | "BINARY" | "VARBINARY" | "BLOB"
+    )
 }
 
 /// Normalize ISO 8601 timestamp to DM8-compatible format.
@@ -326,11 +363,7 @@ fn format_literal(data_type: &str, raw: &str) -> String {
         } else {
             "YYYY-MM-DD"
         };
-        return format!(
-            "TO_DATE('{}','{}')",
-            escape_single_quotes(raw),
-            format_str
-        );
+        return format!("TO_DATE('{}','{}')", escape_single_quotes(raw), format_str);
     }
     if is_timestamp_type(&upper) {
         // Normalize ISO 8601 format to DM8-compatible format
@@ -415,4 +448,23 @@ fn has_timezone_offset(s: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn write_data_export_header_uses_chinese_comments() {
+        let mut buf = Vec::new();
+        super::write_data_export_header(&mut buf, 3, true, 128, "2026-02-06 10:30:00", true)
+            .unwrap();
+
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains("-- DM8 数据导出脚本"));
+        assert!(rendered.contains("-- 表数量: 3"));
+        assert!(rendered.contains("-- 预计总行数: 128"));
+        assert!(rendered.contains("-- 生成时间: 2026-02-06 10:30:00"));
+        assert!(rendered.contains("-- 警告: 本脚本会先 TRUNCATE 表，再执行数据插入。"));
+        assert!(rendered.contains("-- 说明: 插入前会将序列重置到 START 值。"));
+        assert!(!rendered.contains("DM8 Data Export"));
+    }
 }

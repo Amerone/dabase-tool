@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react'
 import { Form, Checkbox, Input, InputNumber, Space, message, Progress, Typography, Row, Col, Select } from 'antd'
-import { ClockCircleOutlined, FileTextOutlined, DatabaseOutlined, RocketOutlined } from '@ant-design/icons'
+import { ClockCircleOutlined, FileTextOutlined, DatabaseOutlined, RocketOutlined, FolderOpenOutlined } from '@ant-design/icons'
 import { animate } from 'animejs'
 import type { ExportRequest } from '@/types'
-import { exportDDL, exportData } from '@/services/api'
+import { exportDDL, exportData, getExportDirectory } from '@/services/api'
 import { calcProgress } from '@/utils/exportProgress'
 import { useExportStore } from '@/store/useExportStore'
 import { TechCard } from './common/TechCard'
@@ -21,7 +21,6 @@ export default function ExportConfig() {
   const [progress, setProgress] = useState(0)
   const [animatedProgress, setAnimatedProgress] = useState(0)
   const [progressStatus, setProgressStatus] = useState<'normal' | 'active' | 'success' | 'exception'>('normal')
-  const [hasError, setHasError] = useState(false)
   const [elapsedTime, setElapsedTime] = useState(0)
   const [exportResult, setExportResult] = useState<{ ddl?: string; data?: string } | null>(null)
 
@@ -69,6 +68,32 @@ export default function ExportConfig() {
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
   }
 
+  const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+
+  const handleOpenFolder = async () => {
+    const res = await getExportDirectory()
+    if (!res.success || !res.data) {
+      message.error(res.error || '获取导出目录失败')
+      return
+    }
+    const dir = res.data
+    if (isTauri()) {
+      try {
+        const { openPath } = await import('@tauri-apps/plugin-opener')
+        await openPath(dir)
+      } catch {
+        message.error('打开目录失败')
+      }
+    } else {
+      try {
+        await navigator.clipboard.writeText(dir)
+        message.success(`路径已复制: ${dir}`)
+      } catch {
+        message.info(`导出目录: ${dir}`)
+      }
+    }
+  }
+
   const handleExport = async () => {
     if (!config || selectedTables.length === 0) {
       message.warning('序列中止: 前置条件未满足')
@@ -80,7 +105,6 @@ export default function ExportConfig() {
       setLoading(true)
       setProgress(0)
       setProgressStatus('active')
-      setHasError(false)
       setElapsedTime(0)
       setExportResult(null)
 
@@ -118,7 +142,6 @@ export default function ExportConfig() {
         } else {
           message.error(ddlResult.error || 'DDL 提取失败')
           hadError = true
-          setHasError(true)
           const ddlProgress = calcProgress({
             includeDdl: true,
             includeData: values.include_data,
@@ -147,7 +170,6 @@ export default function ExportConfig() {
         } else {
           message.error(dataResult.error || '数据迁移失败')
           hadError = true
-          setHasError(true)
           const dataProgress = calcProgress({
             includeDdl: values.include_ddl,
             includeData: true,
@@ -170,7 +192,6 @@ export default function ExportConfig() {
       }
     } catch (error) {
       message.error('严重错误')
-      setHasError(true)
       const errorProgress = calcProgress({
         includeDdl: true,
         includeData: true,
@@ -309,6 +330,13 @@ export default function ExportConfig() {
                   {exportResult.ddl && <div>&gt; DDL 文件: <span style={{ color: '#fff' }}>{exportResult.ddl}</span></div>}
                   {exportResult.data && <div>&gt; 数据文件: <span style={{ color: '#fff' }}>{exportResult.data}</span></div>}
                   <div style={{ marginTop: 8, color: '#aaa' }}>// 总耗时: {formatTime(elapsedTime)}</div>
+                  <TechButton
+                    icon={<FolderOpenOutlined />}
+                    onClick={handleOpenFolder}
+                    style={{ marginTop: 12 }}
+                  >
+                    打开导出目录
+                  </TechButton>
                 </Space>
               </div>
             )}

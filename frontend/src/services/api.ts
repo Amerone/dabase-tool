@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { invoke } from '@tauri-apps/api/tauri';
+import { invoke } from '@tauri-apps/api/core';
 import type {
   ConnectionConfig,
   Table,
@@ -12,7 +12,7 @@ import type {
   DriverInfo,
 } from '../types';
 
-const isTauri = () => typeof window !== 'undefined' && '__TAURI_IPC__' in window;
+const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 async function resolveBaseUrl() {
   if (isTauri()) {
@@ -173,5 +173,18 @@ export const getDriverInfo = async (): Promise<DriverInfo | null> => {
   } catch (error) {
     console.warn('Failed to load driver info', error);
     return null;
+  }
+};
+
+export const getExportDirectory = async (): Promise<ApiResponse<string>> => {
+  try {
+    const api = await getApi();
+    const response = await api.get<ApiResponse<string>>('/export/directory');
+    return response.data;
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : '获取导出目录失败',
+    };
   }
 };

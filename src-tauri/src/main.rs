@@ -4,6 +4,7 @@ mod driver;
 
 use driver::{discover_and_apply, DriverSource, ResolvedDriver};
 use tauri::{Manager, State};
+use tauri_plugin_dialog::DialogExt;
 
 #[derive(Clone, serde::Serialize)]
 struct DriverInfo {
@@ -32,17 +33,18 @@ fn driver_info(state: State<'_, AppState>) -> DriverInfo {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![backend_base_url, driver_info])
         .setup(|app| {
-            let resolved = match discover_and_apply(app) {
+            let resolved = match discover_and_apply(app.handle()) {
                 Ok(driver) => driver,
                 Err(err) => {
-                    tauri::api::dialog::blocking::message(
-                        None::<tauri::Window>,
-                        "DM8 driver missing",
-                        format!("Failed to locate DM8 ODBC driver: {err}"),
-                    );
-                    return Err(err);
+                    app.dialog()
+                        .message(format!("Failed to locate DM8 ODBC driver: {err}"))
+                        .title("DM8 driver missing")
+                        .blocking_show();
+                    return Err(err.into());
                 }
             };
 
@@ -50,7 +52,10 @@ fn main() {
             let bound = tauri::async_runtime::block_on(dm8_export_backend::start_server(Some(0)))?;
             let backend_url = format!("http://127.0.0.1:{}", bound.port());
 
-            app.manage(AppState { driver: resolved, backend_url });
+            app.manage(AppState {
+                driver: resolved,
+                backend_url,
+            });
             Ok(())
         })
         .run(tauri::generate_context!())

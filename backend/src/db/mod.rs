@@ -1,3 +1,4 @@
 pub mod connection;
-pub mod schema;
 pub mod dm8_adapter;
+pub mod odbc_register;
+pub mod schema;

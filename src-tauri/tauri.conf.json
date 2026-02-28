@@ -1,33 +1,41 @@
 {
-  "$schema": "https://schema.tauri.app/config/1",
-  "package": {
-    "productName": "DM8 Export Tool",
-    "version": "0.1.0"
-  },
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DM8 Export Tool",
+  "version": "0.1.0",
+  "identifier": "com.dm8.export",
   "build": {
     "beforeDevCommand": "cd ../frontend && npm run dev -- --host --port 5173",
     "beforeBuildCommand": "cd ../frontend && npm run build",
-    "devPath": "http://localhost:5173",
-    "distDir": "../frontend/dist"
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../frontend/dist"
   },
-  "tauri": {
-    "bundle": {
-      "identifier": "com.dm8.export",
-      "targets": [
-        "appimage",
-        "nsis"
-      ],
-      "resources": [
-        "../drivers/dm8"
-      ]
+  "bundle": {
+    "targets": ["appimage", "deb", "nsis"],
+    "resources": {
+      "../drivers/dm8": "drivers/dm8"
     },
     "windows": {
-      "allowlist": {
-        "all": true
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "nsis/hooks.nsh"
       }
     },
+    "linux": {
+      "deb": {
+        "depends": ["unixodbc"]
+      }
+    }
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "DM8 Export Tool",
+        "width": 1024,
+        "height": 768
+      }
+    ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' http://localhost:* http://127.0.0.1:*; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline';"
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:* http://127.0.0.1:*; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline';"
     }
   }
 }

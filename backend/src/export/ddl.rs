@@ -33,13 +33,14 @@ pub fn generate_create_table(table: &TableDetails) -> String {
         .join(",\n");
 
     let mut ddl = String::new();
-    let _ = writeln!(
-        ddl,
-        "CREATE TABLE {} (\n{}\n);",
-        table_ident, column_lines
-    );
+    let _ = writeln!(ddl, "CREATE TABLE {} (\n{}\n);", table_ident, column_lines);
 
-    if let Some(comment) = table.comment.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+    if let Some(comment) = table
+        .comment
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
         let _ = writeln!(
             ddl,
             "COMMENT ON TABLE {} IS '{}';",
@@ -49,7 +50,12 @@ pub fn generate_create_table(table: &TableDetails) -> String {
     }
 
     for column in &table.columns {
-        if let Some(comment) = column.comment.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        if let Some(comment) = column
+            .comment
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
             let _ = writeln!(
                 ddl,
                 "COMMENT ON COLUMN {}.{} IS '{}';",
@@ -75,11 +81,7 @@ pub fn generate_primary_key(table: &TableDetails) -> Option<String> {
         .collect::<Vec<_>>()
         .join(", ");
 
-    let base_name = table
-        .name
-        .rsplit('.')
-        .next()
-        .unwrap_or(&table.name);
+    let base_name = table.name.rsplit('.').next().unwrap_or(&table.name);
     let constraint_name = format!("PK_{}", base_name);
 
     Some(format!(
@@ -167,8 +169,8 @@ fn normalize_columns_sorted(columns: &[String]) -> String {
 
 fn normalize_index_name(table_name: &str, index: &Index) -> String {
     let upper = index.name.to_uppercase();
-    let is_plain_index_number = upper.starts_with("INDEX")
-        && upper[5..].chars().all(|c| c.is_ascii_digit());
+    let is_plain_index_number =
+        upper.starts_with("INDEX") && upper[5..].chars().all(|c| c.is_ascii_digit());
 
     if !is_plain_index_number {
         return index.name.clone();
@@ -233,10 +235,21 @@ pub fn generate_check_constraints(table: &TableDetails) -> Vec<String> {
 }
 
 pub fn generate_foreign_keys(table: &TableDetails) -> Vec<String> {
+    let target_schema = table
+        .name
+        .split_once('.')
+        .map(|(schema, _)| schema.to_string());
+
     table
         .foreign_keys
         .iter()
         .map(|fk| {
+            let referenced_table_name = table_base_name(&fk.referenced_table).to_string();
+            let referenced_table = if let Some(schema) = &target_schema {
+                format!("{}.{}", schema, referenced_table_name)
+            } else {
+                fk.referenced_table.clone()
+            };
             let cols = fk
                 .columns
                 .iter()
@@ -254,7 +267,7 @@ pub fn generate_foreign_keys(table: &TableDetails) -> Vec<String> {
                 quote_identifier(&table.name),
                 quote_identifier(&fk.name),
                 cols,
-                quote_identifier(&fk.referenced_table),
+                quote_identifier(&referenced_table),
                 ref_cols
             );
             // Add ON DELETE rule if specified and not NO ACTION
@@ -277,6 +290,20 @@ pub fn generate_foreign_keys(table: &TableDetails) -> Vec<String> {
             stmt
         })
         .collect()
+}
+
+fn table_base_name(table_name: &str) -> &str {
+    table_name.rsplit('.').next().unwrap_or(table_name)
+}
+
+fn retain_foreign_keys_for_selected_tables(
+    table: &mut TableDetails,
+    selected_tables: &HashSet<String>,
+) {
+    table.foreign_keys.retain(|fk| {
+        let referenced_table = table_base_name(&fk.referenced_table).to_uppercase();
+        selected_tables.contains(&referenced_table)
+    });
 }
 
 pub fn generate_sequences(schema: &str, sequences: &[Sequence]) -> Vec<String> {
@@ -412,7 +439,6 @@ fn apply_trigger_terminator(stmt: &mut String, terminator: TriggerTerminator) {
     }
 }
 
-
 pub fn export_schema_ddl(
     connection: &Connection<'_>,
     source_schema: &str,
@@ -428,11 +454,18 @@ pub fn export_schema_ddl(
     // Cache table details to avoid repeated queries.
     let mut table_cache = Vec::new();
     for table_name in tables {
-        let details =
-            get_table_details(connection, &source_schema, table_name).with_context(|| {
-                format!("Failed to fetch table metadata for '{}'", table_name)
-            })?;
+        let details = get_table_details(connection, &source_schema, table_name)
+            .with_context(|| format!("Failed to fetch table metadata for '{}'", table_name))?;
         table_cache.push(details);
+    }
+
+    let selected_tables: HashSet<String> = table_cache
+        .iter()
+        .map(|t| table_base_name(&t.name).to_uppercase())
+        .collect();
+
+    for table_details in &mut table_cache {
+        retain_foreign_keys_for_selected_tables(table_details, &selected_tables);
     }
 
     let sequences = fetch_sequences(connection, &source_schema).unwrap_or_default();
@@ -447,7 +480,10 @@ pub fn export_schema_ddl(
     }
 
     let file = File::create(output_path).with_context(|| {
-        format!("Failed to create DDL export file at {}", output_path.display())
+        format!(
+            "Failed to create DDL export file at {}",
+            output_path.display()
+        )
     })?;
     let mut writer = BufWriter::new(file);
 
@@ -460,14 +496,17 @@ pub fn export_schema_ddl(
     writeln!(writer, "-- DM8 DDL 导出脚本")?;
     writeln!(writer, "-- ============================================")?;
     writeln!(writer, "-- 生成时间: {}", timestamp)?;
-    writeln!(writer, "-- 源 Schema: {}", source_schema)?;
-    writeln!(writer, "-- 目标 Schema: {}", target_schema)?;
+    writeln!(writer, "-- 源模式: {}", source_schema)?;
+    writeln!(writer, "-- 目标模式: {}", target_schema)?;
     writeln!(writer, "-- 表数量: {}", tables.len())?;
     writeln!(writer, "-- 涉及的表: {}", table_names.join(", "))?;
     writeln!(writer, "--")?;
     if trigger_terminator == TriggerTerminator::DataGripScript {
         writeln!(writer, "-- 执行方式: DataGrip 脚本模式")?;
-        writeln!(writer, "-- 注意: 触发器已导出到单独的文件，请使用 DIsql 或其他达梦原生工具执行")?;
+        writeln!(
+            writer,
+            "-- 注意: 触发器已导出到单独的文件，请使用 DIsql 或其他达梦原生工具执行"
+        )?;
     } else if trigger_terminator == TriggerTerminator::Script {
         writeln!(writer, "-- 执行方式: 脚本模式 (DBeaver/SQLark/DIsql)")?;
         writeln!(writer, "-- 注意: 触发器使用 / 作为语句分隔符")?;
@@ -480,8 +519,8 @@ pub fn export_schema_ddl(
     } else {
         writeln!(writer, "-- 说明: 此脚本不会删除已存在的表")?;
     }
-    writeln!(writer, "-- 重要: 触发器通常依赖 SEQUENCE (序列) 生成主键")?;
-    writeln!(writer, "-- 重要: 必须先执行 SEQUENCE 再执行触发器")?;
+    writeln!(writer, "-- 重要: 触发器通常依赖序列生成主键")?;
+    writeln!(writer, "-- 重要: 必须先执行序列，再执行触发器")?;
     writeln!(writer, "-- ============================================")?;
     writeln!(writer)?;
 
@@ -493,11 +532,7 @@ pub fn export_schema_ddl(
             writeln!(writer)?;
         }
 
-        writeln!(
-            writer,
-            "-- 表: {}",
-            quote_identifier(&render_table.name)
-        )?;
+        writeln!(writer, "-- 表: {}", quote_identifier(&render_table.name))?;
         if drop_existing {
             writeln!(
                 writer,
@@ -570,16 +605,16 @@ pub fn export_schema_ddl(
     if !seq_stmts.is_empty() || !trig_stmts.is_empty() {
         writeln!(writer)?;
         writeln!(writer, "-- ============================================")?;
-        writeln!(writer, "-- SEQUENCE 与触发器")?;
+        writeln!(writer, "-- 序列与触发器")?;
         writeln!(writer, "-- ============================================")?;
-        writeln!(writer, "-- 重要: 必须先执行 SEQUENCE 再执行触发器")?;
+        writeln!(writer, "-- 重要: 必须先执行序列，再执行触发器")?;
         writeln!(writer, "-- ============================================")?;
     }
 
     // 输出 SEQUENCE
     if !seq_stmts.is_empty() {
         writeln!(writer)?;
-        writeln!(writer, "-- SEQUENCE (第一步: 请先执行)")?;
+        writeln!(writer, "-- 序列（第一步：请先执行）")?;
         for stmt in seq_stmts {
             writeln!(writer, "{}", stmt)?;
         }
@@ -603,22 +638,40 @@ pub fn export_schema_ddl(
         })?;
         let mut trigger_writer = BufWriter::new(trigger_file);
 
-        writeln!(trigger_writer, "-- ============================================")?;
+        writeln!(
+            trigger_writer,
+            "-- ============================================"
+        )?;
         writeln!(trigger_writer, "-- DM8 触发器 DDL 导出脚本")?;
-        writeln!(trigger_writer, "-- ============================================")?;
+        writeln!(
+            trigger_writer,
+            "-- ============================================"
+        )?;
         writeln!(trigger_writer, "-- 生成时间: {}", timestamp)?;
-        writeln!(trigger_writer, "-- 目标 Schema: {}", target_schema)?;
+        writeln!(trigger_writer, "-- 目标模式: {}", target_schema)?;
         writeln!(trigger_writer, "-- 触发器数量: {}", trig_stmts.len())?;
         writeln!(trigger_writer, "-- 涉及的表: {}", trigger_tables.join(", "))?;
         writeln!(trigger_writer, "--")?;
         writeln!(trigger_writer, "-- 执行方式:")?;
-        writeln!(trigger_writer, "--   1. 使用 DIsql 命令行工具: disql USER/PASSWORD@HOST:PORT -f 此文件路径")?;
+        writeln!(
+            trigger_writer,
+            "--   1. 使用 DIsql 命令行工具: disql USER/PASSWORD@HOST:PORT -f 此文件路径"
+        )?;
         writeln!(trigger_writer, "--   2. 使用达梦管理工具打开此文件并执行")?;
-        writeln!(trigger_writer, "--   3. 在 DataGrip 中逐条选中触发器语句执行 (不要使用 Run Script)")?;
+        writeln!(
+            trigger_writer,
+            "--   3. 在 DataGrip 中逐条选中触发器语句执行（不要使用“运行脚本”）"
+        )?;
         writeln!(trigger_writer, "--")?;
-        writeln!(trigger_writer, "-- 重要: 必须先执行主DDL文件中的 SEQUENCE，再执行本文件")?;
+        writeln!(
+            trigger_writer,
+            "-- 重要: 必须先执行主 DDL 文件中的序列，再执行本文件"
+        )?;
         writeln!(trigger_writer, "-- 注意: 每个触发器以 / 结尾作为语句分隔符")?;
-        writeln!(trigger_writer, "-- ============================================")?;
+        writeln!(
+            trigger_writer,
+            "-- ============================================"
+        )?;
         writeln!(trigger_writer)?;
         for stmt in &trig_stmts {
             writeln!(trigger_writer, "{}", stmt)?;
@@ -630,25 +683,27 @@ pub fn export_schema_ddl(
 
         // 在主文件中添加提示
         writeln!(writer)?;
-        writeln!(writer, "-- 触发器 (第二步: 请在 SEQUENCE 之后执行)")?;
+        writeln!(writer, "-- 触发器（第二步：请在序列之后执行）")?;
         writeln!(
             writer,
             "-- 注意: 触发器已导出到单独的文件: {}",
-            trigger_path.file_name().unwrap_or_default().to_string_lossy()
+            trigger_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
         )?;
-        writeln!(
-            writer,
-            "-- 请使用 DIsql 或其他达梦原生工具执行该文件"
-        )?;
+        writeln!(writer, "-- 请使用 DIsql 或其他达梦原生工具执行该文件")?;
     } else if !trig_stmts.is_empty() {
         writeln!(writer)?;
-        writeln!(writer, "-- 触发器 (第二步: 请在 SEQUENCE 之后执行)")?;
+        writeln!(writer, "-- 触发器（第二步：请在序列之后执行）")?;
         for stmt in trig_stmts {
             writeln!(writer, "{}", stmt)?;
         }
     }
 
-    writer.flush().context("Failed to flush DDL export to disk")?;
+    writer
+        .flush()
+        .context("Failed to flush DDL export to disk")?;
     Ok(())
 }
 
@@ -692,8 +747,8 @@ fn format_data_type(column: &Column) -> String {
 
     match data_type.as_str() {
         // String types: use length with CHAR/BYTE semantics
-        "VARCHAR" | "VARCHAR2" | "CHAR" | "NCHAR" | "NVARCHAR" | "NVARCHAR2" | "RAW"
-        | "BINARY" | "VARBINARY" => {
+        "VARCHAR" | "VARCHAR2" | "CHAR" | "NCHAR" | "NVARCHAR" | "NVARCHAR2" | "RAW" | "BINARY"
+        | "VARBINARY" => {
             if let Some(len) = column.length.filter(|l| *l > 0) {
                 if let Some(cs) = column.char_semantics.as_deref().map(str::to_uppercase) {
                     // DM8 CHAR_USED: 'C' = CHAR semantics, 'B' = BYTE semantics
@@ -741,8 +796,8 @@ fn format_data_type(column: &Column) -> String {
             }
         }
         // These types don't need length/precision in DDL
-        "DATE" | "BLOB" | "CLOB" | "NCLOB" | "TEXT" | "LONG" | "LONGVARBINARY"
-        | "INTEGER" | "INT" | "BIGINT" | "SMALLINT" | "TINYINT" | "BIT" | "BOOLEAN" => {
+        "DATE" | "BLOB" | "CLOB" | "NCLOB" | "TEXT" | "LONG" | "LONGVARBINARY" | "INTEGER"
+        | "INT" | "BIGINT" | "SMALLINT" | "TINYINT" | "BIT" | "BOOLEAN" => {
             // Keep as-is without modifications
         }
         _ => {
@@ -777,15 +832,27 @@ fn format_default(column: &Column, raw: &str) -> String {
             } else {
                 "YYYY-MM-DD"
             };
-            return format!("TO_DATE('{}','{}')", escape_single_quotes(inner), format_str);
+            return format!(
+                "TO_DATE('{}','{}')",
+                escape_single_quotes(inner),
+                format_str
+            );
         }
         if dt.starts_with("TIMESTAMP") && (is_date_literal(inner) || is_timestamp_literal(inner)) {
             let normalized = normalize_iso_timestamp(inner);
             let format_str = build_timestamp_format(&normalized, dt.contains("TIME ZONE"));
             if dt.contains("TIME ZONE") && has_timezone(&normalized) {
-                return format!("TO_TIMESTAMP_TZ('{}','{}')", escape_single_quotes(&normalized), format_str);
+                return format!(
+                    "TO_TIMESTAMP_TZ('{}','{}')",
+                    escape_single_quotes(&normalized),
+                    format_str
+                );
             }
-            return format!("TO_TIMESTAMP('{}','{}')", escape_single_quotes(&normalized), format_str);
+            return format!(
+                "TO_TIMESTAMP('{}','{}')",
+                escape_single_quotes(&normalized),
+                format_str
+            );
         }
         return expr.to_string();
     }
@@ -796,9 +863,7 @@ fn format_default(column: &Column, raw: &str) -> String {
     }
 
     // Hex literal: X'0A0B' or 0x0A0B
-    if (expr_upper.starts_with("X'") && expr.ends_with('\''))
-        || expr_upper.starts_with("0X")
-    {
+    if (expr_upper.starts_with("X'") && expr.ends_with('\'')) || expr_upper.starts_with("0X") {
         return expr.to_string();
     }
 
@@ -1015,13 +1080,21 @@ fn has_timezone(expr: &str) -> bool {
     if let Some(pos) = expr.rfind('+') {
         let rest = &expr[pos..];
         // Timezone pattern: +HH:MM or +HHMM
-        return rest.len() >= 5 && rest[1..].chars().next().map_or(false, |c| c.is_ascii_digit());
+        return rest.len() >= 5
+            && rest[1..]
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_ascii_digit());
     }
     if let Some(pos) = expr.rfind('-') {
         // Make sure it's not a date separator (position should be after time part)
         if expr[..pos].contains(':') {
             let rest = &expr[pos..];
-            return rest.len() >= 5 && rest[1..].chars().next().map_or(false, |c| c.is_ascii_digit());
+            return rest.len() >= 5
+                && rest[1..]
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_ascii_digit());
         }
     }
     false
@@ -1134,18 +1207,12 @@ fn is_date_literal(expr: &str) -> bool {
     }
 
     // Second part should be 1-2 digit month
-    if parts[1].is_empty()
-        || parts[1].len() > 2
-        || !parts[1].chars().all(|c| c.is_ascii_digit())
-    {
+    if parts[1].is_empty() || parts[1].len() > 2 || !parts[1].chars().all(|c| c.is_ascii_digit()) {
         return false;
     }
 
     // Third part should be 1-2 digit day
-    if parts[2].is_empty()
-        || parts[2].len() > 2
-        || !parts[2].chars().all(|c| c.is_ascii_digit())
-    {
+    if parts[2].is_empty() || parts[2].len() > 2 || !parts[2].chars().all(|c| c.is_ascii_digit()) {
         return false;
     }
 
@@ -1391,15 +1458,17 @@ fn normalize_trigger_body(body: &str) -> String {
                     depth -= next_line.matches(')').count() as i32;
 
                     // If we're at depth 0 and hit a line that could end the statement
-                    if depth == 0 && (next_upper.ends_with(';')
-                        || next_upper.starts_with("SELECT ")
-                        || next_upper.starts_with("INSERT ")
-                        || next_upper.starts_with("UPDATE ")
-                        || next_upper.starts_with("DELETE ")
-                        || next_upper.contains(":NEW.")
-                        || next_upper.contains(":OLD.")
-                        || next_upper.contains(":=")
-                        || next_upper.starts_with("END")) {
+                    if depth == 0
+                        && (next_upper.ends_with(';')
+                            || next_upper.starts_with("SELECT ")
+                            || next_upper.starts_with("INSERT ")
+                            || next_upper.starts_with("UPDATE ")
+                            || next_upper.starts_with("DELETE ")
+                            || next_upper.contains(":NEW.")
+                            || next_upper.contains(":OLD.")
+                            || next_upper.contains(":=")
+                            || next_upper.starts_with("END"))
+                    {
                         break;
                     }
 
@@ -1525,8 +1594,12 @@ fn normalize_trigger_references(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{generate_foreign_keys, generate_indexes, generate_triggers, TriggerTerminator};
-    use crate::models::{CheckConstraint, ForeignKey, Index, TableDetails, TriggerDefinition, UniqueConstraint};
+    use crate::models::{
+        CheckConstraint, ForeignKey, Index, TableDetails, TriggerDefinition, UniqueConstraint,
+    };
 
     fn base_table_details(name: &str, indexes: Vec<Index>) -> TableDetails {
         TableDetails {
@@ -1560,8 +1633,12 @@ mod tests {
         let statements = generate_indexes(&table);
         assert_eq!(statements.len(), 1);
         let stmt = &statements[0];
-        assert!(stmt.contains("CREATE INDEX \"IDX_QRTZ_BLOB_TRIGGERS_SCHED_NAME_TRIGGER_NAME_TRIGGER_GROUP\""));
-        assert!(!stmt.contains("\"PLATFORM_V3\".\"IDX_QRTZ_BLOB_TRIGGERS_SCHED_NAME_TRIGGER_NAME_TRIGGER_GROUP\""));
+        assert!(stmt.contains(
+            "CREATE INDEX \"IDX_QRTZ_BLOB_TRIGGERS_SCHED_NAME_TRIGGER_NAME_TRIGGER_GROUP\""
+        ));
+        assert!(!stmt.contains(
+            "\"PLATFORM_V3\".\"IDX_QRTZ_BLOB_TRIGGERS_SCHED_NAME_TRIGGER_NAME_TRIGGER_GROUP\""
+        ));
     }
 
     #[test]
@@ -1585,7 +1662,11 @@ mod tests {
         ];
 
         let statements = generate_indexes(&table);
-        assert_eq!(statements.len(), 0, "Should skip index that covers same columns as PK");
+        assert_eq!(
+            statements.len(),
+            0,
+            "Should skip index that covers same columns as PK"
+        );
     }
 
     #[test]
@@ -1626,7 +1707,11 @@ mod tests {
         }];
 
         let statements = generate_indexes(&table);
-        assert_eq!(statements.len(), 0, "Should skip index that matches unique constraint columns");
+        assert_eq!(
+            statements.len(),
+            0,
+            "Should skip index that matches unique constraint columns"
+        );
     }
 
     #[test]
@@ -1646,6 +1731,57 @@ mod tests {
         let stmt = &statements[0].to_uppercase();
         assert!(!stmt.contains("ON DELETE NO ACTION"));
         assert!(!stmt.contains("ON UPDATE NO ACTION"));
+    }
+
+    #[test]
+    fn generate_foreign_keys_rewrites_reference_to_table_schema() {
+        let mut table = base_table_details("PLATFORM_V3.QRTZ_TRIGGERS", Vec::new());
+        table.foreign_keys = vec![ForeignKey {
+            name: "FK_TEST".to_string(),
+            columns: vec!["SCHED_NAME".to_string()],
+            referenced_table: "PLATFORM.QRTZ_JOB_DETAILS".to_string(),
+            referenced_columns: vec!["SCHED_NAME".to_string()],
+            delete_rule: None,
+            update_rule: None,
+        }];
+
+        let statements = generate_foreign_keys(&table);
+        assert_eq!(statements.len(), 1);
+        assert!(
+            statements[0].contains("REFERENCES \"PLATFORM_V3\".\"QRTZ_JOB_DETAILS\""),
+            "expected REFERENCES to use target schema from table name, got: {}",
+            statements[0]
+        );
+    }
+
+    #[test]
+    fn retain_foreign_keys_for_selected_tables_filters_unselected_references() {
+        let mut table = base_table_details("PLATFORM_V3.QRTZ_TRIGGERS", Vec::new());
+        table.foreign_keys = vec![
+            ForeignKey {
+                name: "FK_KEEP".to_string(),
+                columns: vec!["A".to_string()],
+                referenced_table: "PLATFORM.QRTZ_JOB_DETAILS".to_string(),
+                referenced_columns: vec!["ID".to_string()],
+                delete_rule: None,
+                update_rule: None,
+            },
+            ForeignKey {
+                name: "FK_DROP".to_string(),
+                columns: vec!["B".to_string()],
+                referenced_table: "PLATFORM.FLW_RU_BATCH".to_string(),
+                referenced_columns: vec!["ID_".to_string()],
+                delete_rule: None,
+                update_rule: None,
+            },
+        ];
+
+        let selected_tables =
+            HashSet::from(["QRTZ_TRIGGERS".to_string(), "QRTZ_JOB_DETAILS".to_string()]);
+        super::retain_foreign_keys_for_selected_tables(&mut table, &selected_tables);
+
+        assert_eq!(table.foreign_keys.len(), 1);
+        assert_eq!(table.foreign_keys[0].name, "FK_KEEP");
     }
 
     #[test]
@@ -1680,13 +1816,23 @@ mod tests {
     fn normalize_trigger_body_handles_multiline_select() {
         // This is a simplified test - the function may not handle all edge cases perfectly,
         // but it should handle the common case of SELECT...INTO with FROM clause
-        let body = "BEGIN\nSELECT SEQ.NEXTVAL INTO :NEW.ID FROM DUAL\n:NEW.UPDATE_TIME := SYSDATE\nEND";
+        let body =
+            "BEGIN\nSELECT SEQ.NEXTVAL INTO :NEW.ID FROM DUAL\n:NEW.UPDATE_TIME := SYSDATE\nEND";
         let normalized = super::normalize_trigger_body(body);
 
         // Should add semicolons to complete statements
-        assert!(normalized.contains("FROM DUAL;"), "Single-line SELECT...INTO...FROM should have semicolon");
-        assert!(normalized.contains("SYSDATE;"), "Assignment should have semicolon");
-        assert!(normalized.trim_end().ends_with(';'), "END should have semicolon");
+        assert!(
+            normalized.contains("FROM DUAL;"),
+            "Single-line SELECT...INTO...FROM should have semicolon"
+        );
+        assert!(
+            normalized.contains("SYSDATE;"),
+            "Assignment should have semicolon"
+        );
+        assert!(
+            normalized.trim_end().ends_with(';'),
+            "END should have semicolon"
+        );
     }
 
     #[test]
@@ -1723,7 +1869,8 @@ mod tests {
             timing: "BEFORE".to_string(),
             events: vec!["INSERT".to_string()],
             each_row: true,
-            body: "WHEN (NEW.ID IS NULL)\nBEGIN\nSELECT SEQ.NEXTVAL INTO :NEW.ID FROM DUAL;\nEND".to_string(),
+            body: "WHEN (NEW.ID IS NULL)\nBEGIN\nSELECT SEQ.NEXTVAL INTO :NEW.ID FROM DUAL;\nEND"
+                .to_string(),
         }];
 
         let statements = generate_triggers("PLATFORM", &triggers, TriggerTerminator::DataGrip);
@@ -1731,9 +1878,14 @@ mod tests {
         let stmt = &statements[0];
 
         // Verify structure: FOR EACH ROW comes before WHEN
-        let for_each_row_pos = stmt.find("FOR EACH ROW").expect("Should contain FOR EACH ROW");
+        let for_each_row_pos = stmt
+            .find("FOR EACH ROW")
+            .expect("Should contain FOR EACH ROW");
         let when_pos = stmt.find("WHEN (").expect("Should contain WHEN clause");
-        assert!(for_each_row_pos < when_pos, "FOR EACH ROW should come before WHEN");
+        assert!(
+            for_each_row_pos < when_pos,
+            "FOR EACH ROW should come before WHEN"
+        );
 
         // Verify WHEN clause content
         assert!(stmt.contains("WHEN (:NEW.ID IS NULL)"));
@@ -1742,7 +1894,10 @@ mod tests {
         assert!(stmt.contains("REFERENCING OLD AS OLD NEW AS NEW"));
 
         // Verify trigger terminator
-        assert!(stmt.trim_end().ends_with(';'), "Trigger should end with ';'");
+        assert!(
+            stmt.trim_end().ends_with(';'),
+            "Trigger should end with ';'"
+        );
     }
 
     #[test]
@@ -1753,7 +1908,9 @@ mod tests {
             timing: "BEFORE".to_string(),
             events: vec!["INSERT".to_string()],
             each_row: true,
-            body: "DECLARE\n  v_count NUMBER;\nBEGIN\n  SELECT COUNT(*) INTO v_count FROM DUAL;\nEND".to_string(),
+            body:
+                "DECLARE\n  v_count NUMBER;\nBEGIN\n  SELECT COUNT(*) INTO v_count FROM DUAL;\nEND"
+                    .to_string(),
         }];
 
         let statements = generate_triggers("PLATFORM", &triggers, TriggerTerminator::DataGrip);
@@ -1763,11 +1920,19 @@ mod tests {
         // Should not wrap DECLARE block with BEGIN/END
         assert!(stmt.contains("DECLARE"));
         let declare_count = stmt.matches("DECLARE").count();
-        assert_eq!(declare_count, 1, "Should have exactly one DECLARE keyword, got: {}", stmt);
+        assert_eq!(
+            declare_count, 1,
+            "Should have exactly one DECLARE keyword, got: {}",
+            stmt
+        );
 
         // Should not have double BEGIN
         let begin_count = stmt.matches("BEGIN").count();
-        assert_eq!(begin_count, 1, "Should have exactly one BEGIN keyword, got: {}", stmt);
+        assert_eq!(
+            begin_count, 1,
+            "Should have exactly one BEGIN keyword, got: {}",
+            stmt
+        );
     }
 
     #[test]
@@ -1841,7 +2006,10 @@ mod tests {
         let statements = generate_triggers("PLATFORM", &triggers, TriggerTerminator::Script);
         assert_eq!(statements.len(), 1);
         let stmt = &statements[0];
-        assert!(stmt.contains("\n/"), "Expected script mode to include '/' terminator");
+        assert!(
+            stmt.contains("\n/"),
+            "Expected script mode to include '/' terminator"
+        );
         assert!(stmt.trim_end().ends_with('/'));
     }
 
@@ -1858,11 +2026,15 @@ mod tests {
             body: "BEGIN\n:NEW.ID := 1;\nEND".to_string(),
         }];
 
-        let statements = generate_triggers("PLATFORM", &triggers, TriggerTerminator::DataGripScript);
+        let statements =
+            generate_triggers("PLATFORM", &triggers, TriggerTerminator::DataGripScript);
         assert_eq!(statements.len(), 1);
         let stmt = &statements[0];
         // DataGripScript 现在使用 Script 格式
-        assert!(stmt.contains("\n/"), "Expected script mode to include '/' terminator");
+        assert!(
+            stmt.contains("\n/"),
+            "Expected script mode to include '/' terminator"
+        );
         assert!(stmt.trim_end().ends_with('/'));
     }
 }

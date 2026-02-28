@@ -1,0 +1,10 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for DM8 Export Tool",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "opener:default"
+  ]
+}

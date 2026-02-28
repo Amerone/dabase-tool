@@ -1,8 +1,6 @@
 # Rust
 /backend/target/
-/backend/Cargo.lock
 /src-tauri/target/
-/src-tauri/Cargo.lock
 **/*.rs.bk
 
 # Node
@@ -38,6 +36,7 @@ exports/
 # Toolchains and local tools
 .rustup/
 .amarone/
+.claude/
 
 # Debian packages
 *.deb
