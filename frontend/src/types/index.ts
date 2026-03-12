@@ -1,7 +1,9 @@
 export type ConfigSource = 'sqlite' | 'env';
 export type DriverSource = 'Bundled' | 'Env' | 'System';
+export type DbType = 'dm8' | 'mysql' | 'kingbase' | 'shentong';
 
 export interface ConnectionConfig {
+  db_type?: DbType;
   host: string;
   port: number;
   username: string;
@@ -16,6 +18,13 @@ export interface StoredConnectionResponse {
   config: ConnectionConfig;
   source: ConfigSource;
   updated_at?: string;
+}
+
+export interface NamedConnectionResponse {
+  id: number;
+  name: string;
+  config: ConnectionConfig;
+  updated_at: string;
 }
 
 export interface Table {
@@ -84,22 +93,80 @@ export interface TriggerDefinition {
   body: string;
 }
 
+export interface TableIdentifier {
+  schema: string;
+  name: string;
+}
+
 export interface ExportRequest {
   config: ConnectionConfig;
+  target_dialect?: DbType;
   export_schema?: string;
   export_compat?: string;
-  tables: string[];
+  tables: TableIdentifier[];
   include_ddl: boolean;
   include_data: boolean;
   batch_size?: number;
   drop_existing?: boolean;
   include_row_counts?: boolean;
+  strict_mode?: boolean;
+}
+
+export type CapabilityLevel = 'none' | 'partial' | 'full';
+export type ExportObjectKind =
+  | 'ddl'
+  | 'data'
+  | 'columns'
+  | 'primary_keys'
+  | 'indexes'
+  | 'unique_constraints'
+  | 'foreign_keys'
+  | 'check_constraints'
+  | 'triggers'
+  | 'sequences';
+
+export interface ExportCapabilityEntry {
+  object: ExportObjectKind;
+  source_level: CapabilityLevel;
+  target_level: CapabilityLevel;
+  effective_level: CapabilityLevel;
+  note?: string;
+  reason_code?: string;
+}
+
+export interface ExportDataOptions {
+  include_row_counts_supported: boolean;
+  include_row_counts_note?: string;
+}
+
+export interface ExportCapabilityReport {
+  source_db_type: DbType;
+  target_dialect: DbType;
+  entries: ExportCapabilityEntry[];
+  data_options: ExportDataOptions;
 }
 
 export interface ExportResponse {
   success: boolean;
   message: string;
   file_path?: string;
+  summary?: ExportExecutionSummary;
+}
+
+export interface ExportExecutionSummary {
+  workload: ExportObjectKind;
+  execution_path: string;
+  duration_ms: number;
+  rows_exported?: number;
+  warnings: string[];
+  skipped_objects: ExportSkippedObject[];
+}
+
+export interface ExportSkippedObject {
+  object_kind: ExportObjectKind;
+  object_name: string;
+  reason_code?: string;
+  message: string;
 }
 
 export interface ApiResponse<T> {

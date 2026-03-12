@@ -21,6 +21,9 @@
 - 📊 **模式浏览** - 浏览模式、表，查看详细的表结构
 - 📝 **DDL 导出** - 导出表结构为 CREATE TABLE 语句
 - 💾 **数据导出** - 导出表数据为 INSERT 语句，支持配置批量大小
+  - 4 阶段 FK 感知导出：禁用外键 → 按依赖反序清空 → 按依赖顺序插入 → 重启外键
+  - LOB 列（BLOB/CLOB）自动切换逐行导出，避免 8KB 缓冲截断
+  - 大 BLOB（>16KB）使用 PL/SQL `DBMS_LOB.APPEND` 块，突破 DM8 `HEXTORAW` 16383 字节限制
 - 🎨 **现代化界面** - 暗黑主题界面，配备动态粒子背景
 - ⚡ **高性能** - Rust 后端实现快速数据处理
 - 🌐 **基于 Web** - 无需安装，通过浏览器访问
@@ -392,6 +395,18 @@ curl -X POST http://localhost:3000/api/connection/test \
 - 增加 frontend/src/services/api.ts 中的 axios 超时时间
 ```
 
+**问题**：导入时 DM8 报 `-6108 字符串截断`
+```
+原因：BLOB 数据超过 DM8 HEXTORAW() 的 16383 字节限制
+解决方案：确保使用最新版本，大 BLOB 自动使用 DBMS_LOB.APPEND PL/SQL 块导出
+```
+
+**问题**：导入时 DM8 报 `-6607 违反引用约束`
+```
+原因：外键约束导致插入顺序冲突，或父表数据因截断未插入成功
+解决方案：确保使用最新版本，数据导出已包含 4 阶段 FK 处理（禁用→清空→插入→启用）
+```
+
 ## 🤝 贡献
 
 欢迎贡献！请遵循以下指南：
@@ -428,3 +443,28 @@ curl -X POST http://localhost:3000/api/connection/test \
 ---
 
 使用 ❤️ 和 Rust + React 构建
+
+## Phase-1 Multi-DB Update (2026-03-03)
+
+Current status:
+
+- Added `db_type` in connection config: `dm8`, `mysql`, `kingbase`, `shentong`
+- Implemented phase-1 support for connection + table browsing + table details
+- `mysql` uses native Rust driver (`sqlx/mysql`)
+- `kingbase` and `shentong` use ODBC generic metadata queries
+- Export is still DM8-only in phase-1
+
+Backend env additions:
+
+- `DATABASE_TYPE=dm8` (default)
+- Optional for ODBC naming:
+  - `KINGBASE_ODBC_DRIVER`
+  - `SHENTONG_ODBC_DRIVER`
+- Optional for bundled driver file path:
+  - `KINGBASE_ODBC_DRIVER_PATH`
+  - `SHENTONG_ODBC_DRIVER_PATH`
+
+Driver setup and QA docs:
+
+- `docs/guides/kingbase-shentong-driver-setup.md`
+- `docs/testing/phase1-multi-db-qa.md`

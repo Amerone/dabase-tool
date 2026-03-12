@@ -1,269 +1,296 @@
+mod context;
+mod execution;
+
 use axum::{extract::Json, http::StatusCode};
 use chrono::Local;
-use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::{
-    db::connection::ConnectionPool,
-    export::data::export_schema_data,
-    export::ddl::{export_schema_ddl, TriggerTerminator},
-    models::{ApiResponse, ConnectionConfig, ExportRequest, ExportResponse},
+    api::response::{self, ApiResult},
+    export::orchestrator::{ExportWorkload, LegacyExportOrchestrator, LegacyExportPlan},
+    models::{ErrorCode, ExportResponse},
 };
 
-fn normalize_schema_value(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_string())
-}
+use self::{
+    context::{
+        build_export_context, build_summary, collect_workload_warnings, exports_dir,
+        format_export_filename, resolve_compat, resolve_include_row_counts, resolve_target_dialect,
+    },
+    execution::{execute_data_by_path, execute_ddl_by_path},
+};
 
-fn resolve_target_schema(source: &str, export_schema: Option<&str>) -> String {
-    normalize_schema_value(export_schema).unwrap_or_else(|| source.trim().to_string())
-}
+const DEFAULT_BATCH_SIZE: usize = 1000;
+const MAX_BATCH_SIZE: usize = 10_000;
 
-fn resolve_compat(value: Option<&str>) -> TriggerTerminator {
-    match value.map(str::trim).filter(|v| !v.is_empty()) {
-        Some(mode) if mode.eq_ignore_ascii_case("script") => TriggerTerminator::Script,
-        Some(mode) if mode.eq_ignore_ascii_case("datagrip-script") => {
-            TriggerTerminator::DataGripScript
-        }
-        Some(mode) if mode.eq_ignore_ascii_case("datagrip") => TriggerTerminator::DataGrip,
-        _ => TriggerTerminator::DataGrip,
-    }
-}
-
-/// Replace characters that are unsafe in file paths with underscores.
-fn sanitize_filename_part(s: &str) -> String {
-    s.trim()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn exports_dir() -> Result<PathBuf, String> {
-    let home =
-        dirs::home_dir().ok_or_else(|| "Unable to determine home directory".to_string())?;
-    let dir = home.join(".amarone").join("exports");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Failed to create exports directory {:?}: {}", dir, e))?;
-    Ok(dir)
-}
-
-fn format_export_filename(
-    source: &str,
-    target: &str,
-    kind: &str,
-    suffix: &str,
-) -> Result<PathBuf, String> {
-    let dir = exports_dir()?;
-    Ok(dir.join(format!(
-        "{}_to_{}_{}_{}.sql",
-        sanitize_filename_part(source),
-        sanitize_filename_part(target),
-        kind,
-        suffix
-    )))
-}
-
-fn format_error_chain(err: &anyhow::Error) -> String {
-    format!("{:#}", err)
-}
-
-fn connect_from_request(
-    req: &mut ExportRequest,
-) -> Result<(ConnectionPool, String, String), String> {
-    let config = ConnectionConfig {
-        host: std::mem::take(&mut req.config.host),
-        port: req.config.port,
-        username: std::mem::take(&mut req.config.username),
-        password: std::mem::take(&mut req.config.password),
-        schema: req.config.schema.clone(),
-        export_schema: req.config.export_schema.clone(),
-    };
-
-    let source_schema = config.schema.clone();
-    let target_schema = resolve_target_schema(
-        &source_schema,
-        req.export_schema
-            .as_deref()
-            .or(config.export_schema.as_deref()),
-    );
-
-    let pool =
-        ConnectionPool::new(config).map_err(|e| format!("Failed to create connection: {e}"))?;
-
-    Ok((pool, source_schema, target_schema))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        format_error_chain, format_export_filename, resolve_compat, resolve_target_schema,
-        sanitize_filename_part,
-    };
-    use crate::export::ddl::TriggerTerminator;
-
-    #[test]
-    fn resolve_target_schema_falls_back_to_source() {
-        let target = resolve_target_schema("SYSDBA", None);
-        assert_eq!(target, "SYSDBA");
-    }
-
-    #[test]
-    fn resolve_target_schema_uses_trimmed_value() {
-        let target = resolve_target_schema("SYSDBA", Some("  APP  "));
-        assert_eq!(target, "APP");
-    }
-
-    #[test]
-    fn format_export_filename_includes_source_and_target() {
-        let path = format_export_filename("SRC", "TGT", "ddl", "20260130_120000_000").unwrap();
-        assert!(path.is_absolute(), "export path must be absolute");
-        let name = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(name, "SRC_to_TGT_ddl_20260130_120000_000.sql");
-    }
-
-    #[test]
-    fn format_export_filename_sanitizes_special_chars() {
-        let path = format_export_filename("../evil", "a;b", "ddl", "ts").unwrap();
-        assert!(path.is_absolute(), "export path must be absolute");
-        let name = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(name, "___evil_to_a_b_ddl_ts.sql");
-    }
-
-    #[test]
-    fn sanitize_filename_part_keeps_safe_chars() {
-        assert_eq!(sanitize_filename_part("Hello_World-1"), "Hello_World-1");
-    }
-
-    #[test]
-    fn sanitize_filename_part_replaces_dots_slashes() {
-        assert_eq!(sanitize_filename_part("../foo.bar"), "___foo_bar");
-    }
-
-    #[test]
-    fn format_error_chain_includes_contexts() {
-        let err = anyhow::anyhow!("root cause")
-            .context("middle context")
-            .context("top context");
-        let rendered = format_error_chain(&err);
-        assert!(rendered.contains("top context"));
-        assert!(rendered.contains("middle context"));
-        assert!(rendered.contains("root cause"));
-    }
-
-    #[test]
-    fn resolve_compat_defaults_to_datagrip() {
-        let mode = resolve_compat(None);
-        assert_eq!(mode, TriggerTerminator::DataGrip);
-    }
-
-    #[test]
-    fn resolve_compat_datagrip_script_maps_to_datagrip_script() {
-        let mode = resolve_compat(Some("datagrip-script"));
-        assert_eq!(mode, TriggerTerminator::DataGripScript);
+fn resolve_batch_size(batch_size: Option<usize>) -> Result<usize, String> {
+    match batch_size {
+        Some(size) if size == 0 || size > MAX_BATCH_SIZE => Err(format!(
+            "batch_size must be between 1 and {}",
+            MAX_BATCH_SIZE
+        )),
+        Some(size) => Ok(size),
+        None => Ok(DEFAULT_BATCH_SIZE),
     }
 }
 
 pub async fn export_ddl(
-    Json(mut req): Json<ExportRequest>,
-) -> Result<Json<ApiResponse<ExportResponse>>, StatusCode> {
-    let (pool, source_schema, target_schema) = match connect_from_request(&mut req) {
-        Ok(v) => v,
-        Err(e) => return Ok(Json(ApiResponse::error(e))),
+    Json(mut req): Json<crate::models::ExportRequest>,
+) -> ApiResult<ExportResponse> {
+    let source_db_type = req.config.db_type.clone();
+    let target_dialect = resolve_target_dialect(&req);
+    let execution_path = match LegacyExportOrchestrator::resolve_execution_path(
+        &source_db_type,
+        &target_dialect,
+        ExportWorkload::Ddl,
+    ) {
+        Ok(path) => path,
+        Err(message) => return response::err(StatusCode::BAD_REQUEST, message),
+    };
+    let warnings = match collect_workload_warnings(
+        &source_db_type,
+        &target_dialect,
+        ExportWorkload::Ddl,
+        req.strict_mode,
+    ) {
+        Ok(value) => value,
+        Err(message) => return response::err(StatusCode::UNPROCESSABLE_ENTITY, message),
     };
 
-    let connection = match pool.get_connection() {
-        Ok(conn) => conn,
-        Err(e) => {
-            return Ok(Json(ApiResponse::error(format!(
-                "Failed to get connection: {e}"
-            ))))
-        }
-    };
+    let (config, source_schema, target_schema) = build_export_context(&mut req);
 
     let date_suffix = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let output_path = match format_export_filename(&source_schema, &target_schema, "ddl", &date_suffix) {
-        Ok(p) => p,
-        Err(e) => return Ok(Json(ApiResponse::error(e))),
+    let output_path =
+        match format_export_filename(&source_schema, &target_schema, "ddl", &date_suffix) {
+            Ok(p) => p,
+            Err(e) => return response::err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+
+    let plan = LegacyExportPlan {
+        source_schema,
+        target_schema,
+        tables: req.tables,
+        output_path,
     };
 
-    match export_schema_ddl(
-        &connection,
-        &source_schema,
-        &target_schema,
-        &req.tables,
-        &output_path,
+    let start = Instant::now();
+    let result = execute_ddl_by_path(
+        execution_path,
+        &config,
+        &plan,
         req.drop_existing,
         resolve_compat(req.export_compat.as_deref()),
-    ) {
-        Ok(_) => Ok(Json(ApiResponse::success(ExportResponse {
-            success: true,
-            message: "DDL exported successfully".to_string(),
-            file_path: Some(output_path.to_string_lossy().to_string()),
-        }))),
-        Err(e) => Ok(Json(ApiResponse::error(format!(
-            "Failed to export DDL: {}",
-            format_error_chain(&e)
-        )))),
+    )
+    .await;
+
+    match result {
+        Ok(_) => {
+            let duration_ms = start.elapsed().as_millis();
+            let summary = build_summary(
+                ExportWorkload::Ddl,
+                execution_path,
+                duration_ms,
+                None,
+                warnings,
+            );
+            tracing::info!(
+                workload = "ddl",
+                ?source_db_type,
+                ?target_dialect,
+                ?execution_path,
+                duration_ms,
+                output_path = %plan.output_path.display(),
+                "Export completed"
+            );
+            response::ok(ExportResponse {
+                success: true,
+                message: "DDL exported successfully".to_string(),
+                file_path: Some(plan.output_path.to_string_lossy().to_string()),
+                summary: Some(summary),
+            })
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "Failed to export DDL");
+            response::err_with_code(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to export DDL",
+                ErrorCode::ExportFailed,
+            )
+        }
     }
 }
 
 pub async fn export_data(
-    Json(mut req): Json<ExportRequest>,
-) -> Result<Json<ApiResponse<ExportResponse>>, StatusCode> {
-    let (pool, source_schema, target_schema) = match connect_from_request(&mut req) {
-        Ok(v) => v,
-        Err(e) => return Ok(Json(ApiResponse::error(e))),
+    Json(mut req): Json<crate::models::ExportRequest>,
+) -> ApiResult<ExportResponse> {
+    let source_db_type = req.config.db_type.clone();
+    let target_dialect = resolve_target_dialect(&req);
+    let execution_path = match LegacyExportOrchestrator::resolve_execution_path(
+        &source_db_type,
+        &target_dialect,
+        ExportWorkload::Data,
+    ) {
+        Ok(path) => path,
+        Err(message) => return response::err(StatusCode::BAD_REQUEST, message),
+    };
+    let mut warnings = match collect_workload_warnings(
+        &source_db_type,
+        &target_dialect,
+        ExportWorkload::Data,
+        req.strict_mode,
+    ) {
+        Ok(value) => value,
+        Err(message) => return response::err(StatusCode::UNPROCESSABLE_ENTITY, message),
     };
 
-    let connection = match pool.get_connection() {
-        Ok(conn) => conn,
-        Err(e) => {
-            return Ok(Json(ApiResponse::error(format!(
-                "Failed to get connection: {e}"
-            ))))
-        }
+    let include_row_counts = match resolve_include_row_counts(
+        execution_path,
+        req.include_row_counts,
+        req.strict_mode,
+        &mut warnings,
+    ) {
+        Ok(value) => value,
+        Err(message) => return response::err(StatusCode::UNPROCESSABLE_ENTITY, message),
     };
+
+    let (config, source_schema, target_schema) = build_export_context(&mut req);
 
     let date_suffix = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let output_path = match format_export_filename(&source_schema, &target_schema, "data", &date_suffix) {
-        Ok(p) => p,
-        Err(e) => return Ok(Json(ApiResponse::error(e))),
+    let output_path =
+        match format_export_filename(&source_schema, &target_schema, "data", &date_suffix) {
+            Ok(p) => p,
+            Err(e) => return response::err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+    let batch_size = match resolve_batch_size(req.batch_size) {
+        Ok(size) => size,
+        Err(message) => return response::err(StatusCode::BAD_REQUEST, message),
     };
-    let batch_size = req.batch_size.unwrap_or(1000);
 
-    match export_schema_data(
-        &connection,
-        &source_schema,
-        &target_schema,
-        &req.tables,
-        &output_path,
+    let plan = LegacyExportPlan {
+        source_schema,
+        target_schema,
+        tables: req.tables,
+        output_path,
+    };
+
+    let start = Instant::now();
+    let result = execute_data_by_path(
+        execution_path,
+        &config,
+        &plan,
         batch_size,
-        req.include_row_counts,
-    ) {
-        Ok(_) => Ok(Json(ApiResponse::success(ExportResponse {
-            success: true,
-            message: "Data exported successfully".to_string(),
-            file_path: Some(output_path.to_string_lossy().to_string()),
-        }))),
-        Err(e) => Ok(Json(ApiResponse::error(format!(
-            "Failed to export data: {}",
-            format_error_chain(&e)
-        )))),
+        include_row_counts,
+        resolve_compat(req.export_compat.as_deref()),
+    )
+    .await;
+
+    match result {
+        Ok(rows_exported) => {
+            let duration_ms = start.elapsed().as_millis();
+            let summary = build_summary(
+                ExportWorkload::Data,
+                execution_path,
+                duration_ms,
+                Some(rows_exported),
+                warnings,
+            );
+            tracing::info!(
+                workload = "data",
+                ?source_db_type,
+                ?target_dialect,
+                ?execution_path,
+                rows_exported,
+                duration_ms,
+                output_path = %plan.output_path.display(),
+                "Export completed"
+            );
+            response::ok(ExportResponse {
+                success: true,
+                message: "Data exported successfully".to_string(),
+                file_path: Some(plan.output_path.to_string_lossy().to_string()),
+                summary: Some(summary),
+            })
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "Failed to export data");
+            response::err_with_code(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to export data",
+                ErrorCode::ExportFailed,
+            )
+        }
     }
 }
 
-pub async fn get_export_directory() -> Result<Json<ApiResponse<String>>, StatusCode> {
+pub async fn get_export_directory() -> ApiResult<String> {
     match exports_dir() {
-        Ok(dir) => Ok(Json(ApiResponse::success(
-            dir.to_string_lossy().to_string(),
-        ))),
-        Err(e) => Ok(Json(ApiResponse::error(e))),
+        Ok(dir) => response::ok(dir.to_string_lossy().to_string()),
+        Err(e) => response::err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{export_data, export_ddl};
+    use crate::models::{ConnectionConfig, DbType, ExportRequest};
+    use axum::{extract::Json, http::StatusCode};
+
+    fn sample_request() -> ExportRequest {
+        ExportRequest {
+            config: ConnectionConfig {
+                db_type: DbType::Dm8,
+                host: "localhost".to_string(),
+                port: 5236,
+                username: "SYSDBA".to_string(),
+                password: "SYSDBA".to_string(),
+                schema: "SYSDBA".to_string(),
+                export_schema: None,
+            },
+            target_dialect: None,
+            export_schema: None,
+            export_compat: None,
+            tables: vec![],
+            include_ddl: true,
+            include_data: false,
+            batch_size: Some(1000),
+            drop_existing: true,
+            include_row_counts: false,
+            strict_mode: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn export_ddl_succeeds_for_kingbase_to_mysql() {
+        let mut req = sample_request();
+        req.config.db_type = DbType::Kingbase;
+        req.target_dialect = Some(DbType::Mysql);
+
+        let out = export_ddl(Json(req)).await;
+        // This path is now implemented, but will fail due to missing connection
+        // We expect INTERNAL_SERVER_ERROR (500) not BAD_REQUEST (400)
+        let err = out.expect_err("should fail due to connection, not unsupported path");
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn export_data_returns_unprocessable_entity_in_strict_partial_mode() {
+        let mut req = sample_request();
+        req.config.db_type = DbType::Mysql;
+        req.target_dialect = Some(DbType::Mysql);
+        req.include_ddl = false;
+        req.include_data = true;
+        req.strict_mode = true;
+
+        let out = export_data(Json(req)).await;
+        let err = out.expect_err("strict mode should reject partial capability");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!err.1 .0.success, "error response must set success=false");
+        assert!(
+            err.1
+                 .0
+                .error
+                .unwrap_or_default()
+                .contains("Strict mode rejection"),
+            "strict mode error should be surfaced"
+        );
     }
 }

@@ -12,7 +12,7 @@ use odbc_api::Connection;
 
 use crate::{
     db::schema::{fetch_sequences, get_table_details},
-    models::{Column, Index, Sequence, TableDetails, TriggerDefinition},
+    models::{Column, Index, Sequence, TableDetails, TableIdentifier, TriggerDefinition},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,6 +306,50 @@ fn retain_foreign_keys_for_selected_tables(
     });
 }
 
+/// Filter sequences to only those referenced by the selected tables' triggers or columns.
+///
+/// A sequence is considered "related" if its name (case-insensitive) appears in any
+/// trigger body of the selected tables, or in a column DEFAULT expression.
+pub fn filter_sequences_for_tables(
+    all_sequences: &[Sequence],
+    tables: &[TableDetails],
+) -> Vec<Sequence> {
+    if all_sequences.is_empty() {
+        return Vec::new();
+    }
+
+    let mut referenced_seq_names: HashSet<String> = HashSet::new();
+
+    for table in tables {
+        // Check trigger bodies for sequence references
+        for trigger in &table.triggers {
+            let body_upper = trigger.body.to_uppercase();
+            for seq in all_sequences {
+                if body_upper.contains(&seq.name.to_uppercase()) {
+                    referenced_seq_names.insert(seq.name.to_uppercase());
+                }
+            }
+        }
+        // Check column DEFAULT expressions for sequence references (e.g. SEQ_FOO.NEXTVAL)
+        for col in &table.columns {
+            if let Some(ref default_val) = col.default_value {
+                let default_upper = default_val.to_uppercase();
+                for seq in all_sequences {
+                    if default_upper.contains(&seq.name.to_uppercase()) {
+                        referenced_seq_names.insert(seq.name.to_uppercase());
+                    }
+                }
+            }
+        }
+    }
+
+    all_sequences
+        .iter()
+        .filter(|seq| referenced_seq_names.contains(&seq.name.to_uppercase()))
+        .cloned()
+        .collect()
+}
+
 pub fn generate_sequences(schema: &str, sequences: &[Sequence]) -> Vec<String> {
     sequences
         .iter()
@@ -443,7 +487,7 @@ pub fn export_schema_ddl(
     connection: &Connection<'_>,
     source_schema: &str,
     target_schema: &str,
-    tables: &[String],
+    tables: &[TableIdentifier],
     output_path: &Path,
     drop_existing: bool,
     trigger_terminator: TriggerTerminator,
@@ -453,9 +497,9 @@ pub fn export_schema_ddl(
 
     // Cache table details to avoid repeated queries.
     let mut table_cache = Vec::new();
-    for table_name in tables {
-        let details = get_table_details(connection, &source_schema, table_name)
-            .with_context(|| format!("Failed to fetch table metadata for '{}'", table_name))?;
+    for table_id in tables {
+        let details = get_table_details(connection, &source_schema, &table_id.name)
+            .with_context(|| format!("Failed to fetch table metadata for '{}'", table_id))?;
         table_cache.push(details);
     }
 
@@ -468,7 +512,8 @@ pub fn export_schema_ddl(
         retain_foreign_keys_for_selected_tables(table_details, &selected_tables);
     }
 
-    let sequences = fetch_sequences(connection, &source_schema).unwrap_or_default();
+    let all_sequences = fetch_sequences(connection, &source_schema).unwrap_or_default();
+    let sequences = filter_sequences_for_tables(&all_sequences, &table_cache);
 
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
@@ -925,8 +970,7 @@ fn format_default(column: &Column, raw: &str) -> String {
             return expr.to_string();
         }
         // Keyword followed by operator or space (e.g., "CURRENT_DATE + 1")
-        if expr_upper.starts_with(kw) {
-            let rest = &expr_upper[kw.len()..];
+        if let Some(rest) = expr_upper.strip_prefix(kw) {
             if rest.is_empty()
                 || rest.starts_with(' ')
                 || rest.starts_with('+')
@@ -964,7 +1008,7 @@ fn format_default(column: &Column, raw: &str) -> String {
                     return expr.to_string();
                 }
                 // If preceded by a letter (like "SYSDATE-1"), it's subtraction
-                if prev_char.map_or(false, |c| c.is_ascii_alphabetic()) {
+                if prev_char.is_some_and(|c| c.is_ascii_alphabetic()) {
                     return expr.to_string();
                 }
             }
@@ -1084,7 +1128,7 @@ fn has_timezone(expr: &str) -> bool {
             && rest[1..]
                 .chars()
                 .next()
-                .map_or(false, |c| c.is_ascii_digit());
+                .is_some_and(|c| c.is_ascii_digit());
     }
     if let Some(pos) = expr.rfind('-') {
         // Make sure it's not a date separator (position should be after time part)
@@ -1433,8 +1477,8 @@ fn normalize_trigger_body(body: &str) -> String {
             // Check if there's an INTO in the following lines before a semicolon
             let mut found_into = false;
             let mut into_idx = i;
-            for j in (i + 1)..all_lines.len() {
-                let next_upper = all_lines[j].trim().to_uppercase();
+            for (j, next_line_j) in all_lines.iter().enumerate().skip(i + 1) {
+                let next_upper = next_line_j.trim().to_uppercase();
                 if next_upper.starts_with("INTO ") {
                     found_into = true;
                     into_idx = j;
@@ -1449,8 +1493,8 @@ fn normalize_trigger_body(body: &str) -> String {
                 // Find the end of the statement (after FROM clause or subquery)
                 let mut end_idx = into_idx;
                 let mut depth = 0;
-                for j in (into_idx + 1)..all_lines.len() {
-                    let next_line = all_lines[j].trim();
+                for (j, next_line_j) in all_lines.iter().enumerate().skip(into_idx + 1) {
+                    let next_line = next_line_j.trim();
                     let next_upper = next_line.to_uppercase();
 
                     // Track parenthesis depth
@@ -1476,8 +1520,8 @@ fn normalize_trigger_body(body: &str) -> String {
                 }
 
                 // Mark all lines from SELECT to end of statement
-                for k in i..=end_idx {
-                    is_select_into_line[k] = true;
+                for item in is_select_into_line.iter_mut().take(end_idx + 1).skip(i) {
+                    *item = true;
                 }
             }
         }
@@ -1575,7 +1619,7 @@ fn normalize_trigger_references(input: &str) -> String {
 
             if is_new || is_old {
                 let prev = if i == 0 { None } else { Some(bytes[i - 1]) };
-                let prev_is_word = prev.map_or(false, |c| c.is_ascii_alphanumeric() || c == b'_');
+                let prev_is_word = prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_');
                 let prev_is_colon = prev == Some(b':');
                 if !prev_is_word && !prev_is_colon {
                     out.push_str(if is_new { ":NEW." } else { ":OLD." });

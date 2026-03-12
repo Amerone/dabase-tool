@@ -53,30 +53,29 @@ export default function MainLayout() {
     <>
       <TechBackground />
       <div ref={layoutRef} style={{ position: 'relative', zIndex: 1, opacity: 0 }}>
-        <Layout style={{ minHeight: '100vh', background: 'transparent' }}>
+        <Layout style={{ height: '100vh', background: 'transparent', display: 'flex', flexDirection: 'column' }}>
           <Header style={{ display: 'flex', alignItems: 'center', background: 'rgba(0, 0, 0, 0.5)', backdropFilter: 'blur(10px)' }}>
-            <Title 
+            <Title
               ref={titleRef}
-              level={3} 
+              level={3}
               style={{ color: '#00b96b', margin: 0, textShadow: '0 0 10px rgba(0, 185, 107, 0.5)', display: 'inline-block' }}
             >
               Amarone
             </Title>
           </Header>
-          <Content style={{ padding: '0 48px', marginTop: 24 }}>
+          <Content style={{ padding: '0 24px', marginTop: 16, flex: 1, overflow: 'auto' }}>
             <div
               style={{
-                // background: colorBgContainer, // Let the card backgrounds handle opacity
                 minHeight: 280,
-                padding: 24,
+                padding: '16px 0',
                 borderRadius: borderRadiusLG,
               }}
             >
               <Outlet />
             </div>
           </Content>
-          <Footer style={{ textAlign: 'center', color: 'rgba(255,255,255,0.5)' }}>
-            Amarone ©{new Date().getFullYear()} // 系统就绪
+          <Footer style={{ textAlign: 'center', color: 'rgba(255,255,255,0.5)', padding: '8px 24px', fontSize: 12 }}>
+            Amarone &copy;{new Date().getFullYear()} // 系统就绪
           </Footer>
         </Layout>
       </div>

@@ -3,12 +3,15 @@ use serde::{Deserialize, Serialize};
 use tracing::error;
 
 use crate::{
-    db::connection::ConnectionPool,
-    models::{ApiResponse, ConnectionConfig},
+    api::response::{self, ApiResult},
+    db::service,
+    models::{ConnectionConfig, DbType, ErrorCode},
 };
 
 #[derive(Debug, Deserialize)]
 pub struct TestConnectionRequest {
+    #[serde(default)]
+    pub db_type: DbType,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -24,8 +27,9 @@ pub struct TestConnectionResponse {
 
 pub async fn test_connection(
     Json(req): Json<TestConnectionRequest>,
-) -> Result<Json<ApiResponse<TestConnectionResponse>>, StatusCode> {
+) -> ApiResult<TestConnectionResponse> {
     let config = ConnectionConfig {
+        db_type: req.db_type,
         host: req.host,
         port: req.port,
         username: req.username,
@@ -34,28 +38,18 @@ pub async fn test_connection(
         export_schema: None,
     };
 
-    match ConnectionPool::new(config) {
-        Ok(pool) => match pool.test_connection() {
-            Ok(_) => Ok(Json(ApiResponse::success(TestConnectionResponse {
-                success: true,
-                message: "Connection successful".to_string(),
-            }))),
-            Err(e) => {
-                let detailed_error = format!("{:#}", e);
-                error!("DM8 connection test failed: {}", detailed_error);
-                Ok(Json(ApiResponse::error(format!(
-                    "Connection test failed: {}",
-                    detailed_error
-                ))))
-            }
-        },
+    match service::test_connection(&config).await {
+        Ok(_) => response::ok(TestConnectionResponse {
+            success: true,
+            message: "Connection successful".to_string(),
+        }),
         Err(e) => {
-            let detailed_error = format!("{:#}", e);
-            error!("Failed to create DM8 connection pool: {}", detailed_error);
-            Ok(Json(ApiResponse::error(format!(
-                "Failed to create connection pool: {}",
-                detailed_error
-            ))))
+            error!(error = ?e, "Database connection test failed");
+            response::err_with_code(
+                StatusCode::BAD_REQUEST,
+                "Database connection test failed. Verify host/port/credentials and driver configuration.",
+                ErrorCode::DatabaseConnection,
+            )
         }
     }
 }

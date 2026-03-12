@@ -39,7 +39,10 @@ export const useExportStore = create<ExportState>((set) => ({
   isConnected: false,
   setConnectionConfig: (config, loadedFrom = 'manual', lastUpdatedAt = null, isConnected = true) =>
     set({
-      connectionConfig: config,
+      connectionConfig: {
+        ...config,
+        db_type: config.db_type ?? 'dm8',
+      },
       isConnected,
       loadedFrom,
       lastUpdatedAt: lastUpdatedAt ?? config.updated_at ?? null,

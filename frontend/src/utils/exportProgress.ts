@@ -18,11 +18,12 @@ export function calcProgress({ includeDdl, includeData, completedSteps, hasError
     return { percent: 0, status: 'normal' }
   }
 
+  const percent = Math.min(100, Math.round((completedSteps / totalSteps) * 100))
+
   if (hasError) {
-    return { percent: 100, status: 'exception' }
+    return { percent, status: 'exception' }
   }
 
-  const percent = Math.min(100, Math.round((completedSteps / totalSteps) * 100))
   const status: ProgressStatus = percent >= 100 ? 'success' : 'active'
 
   return { percent, status }

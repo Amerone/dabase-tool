@@ -147,7 +147,33 @@ Generates `CREATE SEQUENCE` with DM8-specific options: `START WITH`, `INCREMENT 
 
 ### Data Export
 
-Generates batched `INSERT` statements with optional `TRUNCATE TABLE` or `DELETE FROM` cleanup and row count statistics.
+Generates batched `INSERT` statements with 4-phase FK-aware ordering:
+
+1. **Phase 0:** Disable all FK constraints (`ALTER TABLE ... DISABLE CONSTRAINT`)
+2. **Phase 1:** TRUNCATE tables in reverse FK order (children first)
+3. **Phase 2:** INSERT data in FK order (parents first), with identity insert handling
+4. **Phase 3:** Re-enable FK constraints
+
+Tables with LOB columns (BLOB/CLOB/TEXT etc.) use unbuffered row-by-row export (`get_binary`/`get_text`) instead of the default 8KB `TextRowSet` buffer to avoid truncation.
+
+**Large BLOB handling:** DM8 limits `HEXTORAW()` string literals to 16383 bytes (32766 hex chars). BLOBs exceeding this limit are exported as PL/SQL `DBMS_LOB.APPEND` blocks:
+
+```sql
+-- Small BLOB (<= 16383 bytes): inline HEXTORAW
+INSERT INTO ... VALUES (..., HEXTORAW('...'), ...);
+
+-- Large BLOB (> 16383 bytes): PL/SQL DBMS_LOB block
+DECLARE
+  v_blob0 BLOB;
+BEGIN
+  DBMS_LOB.CREATETEMPORARY(v_blob0, TRUE);
+  DBMS_LOB.APPEND(v_blob0, HEXTORAW('chunk1'));
+  DBMS_LOB.APPEND(v_blob0, HEXTORAW('chunk2'));
+  INSERT INTO ... VALUES (..., v_blob0, ...);
+  DBMS_LOB.FREETEMPORARY(v_blob0);
+END;
+/
+```
 
 ### Export Compatibility Modes
 
@@ -196,3 +222,5 @@ Dark cyberpunk theme: primary color `#00b96b`, dark blue-black gradient backgrou
 - Frontend path alias: `@/` → `src/`.
 - Vite proxy config in `vite.config.ts` forwards `/api` to `http://localhost:3000`.
 - Log level: `RUST_LOG=dm8_export_backend=debug,tower_http=debug`.
+- DM8 `HEXTORAW()` has a hard limit of 16383 bytes (32766 hex chars). RAW `||` concatenation has the same limit. Use `DBMS_LOB.APPEND` for larger binary data.
+- Data export output is written to `~/.amarone/exports/` (not `backend/exports/`).

@@ -1,19 +1,20 @@
 use axum::{
-    extract::{Json, Path, Query},
+    extract::{Json, Path},
     http::StatusCode,
 };
 use serde::Deserialize;
+use tracing::error;
 
 use crate::{
-    db::{
-        connection::ConnectionPool,
-        schema::{get_table_details, get_tables},
-    },
-    models::{ApiResponse, ConnectionConfig, Table, TableDetails},
+    api::response::{self, ApiResult},
+    db::service,
+    models::{ConnectionConfig, DbType, ErrorCode, Table, TableDetails},
 };
 
 #[derive(Debug, Deserialize)]
 pub struct SchemaQuery {
+    #[serde(default)]
+    pub db_type: DbType,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -21,16 +22,33 @@ pub struct SchemaQuery {
     pub schema: String,
 }
 
-pub async fn list_schemas() -> Json<ApiResponse<Vec<String>>> {
-    Json(ApiResponse::error(
-        "List schemas not implemented yet".to_string(),
-    ))
+pub async fn list_schemas(Json(query): Json<SchemaQuery>) -> ApiResult<Vec<String>> {
+    let config = ConnectionConfig {
+        db_type: query.db_type,
+        host: query.host,
+        port: query.port,
+        username: query.username,
+        password: query.password,
+        schema: query.schema,
+        export_schema: None,
+    };
+
+    match service::list_schemas(&config).await {
+        Ok(schemas) => response::ok(schemas),
+        Err(e) => {
+            error!(error = ?e, "Failed to get schemas");
+            response::err_with_code(
+                StatusCode::BAD_REQUEST,
+                "Failed to get schemas",
+                ErrorCode::DatabaseQuery,
+            )
+        }
+    }
 }
 
-pub async fn list_tables(
-    Query(query): Query<SchemaQuery>,
-) -> Result<Json<ApiResponse<Vec<Table>>>, StatusCode> {
+pub async fn list_tables(Json(query): Json<SchemaQuery>) -> ApiResult<Vec<Table>> {
     let config = ConnectionConfig {
+        db_type: query.db_type,
         host: query.host,
         port: query.port,
         username: query.username,
@@ -39,40 +57,37 @@ pub async fn list_tables(
         export_schema: None,
     };
 
-    let pool = match ConnectionPool::new(config) {
-        Ok(pool) => pool,
+    match service::list_tables(&config).await {
+        Ok(tables) => response::ok(tables),
         Err(e) => {
-            return Ok(Json(ApiResponse::error(format!(
-                "Failed to create connection: {}",
-                e
-            ))))
+            error!(error = ?e, "Failed to get tables");
+            response::err_with_code(
+                StatusCode::BAD_REQUEST,
+                "Failed to get tables",
+                ErrorCode::DatabaseQuery,
+            )
         }
-    };
-
-    let connection = match pool.get_connection() {
-        Ok(conn) => conn,
-        Err(e) => {
-            return Ok(Json(ApiResponse::error(format!(
-                "Failed to get connection: {}",
-                e
-            ))))
-        }
-    };
-
-    match get_tables(&connection, &query.schema) {
-        Ok(tables) => Ok(Json(ApiResponse::success(tables))),
-        Err(e) => Ok(Json(ApiResponse::error(format!(
-            "Failed to get tables: {}",
-            e
-        )))),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TableDetailsQuery {
+    #[serde(default)]
+    pub db_type: DbType,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    pub schema: String,
+    pub table_schema: String,
 }
 
 pub async fn get_table_details_handler(
     Path(table): Path<String>,
-    Query(query): Query<SchemaQuery>,
-) -> Result<Json<ApiResponse<TableDetails>>, StatusCode> {
+    Json(query): Json<TableDetailsQuery>,
+) -> ApiResult<TableDetails> {
     let config = ConnectionConfig {
+        db_type: query.db_type,
         host: query.host,
         port: query.port,
         username: query.username,
@@ -81,31 +96,15 @@ pub async fn get_table_details_handler(
         export_schema: None,
     };
 
-    let pool = match ConnectionPool::new(config) {
-        Ok(pool) => pool,
+    match service::get_table_details(&config, &query.table_schema, &table).await {
+        Ok(details) => response::ok(details),
         Err(e) => {
-            return Ok(Json(ApiResponse::error(format!(
-                "Failed to create connection: {}",
-                e
-            ))))
+            error!(error = ?e, table = %table, schema = %query.table_schema, "Failed to get table details");
+            response::err_with_code(
+                StatusCode::BAD_REQUEST,
+                "Failed to get table details",
+                ErrorCode::DatabaseQuery,
+            )
         }
-    };
-
-    let connection = match pool.get_connection() {
-        Ok(conn) => conn,
-        Err(e) => {
-            return Ok(Json(ApiResponse::error(format!(
-                "Failed to get connection: {}",
-                e
-            ))))
-        }
-    };
-
-    match get_table_details(&connection, &query.schema, &table) {
-        Ok(details) => Ok(Json(ApiResponse::success(details))),
-        Err(e) => Ok(Json(ApiResponse::error(format!(
-            "Failed to get table details: {}",
-            e
-        )))),
     }
 }

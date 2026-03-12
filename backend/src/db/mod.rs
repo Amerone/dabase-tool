@@ -1,4 +1,11 @@
 pub mod connection;
 pub mod dm8_adapter;
+pub mod kingbase;
+pub mod mysql;
+pub mod odbc_generic;
 pub mod odbc_register;
+pub mod pg_native;
+pub mod pool;
 pub mod schema;
+pub mod service;
+pub mod shentong;

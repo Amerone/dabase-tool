@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::{anyhow, ensure, Context, Result};
 use odbc_api::{buffers::TextRowSet, Connection, Cursor};
@@ -23,6 +22,29 @@ pub(crate) fn decode_cell(batch: &TextRowSet, col: usize, row: usize) -> Option<
             .at(col, row)
             .map(|bytes| encoding_rs::GB18030.decode(bytes).0.into_owned()),
     }
+}
+
+pub fn get_schemas(connection: &Connection<'_>) -> Result<Vec<String>> {
+    let sql = "SELECT USERNAME FROM ALL_USERS ORDER BY USERNAME";
+
+    let mut cursor = connection
+        .execute(sql, ())
+        .context("Failed to query DM8 schemas")?
+        .ok_or_else(|| anyhow!("DM8 returned no cursor for schemas query"))?;
+
+    let mut buffers = TextRowSet::for_cursor(200, &mut cursor, Some(2048))?;
+    let mut row_set_cursor = cursor.bind_buffer(&mut buffers)?;
+
+    let mut schemas = Vec::new();
+    while let Some(batch) = row_set_cursor.fetch()? {
+        for row_index in 0..batch.num_rows() {
+            if let Some(name) = decode_cell(batch, 0, row_index) {
+                schemas.push(name);
+            }
+        }
+    }
+
+    Ok(schemas)
 }
 
 pub fn get_tables(connection: &Connection<'_>, schema: &str) -> Result<Vec<Table>> {
@@ -53,10 +75,10 @@ pub fn get_tables(connection: &Connection<'_>, schema: &str) -> Result<Vec<Table
             let name = decode_cell(batch, 0, row_index)
                 .ok_or_else(|| anyhow!("Encountered table without a name in DM8 metadata"))?;
             let comment = decode_cell(batch, 1, row_index);
-            let row_count = decode_cell(batch, 2, row_index)
-                .and_then(|s| s.parse::<i64>().ok());
+            let row_count = decode_cell(batch, 2, row_index).and_then(|s| s.parse::<i64>().ok());
 
             tables.push(Table {
+                schema: Some(owner.clone()),
                 name,
                 comment,
                 row_count,
@@ -200,18 +222,16 @@ fn fetch_columns(connection: &Connection<'_>, schema: &str, table: &str) -> Resu
                 .ok_or_else(|| anyhow!("Encountered column without a name"))?;
             let data_type = decode_cell(batch, 1, row_index)
                 .ok_or_else(|| anyhow!("Encountered column without data type"))?;
-            let length = decode_cell(batch, 2, row_index)
-                .and_then(|s| s.parse::<i32>().ok());
-            let precision = decode_cell(batch, 3, row_index)
-                .and_then(|s| s.parse::<i32>().ok());
-            let scale = decode_cell(batch, 4, row_index)
-                .and_then(|s| s.parse::<i32>().ok());
+            let length = decode_cell(batch, 2, row_index).and_then(|s| s.parse::<i32>().ok());
+            let precision = decode_cell(batch, 3, row_index).and_then(|s| s.parse::<i32>().ok());
+            let scale = decode_cell(batch, 4, row_index).and_then(|s| s.parse::<i32>().ok());
             let char_used = decode_cell(batch, 5, row_index);
             let nullable_flag = decode_cell(batch, 6, row_index);
             let default_value = decode_cell(batch, 7, row_index);
             let identity_flag = decode_cell(batch, 8, row_index);
             let comment = decode_cell(batch, 9, row_index);
-            let nullable = matches!(nullable_flag, Some(ref flag) if flag.eq_ignore_ascii_case("Y"));
+            let nullable =
+                matches!(nullable_flag, Some(ref flag) if flag.eq_ignore_ascii_case("Y"));
             let identity = matches!(identity_flag, Some(ref flag) if flag.eq_ignore_ascii_case("YES") || flag.eq_ignore_ascii_case("Y"));
 
             columns.push(Column {
@@ -683,10 +703,10 @@ fn fetch_referenced_columns(
 
     let (owner, table) = if let Some(batch) = row_set_cursor.fetch()? {
         if batch.num_rows() > 0 {
-            let owner = decode_cell(batch, 0, 0)
-                .ok_or_else(|| anyhow!("Referenced owner missing"))?;
-            let table = decode_cell(batch, 1, 0)
-                .ok_or_else(|| anyhow!("Referenced table missing"))?;
+            let owner =
+                decode_cell(batch, 0, 0).ok_or_else(|| anyhow!("Referenced owner missing"))?;
+            let table =
+                decode_cell(batch, 1, 0).ok_or_else(|| anyhow!("Referenced table missing"))?;
             (owner, table)
         } else {
             return Err(anyhow!(
@@ -723,23 +743,17 @@ pub fn fetch_sequences(connection: &Connection<'_>, schema: &str) -> Result<Vec<
     let mut seqs = Vec::new();
     while let Some(batch) = row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
-            let name = decode_cell(batch, 0, row_index)
-                .ok_or_else(|| anyhow!("Sequence name missing"))?;
-            let min_value = decode_cell(batch, 1, row_index)
-                .and_then(|s| s.parse::<i64>().ok());
-            let max_value = decode_cell(batch, 2, row_index)
-                .and_then(|s| s.parse::<i64>().ok());
+            let name =
+                decode_cell(batch, 0, row_index).ok_or_else(|| anyhow!("Sequence name missing"))?;
+            let min_value = decode_cell(batch, 1, row_index).and_then(|s| s.parse::<i64>().ok());
+            let max_value = decode_cell(batch, 2, row_index).and_then(|s| s.parse::<i64>().ok());
             let increment_by = decode_cell(batch, 3, row_index)
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(1);
-            let cache_size = decode_cell(batch, 4, row_index)
-                .and_then(|s| s.parse::<i64>().ok());
-            let cycle =
-                matches!(decode_cell(batch, 5, row_index), Some(ref v) if v.eq_ignore_ascii_case("Y"));
-            let order =
-                matches!(decode_cell(batch, 6, row_index), Some(ref v) if v.eq_ignore_ascii_case("Y"));
-            let last_number = decode_cell(batch, 7, row_index)
-                .and_then(|s| s.parse::<i64>().ok());
+            let cache_size = decode_cell(batch, 4, row_index).and_then(|s| s.parse::<i64>().ok());
+            let cycle = matches!(decode_cell(batch, 5, row_index), Some(ref v) if v.eq_ignore_ascii_case("Y"));
+            let order = matches!(decode_cell(batch, 6, row_index), Some(ref v) if v.eq_ignore_ascii_case("Y"));
+            let last_number = decode_cell(batch, 7, row_index).and_then(|s| s.parse::<i64>().ok());
 
             seqs.push(Sequence {
                 name,
@@ -761,8 +775,6 @@ fn fetch_triggers(
     schema: &str,
     table: &str,
 ) -> Result<Vec<TriggerDefinition>> {
-    static TRIGGER_METADATA_LEVEL: AtomicU8 = AtomicU8::new(TRIGGER_LEVEL_FULL);
-
     let sql_full = format!(
         "SELECT TRIGGER_NAME, TRIGGER_TYPE, TRIGGERING_EVENT, TABLE_NAME, WHEN_CLAUSE, TRIGGER_BODY, DESCRIPTION \
          FROM ALL_TRIGGERS \
@@ -797,7 +809,7 @@ fn fetch_triggers(
         _ => "unknown",
     };
 
-    let mut level = TRIGGER_METADATA_LEVEL.load(Ordering::Relaxed);
+    let mut level = TRIGGER_LEVEL_FULL;
     let mut attempts = 0u8;
     let mut cursor = loop {
         let (sql, context_label) = match level {
@@ -820,16 +832,9 @@ fn fetch_triggers(
                     if attempts > 3 {
                         return Err(err);
                     }
-                    if TRIGGER_METADATA_LEVEL
-                        .compare_exchange(level, next_level, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        level = next_level;
-                    } else {
-                        level = TRIGGER_METADATA_LEVEL.load(Ordering::Relaxed);
-                    }
+                    level = next_level;
                     tracing::warn!(
-                        "Trigger metadata not available, fallback to {}: {}",
+                        "Trigger metadata not available for this request, fallback to {}: {}",
                         trigger_level_label(level),
                         err
                     );
@@ -846,20 +851,16 @@ fn fetch_triggers(
     let mut triggers = Vec::new();
     while let Some(batch) = row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
-            let name = decode_cell(batch, 0, row_index)
-                .ok_or_else(|| anyhow!("Trigger name missing"))?;
-            let trigger_type = decode_cell(batch, 1, row_index)
-                .unwrap_or_else(|| "BEFORE".to_string());
-            let triggering_event = decode_cell(batch, 2, row_index)
-                .unwrap_or_else(|| "INSERT".to_string());
-            let table_name = decode_cell(batch, 3, row_index)
-                .unwrap_or_else(|| table.to_string());
-            let when_clause = decode_cell(batch, 4, row_index)
-                .unwrap_or_default();
-            let body = decode_cell(batch, 5, row_index)
-                .unwrap_or_default();
-            let description = decode_cell(batch, 6, row_index)
-                .unwrap_or_default();
+            let name =
+                decode_cell(batch, 0, row_index).ok_or_else(|| anyhow!("Trigger name missing"))?;
+            let trigger_type =
+                decode_cell(batch, 1, row_index).unwrap_or_else(|| "BEFORE".to_string());
+            let triggering_event =
+                decode_cell(batch, 2, row_index).unwrap_or_else(|| "INSERT".to_string());
+            let table_name = decode_cell(batch, 3, row_index).unwrap_or_else(|| table.to_string());
+            let when_clause = decode_cell(batch, 4, row_index).unwrap_or_default();
+            let body = decode_cell(batch, 5, row_index).unwrap_or_default();
+            let description = decode_cell(batch, 6, row_index).unwrap_or_default();
 
             // DM8 uses " OR " as separator (e.g., "INSERT OR UPDATE OR DELETE")
             // Also support comma separator for compatibility
@@ -929,8 +930,8 @@ fn fetch_indexes(connection: &Connection<'_>, schema: &str, table: &str) -> Resu
 
     while let Some(batch) = row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
-            let name = decode_cell(batch, 0, row_index)
-                .ok_or_else(|| anyhow!("Index name missing"))?;
+            let name =
+                decode_cell(batch, 0, row_index).ok_or_else(|| anyhow!("Index name missing"))?;
             let uniqueness = decode_cell(batch, 1, row_index);
             let unique = matches!(
                 uniqueness,

@@ -1,17 +1,18 @@
-use anyhow::{ensure, Context, Result};
-use odbc_api::{Connection, ConnectionOptions, Environment};
-use std::fmt;
+use anyhow::{anyhow, ensure, Result};
 
 use crate::db::odbc_register;
-use crate::models::ConnectionConfig;
+use crate::models::{ConnectionConfig, DbType};
 
-/// Returns true if `name` is a valid DM8 identifier (letters, digits, _, $, #).
+#[allow(dead_code)]
 fn is_valid_identifier(name: &str) -> bool {
     let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let first = trimmed.as_bytes()[0];
+
+    // Safely get the first byte
+    let first = match trimmed.as_bytes().first() {
+        Some(&b) => b,
+        None => return false,
+    };
+
     if !(first.is_ascii_alphabetic() || first == b'_') {
         return false;
     }
@@ -20,142 +21,305 @@ fn is_valid_identifier(name: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'#')
 }
 
+fn wrap_driver(driver: &str) -> String {
+    let trimmed = driver.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return trimmed.to_string();
+    }
+    format!("{{{}}}", trimmed)
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Render an ODBC attribute value.
+///
+/// Most values can stay unwrapped (`UID=SYSDBA`). Only wrap with braces when
+/// the value contains separators or edge whitespace; this keeps DM8 drivers
+/// that are strict about UID/PWD parsing compatible.
+fn render_odbc_attr_value(value: &str) -> String {
+    let starts_or_ends_with_ws = value
+        .chars()
+        .next()
+        .map(|c| c.is_whitespace())
+        .unwrap_or(false)
+        || value
+            .chars()
+            .next_back()
+            .map(|c| c.is_whitespace())
+            .unwrap_or(false);
+
+    let needs_wrap = value.contains(';') || value.contains('}') || starts_or_ends_with_ws;
+
+    if needs_wrap {
+        format!("{{{}}}", value.replace('}', "}}"))
+    } else {
+        value.to_string()
+    }
+}
+
+/// Find the first existing file path from a list of candidates.
+///
+/// # Arguments
+/// * `candidates` - A slice of file path strings to check
+///
+/// # Returns
+/// * `Some(String)` - The first path that exists
+/// * `None` - If no paths exist or the list is empty
+///
+/// # Examples
+/// ```no_run
+/// let paths = ["file1.txt", "file2.txt"];
+/// // first_existing_path is a private helper; usage shown for documentation only
+/// ```
+fn first_existing_path(candidates: &[&str]) -> Option<String> {
+    candidates.iter().find_map(|candidate| {
+        let path = std::path::Path::new(candidate);
+        path.exists().then(|| candidate.to_string())
+    })
+}
+
 impl ConnectionConfig {
-    /// Returns the ODBC driver value; prefers an explicit path from `DM8_DRIVER_PATH`.
-    fn driver_value() -> String {
-        // On Windows the Driver Manager cannot load a driver DLL by path directly —
-        // it must be registered in the registry first. `ensure_dm8_driver_registered`
-        // handles that at startup. Here we return the registered name.
+    pub fn validate_without_schema(&self) -> Result<()> {
+        ensure!(!self.host.trim().is_empty(), "Database host is required");
+        ensure!(self.port > 0, "Database port must be greater than zero");
+        ensure!(
+            !self.username.trim().is_empty(),
+            "Database username is required"
+        );
+        ensure!(!self.password.is_empty(), "Database password is required");
+        Ok(())
+    }
+
+    fn dm8_driver_value() -> String {
         #[cfg(windows)]
         {
-            return format!("{{{}}}", odbc_register::DM8_DRIVER_NAME);
+            wrap_driver(odbc_register::DM8_DRIVER_NAME)
         }
 
-        // Linux / macOS: unixODBC supports specifying a .so path directly.
         #[cfg(not(windows))]
         {
-            if let Ok(path) = std::env::var("DM8_DRIVER_PATH") {
-                let p = path.trim().to_string();
-                if !p.is_empty() {
-                    tracing::debug!("DM8 driver from DM8_DRIVER_PATH: {}", p);
-                    return format!("{{{}}}", p);
-                }
+            if let Some(path) = env_nonempty("DM8_DRIVER_PATH") {
+                tracing::debug!("DM8 driver from DM8_DRIVER_PATH: {}", path);
+                return wrap_driver(&path);
             }
 
             let candidates = ["drivers/dm8/libdodbc.so", "../drivers/dm8/libdodbc.so"];
-            for candidate in candidates {
-                let path = std::path::Path::new(candidate);
-                if path.exists() {
-                    tracing::debug!("DM8 driver from bundled path: {}", candidate);
-                    return format!("{{{}}}", path.display());
-                }
+            if let Some(path) = first_existing_path(&candidates) {
+                tracing::debug!("DM8 driver from bundled path: {}", path);
+                return wrap_driver(&path);
             }
 
             tracing::warn!("DM8_DRIVER_PATH not set and no bundled driver found; falling back to registered name");
-            "{DM8 ODBC DRIVER}".to_string()
+            wrap_driver("DM8 ODBC DRIVER")
         }
     }
 
-    /// Builds the ODBC connection string expected by the DM8 driver.
-    pub fn connection_string(&self) -> String {
-        let driver = Self::driver_value();
-        let cs = format!(
-            "DRIVER={};SERVER={};PORT={};UID={};PWD={};CHARSET=1",
-            driver, self.host, self.port, self.username, self.password
-        );
-        tracing::debug!(
-            "ODBC connection string: DRIVER={};SERVER={};PORT={};UID={};PWD=***;CHARSET=1",
-            driver, self.host, self.port, self.username
-        );
-        cs
+    fn kingbase_driver_value() -> String {
+        if let Some(path) = env_nonempty("KINGBASE_ODBC_DRIVER_PATH") {
+            tracing::debug!("Kingbase driver from KINGBASE_ODBC_DRIVER_PATH: {}", path);
+            return wrap_driver(&path);
+        }
+
+        #[cfg(not(windows))]
+        {
+            let candidates = [
+                "drivers/kingbase/libkdbodbcw.so",
+                "drivers/kingbase/libkdbodbc.so",
+                "drivers/kingbase/X64_Linux/odbc/kdbodbcw.so",
+                "../drivers/kingbase/libkdbodbcw.so",
+                "../drivers/kingbase/libkdbodbc.so",
+                "../drivers/kingbase/X64_Linux/odbc/kdbodbcw.so",
+            ];
+            if let Some(path) = first_existing_path(&candidates) {
+                tracing::debug!("Kingbase driver from bundled path: {}", path);
+                return wrap_driver(&path);
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            // Try PostgreSQL ODBC driver first (KingBase is PostgreSQL-compatible).
+            // IMPORTANT: Use the absolute file path, NOT the registered driver name.
+            // Windows ODBC Driver Manager only resolves DRIVER={name} via HKLM, not HKCU.
+            // Our drivers are registered under HKCU (no admin), so using a name causes IM002.
+            // Using an absolute path bypasses the registry lookup entirely.
+            // NOTE: strip \\?\ prefix from canonicalize() — the legacy ODBC DM (Win32) does
+            // not support extended-length path syntax and returns IM002 when it sees it.
+            if let Some(path) = first_existing_path(odbc_register::POSTGRESQL_DRIVER_CANDIDATES) {
+                let abs = std::path::Path::new(&path)
+                    .canonicalize()
+                    .map(|p| {
+                        let s = p.to_string_lossy().into_owned();
+                        // Strip Windows extended-length path prefix \\?\ if present
+                        s.strip_prefix(r"\\?\").unwrap_or(&s).to_owned()
+                    })
+                    .unwrap_or(path);
+                tracing::info!(
+                    "Using PostgreSQL ODBC driver for KingBase connection (absolute path): {}",
+                    abs
+                );
+                return wrap_driver(&abs);
+            }
+
+            // Fallback to KingBase native driver (also by path for the same reason)
+            if let Some(path) = first_existing_path(odbc_register::KINGBASE_DRIVER_CANDIDATES) {
+                let abs = std::path::Path::new(&path)
+                    .canonicalize()
+                    .map(|p| {
+                        let s = p.to_string_lossy().into_owned();
+                        s.strip_prefix(r"\\?\").unwrap_or(&s).to_owned()
+                    })
+                    .unwrap_or(path);
+                tracing::debug!("Kingbase native driver from bundled path: {}", abs);
+                return wrap_driver(&abs);
+            }
+        }
+
+        let name = env_nonempty("KINGBASE_ODBC_DRIVER")
+            .unwrap_or_else(|| odbc_register::KINGBASE_DRIVER_NAME.to_string());
+        wrap_driver(&name)
     }
 
-    /// Basic validation to surface misconfiguration early.
-    pub fn validate(&self) -> Result<()> {
-        ensure!(!self.host.trim().is_empty(), "DM8 host is required");
-        ensure!(self.port > 0, "DM8 port must be greater than zero");
-        ensure!(!self.username.trim().is_empty(), "DM8 username is required");
-        ensure!(!self.password.is_empty(), "DM8 password is required");
-        Ok(())
+    fn shentong_driver_value() -> String {
+        if let Some(path) = env_nonempty("SHENTONG_ODBC_DRIVER_PATH") {
+            tracing::debug!("Shentong driver from SHENTONG_ODBC_DRIVER_PATH: {}", path);
+            return wrap_driver(&path);
+        }
+
+        #[cfg(not(windows))]
+        {
+            let candidates = [
+                "drivers/shentong/liboscarodbcw.so",
+                "drivers/shentong/liboscarodbc.so",
+                "../drivers/shentong/liboscarodbcw.so",
+                "../drivers/shentong/liboscarodbc.so",
+            ];
+            if let Some(path) = first_existing_path(&candidates) {
+                tracing::debug!("Shentong driver from bundled path: {}", path);
+                return wrap_driver(&path);
+            }
+        }
+
+        let name =
+            env_nonempty("SHENTONG_ODBC_DRIVER").unwrap_or_else(|| "OSCAR ODBC DRIVER".to_string());
+        wrap_driver(&name)
     }
-}
 
-pub struct ConnectionPool {
-    environment: Environment,
-    connection_string: String,
-    schema: Option<String>,
-    display_dsn: String,
-}
-
-impl fmt::Debug for ConnectionPool {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConnectionPool")
-            .field("dsn", &self.display_dsn)
-            .field("schema", &self.schema)
-            .finish()
+    fn odbc_driver_value(&self) -> Result<String> {
+        match self.db_type {
+            DbType::Dm8 => Ok(Self::dm8_driver_value()),
+            DbType::Kingbase => Ok(Self::kingbase_driver_value()),
+            DbType::Shentong => Ok(Self::shentong_driver_value()),
+            DbType::Mysql => Err(anyhow!("MySQL uses native driver, not ODBC")),
+        }
     }
-}
 
-impl ConnectionPool {
-    /// Create a new pool backed by the DM8 ODBC driver.
-    pub fn new(config: ConnectionConfig) -> Result<Self> {
-        config
-            .validate()
-            .context("Invalid DM8 connection configuration")?;
+    pub fn odbc_connection_string(&self) -> Result<String> {
+        let driver = self.odbc_driver_value()?;
+        let server = render_odbc_attr_value(self.host.trim());
+        let uid = render_odbc_attr_value(self.username.trim());
+        let pwd = render_odbc_attr_value(&self.password);
+        let schema = render_odbc_attr_value(self.schema.trim());
 
-        let environment = Environment::new().context("Failed to initialize ODBC environment")?;
-        let connection_string = config.connection_string();
-        let schema = if config.schema.trim().is_empty() {
-            None
-        } else {
-            Some(config.schema)
+        let cs = match self.db_type {
+            DbType::Dm8 => {
+                // SCHEMA is NOT a valid DM8 ODBC connection string parameter — schema selection
+                // is done via `SET SCHEMA` statement after connection (see apply_schema_static).
+                // DM8 follows ODBC spec: brace-wrapped values handle special chars (e.g. `;` in PWD).
+                format!(
+                    "DRIVER={};SERVER={};TCP_PORT={};PORT={};UID={};PWD={};CHARSET=1",
+                    driver, server, self.port, self.port, uid, pwd
+                )
+            }
+            DbType::Kingbase | DbType::Shentong => {
+                if self.schema.trim().is_empty() {
+                    format!(
+                        "DRIVER={};SERVER={};PORT={};UID={};PWD={}",
+                        driver, server, self.port, uid, pwd
+                    )
+                } else {
+                    format!(
+                        "DRIVER={};SERVER={};PORT={};UID={};PWD={};DATABASE={}",
+                        driver, server, self.port, uid, pwd, schema
+                    )
+                }
+            }
+            DbType::Mysql => return Err(anyhow!("MySQL uses native driver, not ODBC")),
         };
 
-        Ok(Self {
-            environment,
-            display_dsn: format!("{}:{} as {}", config.host, config.port, config.username),
-            connection_string,
-            schema,
-        })
+        tracing::debug!(
+            driver = %driver,
+            server = %self.host,
+            port = %self.port,
+            username = %self.username,
+            database = %self.schema,
+            password_length = %self.password.len(),
+            "ODBC connection parameters"
+        );
+
+        Ok(cs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_odbc_attr_value, ConnectionConfig};
+    use crate::models::DbType;
+
+    #[test]
+    fn render_odbc_attr_value_wraps_and_escapes_brace() {
+        assert_eq!(render_odbc_attr_value("ab};c"), "{ab}};c}");
     }
 
-    /// Attempts to open a connection and run a lightweight query.
-    pub fn test_connection(&self) -> Result<()> {
-        let connection = self
-            .get_connection()
-            .context("Unable to open test connection to DM8")?;
-
-        connection
-            .execute("SELECT 1", ())
-            .context("Connected to DM8 but failed to execute health query")?;
-
-        Ok(())
+    #[test]
+    fn render_odbc_attr_value_keeps_simple_value_unwrapped() {
+        assert_eq!(render_odbc_attr_value("SYSDBA"), "SYSDBA");
     }
 
-    /// Returns a new ODBC connection configured for DM8.
-    pub fn get_connection(&self) -> Result<Connection<'_>> {
-        let mut connection = self
-            .environment
-            .connect_with_connection_string(&self.connection_string, ConnectionOptions::default())
-            .with_context(|| format!("Failed to connect to DM8 at {}", self.display_dsn))?;
+    #[test]
+    fn connection_string_escapes_semicolon_in_password() {
+        let config = ConnectionConfig {
+            db_type: DbType::Dm8,
+            host: "127.0.0.1".to_string(),
+            port: 5236,
+            username: "SYSDBA".to_string(),
+            password: "pa;ss".to_string(),
+            schema: "SYSDBA".to_string(),
+            export_schema: None,
+        };
 
-        self.apply_schema(&mut connection)?;
-
-        Ok(connection)
+        let cs = config
+            .odbc_connection_string()
+            .expect("connection string should be rendered");
+        assert!(
+            cs.contains("PWD={pa;ss}"),
+            "unexpected connection string: {cs}"
+        );
     }
 
-    fn apply_schema(&self, connection: &mut Connection<'_>) -> Result<()> {
-        if let Some(schema) = &self.schema {
-            ensure!(
-                is_valid_identifier(schema),
-                "Invalid schema name '{}': must contain only letters, digits, underscores, $, or #",
-                schema
-            );
-            let statement = format!("SET SCHEMA \"{}\"", schema.replace('"', "\"\""));
-            connection.execute(&statement, ()).with_context(|| {
-                format!("Connected to DM8 but failed to set schema to '{}'", schema)
-            })?;
-        }
-        Ok(())
+    #[test]
+    fn dm8_connection_string_includes_tcp_port() {
+        let config = ConnectionConfig {
+            db_type: DbType::Dm8,
+            host: "192.168.0.122".to_string(),
+            port: 5237,
+            username: "PLATFORM".to_string(),
+            password: "123456789".to_string(),
+            schema: "platform".to_string(),
+            export_schema: None,
+        };
+
+        let cs = config
+            .odbc_connection_string()
+            .expect("connection string should be rendered");
+        assert!(
+            cs.contains("SERVER=192.168.0.122;TCP_PORT=5237"),
+            "unexpected connection string: {cs}"
+        );
     }
 }
