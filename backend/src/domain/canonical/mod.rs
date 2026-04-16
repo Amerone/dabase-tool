@@ -23,6 +23,11 @@ pub struct CanonicalColumn {
     pub name: String,
     pub logical_type: LogicalType,
     pub nullable: bool,
+    /// Whether this column is an identity/auto-increment column.
+    /// ShenTong (OSCAR) forbids multi-row INSERT when specifying identity values
+    /// beyond the first row, so tables with identity columns must use single-row INSERTs.
+    #[serde(default)]
+    pub identity: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -77,7 +82,7 @@ pub fn logical_type_from_db_type(raw: &str) -> LogicalType {
     ) {
         return LogicalType::Integer;
     }
-    if contains_any(&upper, &["DECIMAL", "NUMERIC"]) {
+    if contains_any(&upper, &["DECIMAL", "NUMERIC", "NUMBER"]) {
         return LogicalType::Decimal;
     }
     if contains_any(&upper, &["FLOAT", "DOUBLE", "REAL"]) {
@@ -92,7 +97,7 @@ pub fn logical_type_from_db_type(raw: &str) -> LogicalType {
     if contains_any(&upper, &["BLOB", "BINARY", "VARBINARY", "RAW", "BYTEA"]) {
         return LogicalType::Binary;
     }
-    if contains_any(&upper, &["BOOL", "BOOLEAN", "BIT(1)"]) {
+    if contains_any(&upper, &["BOOL", "BOOLEAN", "BIT"]) {
         return LogicalType::Boolean;
     }
     if contains_any(&upper, &["TIMESTAMP", "DATETIME"]) {
@@ -113,6 +118,7 @@ pub fn canonical_column_from_model(column: &Column) -> CanonicalColumn {
         name: column.name.clone(),
         logical_type: logical_type_from_db_type(&column.data_type),
         nullable: column.nullable,
+        identity: column.identity,
     }
 }
 
@@ -178,6 +184,24 @@ mod tests {
             LogicalType::DateTime
         );
         assert_eq!(logical_type_from_db_type("JSON"), LogicalType::Json);
+    }
+
+    #[test]
+    fn oracle_number_type_maps_to_decimal() {
+        // DM8/Oracle NUMBER types must map to Decimal so values render unquoted
+        assert_eq!(logical_type_from_db_type("NUMBER"), LogicalType::Decimal);
+        assert_eq!(
+            logical_type_from_db_type("NUMBER(19,0)"),
+            LogicalType::Decimal
+        );
+        assert_eq!(
+            logical_type_from_db_type("NUMBER(10,2)"),
+            LogicalType::Decimal
+        );
+        assert_eq!(
+            logical_type_from_db_type("NUMBER(1,0)"),
+            LogicalType::Decimal
+        );
     }
 
     #[test]

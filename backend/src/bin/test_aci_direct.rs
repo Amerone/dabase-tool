@@ -22,10 +22,7 @@ fn main() {
         use std::os::windows::ffi::OsStrExt;
         use win32::*;
 
-        let path: Vec<u16> = OsStr::new("aci.dll")
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
+        let path: Vec<u16> = OsStr::new("aci.dll").encode_wide().chain(Some(0)).collect();
 
         println!("Step 1: LoadLibraryW(aci.dll)...");
         let hmod = unsafe { LoadLibraryW(path.as_ptr()) };
@@ -40,15 +37,16 @@ fn main() {
         let fn_ptr = unsafe { GetProcAddress(hmod, b"ACIClientVersion\0".as_ptr()) };
         if fn_ptr.is_null() {
             eprintln!("FAIL: GetProcAddress failed");
-            unsafe { FreeLibrary(hmod); }
+            unsafe {
+                FreeLibrary(hmod);
+            }
             return;
         }
         println!("OK: Got function pointer at {:?}", fn_ptr);
 
         println!("Step 3: Calling ACIClientVersion...");
-        type AciClientVersion = unsafe extern "C" fn(
-            *mut i32, *mut i32, *mut i32, *mut i32, *mut i32
-        );
+        type AciClientVersion =
+            unsafe extern "C" fn(*mut i32, *mut i32, *mut i32, *mut i32, *mut i32);
         let aci_client_version: AciClientVersion = unsafe { std::mem::transmute(fn_ptr) };
 
         let mut major = 0i32;
@@ -58,9 +56,18 @@ fn main() {
         let mut port_update = 0i32;
 
         unsafe {
-            aci_client_version(&mut major, &mut minor, &mut update, &mut patch, &mut port_update);
+            aci_client_version(
+                &mut major,
+                &mut minor,
+                &mut update,
+                &mut patch,
+                &mut port_update,
+            );
         }
-        println!("OK: Version {}.{}.{}.{}.{}", major, minor, update, patch, port_update);
+        println!(
+            "OK: Version {}.{}.{}.{}.{}",
+            major, minor, update, patch, port_update
+        );
 
         // Now try ACIEnvNlsCreate
         println!("\nStep 4: GetProcAddress(ACIEnvNlsCreate)...");
@@ -74,16 +81,16 @@ fn main() {
             // ACIEnvNlsCreate(envhpp, mode, ctxp, malloc, realloc, free, xtramemsz, usrmempp, charset, ncharset)
             // Using OCI_THREADED=2, charset=852 (GBK)
             type AciEnvNlsCreate = unsafe extern "C" fn(
-                *mut *mut std::ffi::c_void,  // envhpp
-                u32,                          // mode (OCI_THREADED = 2)
-                *mut std::ffi::c_void,        // ctxp
-                *mut std::ffi::c_void,        // malocfp
-                *mut std::ffi::c_void,        // ralocfp
-                *mut std::ffi::c_void,        // mfreefp
-                usize,                         // xtramemsz
-                *mut *mut std::ffi::c_void,   // usrmempp
-                u16,                           // charset
-                u16,                           // ncharset
+                *mut *mut std::ffi::c_void, // envhpp
+                u32,                        // mode (OCI_THREADED = 2)
+                *mut std::ffi::c_void,      // ctxp
+                *mut std::ffi::c_void,      // malocfp
+                *mut std::ffi::c_void,      // ralocfp
+                *mut std::ffi::c_void,      // mfreefp
+                usize,                      // xtramemsz
+                *mut *mut std::ffi::c_void, // usrmempp
+                u16,                        // charset
+                u16,                        // ncharset
             ) -> i32;
 
             let aci_env_nls_create: AciEnvNlsCreate = unsafe { std::mem::transmute(env_fn_ptr) };
@@ -92,17 +99,26 @@ fn main() {
             let ret = unsafe {
                 aci_env_nls_create(
                     &mut env_handle,
-                    2,   // OCI_THREADED
-                    std::ptr::null_mut(), std::ptr::null_mut(),
-                    std::ptr::null_mut(), std::ptr::null_mut(),
-                    0, std::ptr::null_mut(),
-                    852u16, 852u16,  // ZHS16GBK charset
+                    2, // OCI_THREADED
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    852u16,
+                    852u16, // ZHS16GBK charset
                 )
             };
-            println!("ACIEnvNlsCreate returned: {}, env_handle: {:?}", ret, env_handle);
+            println!(
+                "ACIEnvNlsCreate returned: {}, env_handle: {:?}",
+                ret, env_handle
+            );
         }
 
-        unsafe { FreeLibrary(hmod); }
+        unsafe {
+            FreeLibrary(hmod);
+        }
         println!("\nAll tests passed!");
     }
 

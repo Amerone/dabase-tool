@@ -13,10 +13,7 @@ use crate::{
         logical_type_from_db_type, CanonicalColumn, CanonicalRow, CanonicalTable, CanonicalValue,
         LogicalType,
     },
-    export::{
-        data::topological_sort_by_foreign_keys,
-        orchestrator::LegacyExportPlan,
-    },
+    export::{data::topological_sort_by_foreign_keys, orchestrator::LegacyExportPlan},
     models::{ConnectionConfig, DbType, ForeignKey},
 };
 
@@ -44,7 +41,12 @@ pub async fn export_kingbase_to_kingbase_ddl(
     for (idx, table_id) in plan.tables.iter().enumerate() {
         let mut table = inspect_canonical_table(&client, &table_id.schema, &table_id.name)
             .await
-            .with_context(|| format!("Failed to inspect Kingbase table '{}.{}'", table_id.schema, table_id.name))?;
+            .with_context(|| {
+                format!(
+                    "Failed to inspect Kingbase table '{}.{}'",
+                    table_id.schema, table_id.name
+                )
+            })?;
         table.name = format!("{}.{}", plan.target_schema, &table_id.name);
         let ddl = renderer.render_table_ddl(&table)?;
 
@@ -99,7 +101,10 @@ pub async fn export_kingbase_to_kingbase_data(
     let truncate_order: Vec<usize> = insert_order.iter().copied().rev().collect();
 
     // Phase 1: TRUNCATE all tables (children first)
-    writeln!(writer, "-- Phase 1: TRUNCATE tables (children before parents)")?;
+    writeln!(
+        writer,
+        "-- Phase 1: TRUNCATE tables (children before parents)"
+    )?;
     for &idx in &truncate_order {
         let table_id = &plan.tables[idx];
         writeln!(
@@ -117,7 +122,12 @@ pub async fn export_kingbase_to_kingbase_data(
         let table_id = &plan.tables[idx];
         let source_table = inspect_canonical_table(&client, &table_id.schema, &table_id.name)
             .await
-            .with_context(|| format!("Failed to inspect Kingbase table '{}.{}'", table_id.schema, table_id.name))?;
+            .with_context(|| {
+                format!(
+                    "Failed to inspect Kingbase table '{}.{}'",
+                    table_id.schema, table_id.name
+                )
+            })?;
 
         let mut target_table = source_table.clone();
         target_table.name = format!("{}.{}", plan.target_schema, &table_id.name);
@@ -193,6 +203,7 @@ async fn fetch_columns(
             name,
             logical_type,
             nullable: !not_null,
+            identity: false,
         });
     }
     Ok(columns)

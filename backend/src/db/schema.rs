@@ -24,6 +24,80 @@ pub(crate) fn decode_cell(batch: &TextRowSet, col: usize, row: usize) -> Option<
     }
 }
 
+fn merge_duplicate_column(existing: &mut Column, duplicate: Column) {
+    if existing.data_type.trim().is_empty() && !duplicate.data_type.trim().is_empty() {
+        existing.data_type = duplicate.data_type;
+    }
+
+    existing.length = existing.length.or(duplicate.length);
+    existing.precision = existing.precision.or(duplicate.precision);
+    existing.scale = existing.scale.or(duplicate.scale);
+
+    if existing
+        .char_semantics
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        existing.char_semantics = duplicate.char_semantics;
+    }
+
+    existing.nullable &= duplicate.nullable;
+
+    if existing
+        .comment
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        existing.comment = duplicate.comment;
+    }
+
+    if existing
+        .default_value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        existing.default_value = duplicate.default_value;
+    }
+
+    existing.identity |= duplicate.identity;
+    existing.identity_start = existing.identity_start.or(duplicate.identity_start);
+    existing.identity_increment = existing.identity_increment.or(duplicate.identity_increment);
+}
+
+fn deduplicate_columns(columns: Vec<Column>, table_name: &str) -> Vec<Column> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut deduplicated = Vec::with_capacity(columns.len());
+    let mut duplicate_count = 0usize;
+
+    for column in columns {
+        let key = column.name.to_uppercase();
+        if let Some(&index) = seen.get(&key) {
+            merge_duplicate_column(&mut deduplicated[index], column);
+            duplicate_count += 1;
+            continue;
+        }
+
+        seen.insert(key, deduplicated.len());
+        deduplicated.push(column);
+    }
+
+    if duplicate_count > 0 {
+        tracing::warn!(
+            table = table_name,
+            duplicates = duplicate_count,
+            "DM8 metadata returned duplicate columns; collapsing to unique column list"
+        );
+    }
+
+    deduplicated
+}
+
 pub fn get_schemas(connection: &Connection<'_>) -> Result<Vec<String>> {
     let sql = "SELECT USERNAME FROM ALL_USERS ORDER BY USERNAME";
 
@@ -86,12 +160,7 @@ pub fn get_tables(connection: &Connection<'_>, schema: &str) -> Result<Vec<Table
         }
     }
 
-    // Fallback: if NUM_ROWS is缺失或为 0，则实时 COUNT(*)
-    for table in &mut tables {
-        if table.row_count.is_none() || table.row_count == Some(0) {
-            table.row_count = fetch_row_count(connection, &owner, &table.name).ok();
-        }
-    }
+    // 使用 ALL_TABLES.NUM_ROWS 统计值（可能略滞后于实际行数，但避免对每张表执行 COUNT(*)）
 
     Ok(tables)
 }
@@ -251,6 +320,8 @@ fn fetch_columns(connection: &Connection<'_>, schema: &str, table: &str) -> Resu
         }
     }
 
+    let mut columns = deduplicate_columns(columns, table);
+
     // Fetch identity seed and increment for tables with identity columns
     // Note: DM8 allows only ONE identity column per table, so we only update the first one found
     let has_identity = columns.iter().any(|c| c.identity);
@@ -396,7 +467,53 @@ pub fn fetch_row_count(connection: &Connection<'_>, schema: &str, table: &str) -
 
 #[cfg(test)]
 mod tests {
-    use super::{is_trigger_metadata_missing, trigger_fallback_level};
+    use crate::models::Column;
+
+    use super::{deduplicate_columns, is_trigger_metadata_missing, trigger_fallback_level};
+
+    fn sample_column(name: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            data_type: "VARCHAR".to_string(),
+            length: Some(255),
+            precision: None,
+            scale: None,
+            char_semantics: Some("C".to_string()),
+            nullable: true,
+            comment: None,
+            default_value: None,
+            identity: false,
+            identity_start: None,
+            identity_increment: None,
+        }
+    }
+
+    #[test]
+    fn deduplicate_columns_collapses_duplicate_names_and_merges_metadata() {
+        let mut duplicate_a = sample_column("files");
+        duplicate_a.comment = Some("file metadata".to_string());
+
+        let mut duplicate_b = sample_column("FILES");
+        duplicate_b.nullable = false;
+        duplicate_b.default_value = Some("'[]'".to_string());
+        duplicate_b.identity = true;
+        duplicate_b.identity_start = Some(1);
+        duplicate_b.identity_increment = Some(1);
+
+        let columns = deduplicate_columns(
+            vec![sample_column("id"), duplicate_a, duplicate_b],
+            "PUBLIC_INTERFACE_TO_CONFIG",
+        );
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[1].name, "files");
+        assert_eq!(columns[1].comment.as_deref(), Some("file metadata"));
+        assert_eq!(columns[1].default_value.as_deref(), Some("'[]'"));
+        assert!(!columns[1].nullable);
+        assert!(columns[1].identity);
+        assert_eq!(columns[1].identity_start, Some(1));
+        assert_eq!(columns[1].identity_increment, Some(1));
+    }
 
     #[test]
     fn trigger_metadata_missing_detects_missing_trigger_type_column() {
@@ -886,7 +1003,10 @@ fn fetch_triggers(
 
             // Check for EACH ROW in both description and trigger_type
             let each_row = description.to_uppercase().contains("EACH ROW")
-                || trigger_type_upper.contains("EACH ROW");
+                || trigger_type_upper.contains("EACH ROW")
+                || body.to_uppercase().contains(":NEW.")
+                || body.to_uppercase().contains(":OLD.")
+                || when_clause.to_uppercase().contains("NEW.");
 
             let mut trigger_body = String::new();
             if !when_clause.trim().is_empty() {
@@ -1000,5 +1120,616 @@ fn fetch_indexes(connection: &Connection<'_>, schema: &str, table: &str) -> Resu
         }
     }
 
+    Ok(result)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Batch metadata fetch — replaces N×8 serial queries with ~9 bulk queries
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn make_in_clause(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|n| format!("'{}'", n.replace("'", "''")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Fetch full `TableDetails` for multiple tables in one shot.
+///
+/// Uses `IN (…)` bulk queries instead of a per-table round-trip for each
+/// metadata category, reducing total ODBC queries from O(N) to a constant ~9.
+pub fn get_tables_details_batch(
+    connection: &Connection<'_>,
+    schema: &str,
+    table_names: &[String],
+) -> Result<Vec<TableDetails>> {
+    if table_names.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let owner = schema.to_uppercase();
+    let names_upper: Vec<String> = table_names.iter().map(|n| n.to_uppercase()).collect();
+    let in_clause = make_in_clause(&names_upper);
+
+    // Seed result map in original order
+    let mut map: HashMap<String, TableDetails> = names_upper
+        .iter()
+        .map(|n| {
+            (
+                n.clone(),
+                TableDetails {
+                    name: n.clone(),
+                    comment: None,
+                    columns: vec![],
+                    primary_keys: vec![],
+                    indexes: vec![],
+                    unique_constraints: vec![],
+                    foreign_keys: vec![],
+                    check_constraints: vec![],
+                    triggers: vec![],
+                },
+            )
+        })
+        .collect();
+
+    tracing::info!(
+        "get_tables_details_batch: start ({} tables)",
+        table_names.len()
+    );
+
+    // ── 1. Table comments ──────────────────────────────────────────────────
+    {
+        let sql = format!(
+            "SELECT TABLE_NAME, COMMENTS FROM ALL_TAB_COMMENTS \
+             WHERE OWNER = '{}' AND TABLE_NAME IN ({})",
+            owner.replace("'", "''"),
+            in_clause
+        );
+        if let Ok(Some(mut cursor)) = connection.execute(&sql, ()) {
+            let mut buffers = TextRowSet::for_cursor(200, &mut cursor, Some(8192))?;
+            let mut rs = cursor.bind_buffer(&mut buffers)?;
+            while let Some(batch) = rs.fetch()? {
+                for row in 0..batch.num_rows() {
+                    if let Some(tname) = decode_cell(batch, 0, row) {
+                        if let Some(entry) = map.get_mut(&tname) {
+                            entry.comment =
+                                decode_cell(batch, 1, row).filter(|s| !s.trim().is_empty());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!("get_tables_details_batch: [1/8] table comments done");
+
+    // ── 2. Columns + column comments ──────────────────────────────────────
+    {
+        let sql = format!(
+            "SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, \
+                    CASE WHEN c.DATA_TYPE IN ('CHAR','NCHAR','VARCHAR','VARCHAR2','NVARCHAR','NVARCHAR2') \
+                              AND c.CHAR_USED = 'C' \
+                         THEN c.CHAR_LENGTH ELSE c.DATA_LENGTH END AS LEN, \
+                    c.DATA_PRECISION, c.DATA_SCALE, c.CHAR_USED, c.NULLABLE, c.DATA_DEFAULT, \
+                    CASE WHEN sc.INFO2 & 1 = 1 THEN 'YES' ELSE 'NO' END AS IS_IDENTITY, \
+                    cc.COMMENTS \
+             FROM ALL_TAB_COLUMNS c \
+             LEFT JOIN ALL_COL_COMMENTS cc ON cc.OWNER=c.OWNER AND cc.TABLE_NAME=c.TABLE_NAME AND cc.COLUMN_NAME=c.COLUMN_NAME \
+             LEFT JOIN SYS.SYSOBJECTS sch ON sch.NAME=c.OWNER AND sch.TYPE$='SCH' \
+             LEFT JOIN SYS.SYSOBJECTS so  ON so.NAME=c.TABLE_NAME AND so.SCHID=sch.ID AND so.TYPE$='SCHOBJ' \
+             LEFT JOIN SYS.SYSCOLUMNS sc  ON sc.ID=so.ID AND sc.NAME=c.COLUMN_NAME \
+             WHERE c.OWNER = '{}' AND c.TABLE_NAME IN ({}) \
+             ORDER BY c.TABLE_NAME, c.COLUMN_ID",
+            owner.replace("'", "''"),
+            in_clause
+        );
+        if let Ok(Some(mut cursor)) = connection.execute(&sql, ()) {
+            let mut buffers = TextRowSet::for_cursor(500, &mut cursor, Some(8192))?;
+            let mut rs = cursor.bind_buffer(&mut buffers)?;
+            while let Some(batch) = rs.fetch()? {
+                for row in 0..batch.num_rows() {
+                    let tname = match decode_cell(batch, 0, row) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    let entry = match map.get_mut(&tname) {
+                        Some(e) => e,
+                        None => continue,
+                    };
+                    let name = match decode_cell(batch, 1, row) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    let data_type = decode_cell(batch, 2, row).unwrap_or_default();
+                    let length = decode_cell(batch, 3, row).and_then(|s| s.parse::<i32>().ok());
+                    let precision = decode_cell(batch, 4, row).and_then(|s| s.parse::<i32>().ok());
+                    let scale = decode_cell(batch, 5, row).and_then(|s| s.parse::<i32>().ok());
+                    let char_semantics = decode_cell(batch, 6, row);
+                    let nullable = matches!(
+                        decode_cell(batch, 7, row),
+                        Some(ref f) if f.eq_ignore_ascii_case("Y")
+                    );
+                    let default_value = decode_cell(batch, 8, row);
+                    let identity = matches!(
+                        decode_cell(batch, 9, row),
+                        Some(ref f) if f.eq_ignore_ascii_case("YES") || f.eq_ignore_ascii_case("Y")
+                    );
+                    let comment = decode_cell(batch, 10, row);
+                    entry.columns.push(Column {
+                        name,
+                        data_type,
+                        length,
+                        precision,
+                        scale,
+                        char_semantics,
+                        nullable,
+                        comment,
+                        default_value,
+                        identity,
+                        identity_start: None,
+                        identity_increment: None,
+                    });
+                }
+            }
+        }
+    }
+
+    tracing::info!("get_tables_details_batch: [2/8] columns done");
+
+    for entry in map.values_mut() {
+        entry.columns = deduplicate_columns(std::mem::take(&mut entry.columns), &entry.name);
+    }
+
+    // ── 2b. Identity seed/increment (per-table, only for tables that need it) ─
+    for entry in map.values_mut() {
+        if entry.columns.iter().any(|c| c.identity) {
+            if let Ok(Some((seed, incr))) = fetch_identity_info(connection, &owner, &entry.name) {
+                if let Some(col) = entry.columns.iter_mut().find(|c| c.identity) {
+                    col.identity_start = Some(seed);
+                    col.identity_increment = Some(incr);
+                }
+            }
+        }
+    }
+
+    tracing::info!("get_tables_details_batch: [2b/8] identity info done");
+
+    // ── 3. Primary keys ───────────────────────────────────────────────────
+    {
+        let sql = format!(
+            "SELECT ac.TABLE_NAME, acc.COLUMN_NAME \
+             FROM ALL_CONSTRAINTS ac \
+             JOIN ALL_CONS_COLUMNS acc ON ac.OWNER=acc.OWNER AND ac.CONSTRAINT_NAME=acc.CONSTRAINT_NAME \
+             WHERE ac.CONSTRAINT_TYPE='P' AND ac.OWNER='{}' AND ac.TABLE_NAME IN ({}) \
+             ORDER BY ac.TABLE_NAME, acc.POSITION",
+            owner.replace("'", "''"),
+            in_clause
+        );
+        if let Ok(Some(mut cursor)) = connection.execute(&sql, ()) {
+            let mut buffers = TextRowSet::for_cursor(500, &mut cursor, Some(8192))?;
+            let mut rs = cursor.bind_buffer(&mut buffers)?;
+            while let Some(batch) = rs.fetch()? {
+                for row in 0..batch.num_rows() {
+                    if let (Some(tname), Some(col)) =
+                        (decode_cell(batch, 0, row), decode_cell(batch, 1, row))
+                    {
+                        if let Some(entry) = map.get_mut(&tname) {
+                            entry.primary_keys.push(col);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!("get_tables_details_batch: [3/8] primary keys done");
+
+    // ── 4. Indexes (name + uniqueness) ────────────────────────────────────
+    {
+        // Temporary per-table index maps for column assembly
+        let mut idx_meta: HashMap<String, HashMap<String, (bool, Vec<String>)>> = HashMap::new();
+
+        let sql = format!(
+            "SELECT ai.TABLE_NAME, ai.INDEX_NAME, ai.UNIQUENESS \
+             FROM ALL_INDEXES ai \
+             WHERE ai.TABLE_OWNER='{}' AND ai.TABLE_NAME IN ({}) \
+             ORDER BY ai.TABLE_NAME, ai.INDEX_NAME",
+            owner.replace("'", "''"),
+            in_clause
+        );
+        if let Ok(Some(mut cursor)) = connection.execute(&sql, ()) {
+            let mut buffers = TextRowSet::for_cursor(500, &mut cursor, Some(8192))?;
+            let mut rs = cursor.bind_buffer(&mut buffers)?;
+            while let Some(batch) = rs.fetch()? {
+                for row in 0..batch.num_rows() {
+                    if let (Some(tname), Some(iname)) =
+                        (decode_cell(batch, 0, row), decode_cell(batch, 1, row))
+                    {
+                        let unique = matches!(
+                            decode_cell(batch, 2, row),
+                            Some(ref f) if f.eq_ignore_ascii_case("UNIQUE") || f.eq_ignore_ascii_case("Y")
+                        );
+                        idx_meta
+                            .entry(tname)
+                            .or_default()
+                            .entry(iname)
+                            .or_insert((unique, vec![]));
+                    }
+                }
+            }
+        }
+
+        // Index columns
+        let sql = format!(
+            "SELECT ic.TABLE_NAME, ic.INDEX_NAME, ic.COLUMN_NAME \
+             FROM ALL_IND_COLUMNS ic \
+             WHERE ic.INDEX_OWNER='{}' AND ic.TABLE_NAME IN ({}) \
+             ORDER BY ic.TABLE_NAME, ic.INDEX_NAME, ic.COLUMN_POSITION",
+            owner.replace("'", "''"),
+            in_clause
+        );
+        if let Ok(Some(mut cursor)) = connection.execute(&sql, ()) {
+            let mut buffers = TextRowSet::for_cursor(1000, &mut cursor, Some(8192))?;
+            let mut rs = cursor.bind_buffer(&mut buffers)?;
+            while let Some(batch) = rs.fetch()? {
+                for row in 0..batch.num_rows() {
+                    if let (Some(tname), Some(iname), Some(col)) = (
+                        decode_cell(batch, 0, row),
+                        decode_cell(batch, 1, row),
+                        decode_cell(batch, 2, row),
+                    ) {
+                        if let Some(tmap) = idx_meta.get_mut(&tname) {
+                            if let Some(entry) = tmap.get_mut(&iname) {
+                                entry.1.push(col);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Populate map
+        for (tname, imap) in idx_meta {
+            if let Some(entry) = map.get_mut(&tname) {
+                for (iname, (unique, columns)) in imap {
+                    if !columns.is_empty() {
+                        entry.indexes.push(Index {
+                            name: iname,
+                            columns,
+                            unique,
+                        });
+                    }
+                }
+                entry.indexes.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+        }
+    }
+
+    tracing::info!("get_tables_details_batch: [4/8] indexes done");
+
+    // ── 5. Unique constraints ─────────────────────────────────────────────
+    {
+        let sql = format!(
+            "SELECT ac.TABLE_NAME, ac.CONSTRAINT_NAME, acc.COLUMN_NAME \
+             FROM ALL_CONSTRAINTS ac \
+             JOIN ALL_CONS_COLUMNS acc ON ac.OWNER=acc.OWNER AND ac.CONSTRAINT_NAME=acc.CONSTRAINT_NAME \
+             WHERE ac.CONSTRAINT_TYPE='U' AND ac.OWNER='{}' AND ac.TABLE_NAME IN ({}) \
+             ORDER BY ac.TABLE_NAME, ac.CONSTRAINT_NAME, acc.POSITION",
+            owner.replace("'", "''"),
+            in_clause
+        );
+        if let Ok(Some(mut cursor)) = connection.execute(&sql, ()) {
+            let mut buffers = TextRowSet::for_cursor(500, &mut cursor, Some(8192))?;
+            let mut rs = cursor.bind_buffer(&mut buffers)?;
+            while let Some(batch) = rs.fetch()? {
+                for row in 0..batch.num_rows() {
+                    if let (Some(tname), Some(cname), Some(col)) = (
+                        decode_cell(batch, 0, row),
+                        decode_cell(batch, 1, row),
+                        decode_cell(batch, 2, row),
+                    ) {
+                        if let Some(entry) = map.get_mut(&tname) {
+                            if let Some(uc) = entry
+                                .unique_constraints
+                                .iter_mut()
+                                .find(|u| u.name == cname)
+                            {
+                                uc.columns.push(col);
+                            } else {
+                                entry.unique_constraints.push(UniqueConstraint {
+                                    name: cname,
+                                    columns: vec![col],
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!("get_tables_details_batch: [5/8] unique constraints done");
+
+    // ── 6. Check constraints ──────────────────────────────────────────────
+    {
+        let sql = format!(
+            "SELECT ac.TABLE_NAME, ac.CONSTRAINT_NAME, ac.SEARCH_CONDITION \
+             FROM ALL_CONSTRAINTS ac \
+             WHERE ac.CONSTRAINT_TYPE='C' AND ac.OWNER='{}' AND ac.TABLE_NAME IN ({}) \
+             ORDER BY ac.TABLE_NAME, ac.CONSTRAINT_NAME",
+            owner.replace("'", "''"),
+            in_clause
+        );
+        if let Ok(Some(mut cursor)) = connection.execute(&sql, ()) {
+            let mut buffers = TextRowSet::for_cursor(500, &mut cursor, Some(8192))?;
+            let mut rs = cursor.bind_buffer(&mut buffers)?;
+            while let Some(batch) = rs.fetch()? {
+                for row in 0..batch.num_rows() {
+                    if let (Some(tname), Some(cname), Some(cond)) = (
+                        decode_cell(batch, 0, row),
+                        decode_cell(batch, 1, row),
+                        decode_cell(batch, 2, row),
+                    ) {
+                        if let Some(entry) = map.get_mut(&tname) {
+                            entry.check_constraints.push(CheckConstraint {
+                                name: cname,
+                                condition: cond,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!("get_tables_details_batch: [6/8] check constraints done");
+
+    // ── 7. Foreign keys (2 queries instead of N×3) ────────────────────────
+    {
+        // Query 1: FK constraints + FK columns
+        #[derive(Default)]
+        struct FkInfo {
+            columns: Vec<String>,
+            r_constraint: String,
+            delete_rule: Option<String>,
+        }
+        // table → constraint_name → FkInfo
+        let mut fk_map: HashMap<String, HashMap<String, FkInfo>> = HashMap::new();
+
+        let sql = format!(
+            "SELECT ac.TABLE_NAME, ac.CONSTRAINT_NAME, acc.COLUMN_NAME, \
+                    ac.R_CONSTRAINT_NAME, ac.R_OWNER, ac.DELETE_RULE \
+             FROM ALL_CONSTRAINTS ac \
+             JOIN ALL_CONS_COLUMNS acc ON ac.OWNER=acc.OWNER AND ac.CONSTRAINT_NAME=acc.CONSTRAINT_NAME \
+             WHERE ac.CONSTRAINT_TYPE='R' AND ac.OWNER='{}' AND ac.TABLE_NAME IN ({}) \
+             ORDER BY ac.TABLE_NAME, ac.CONSTRAINT_NAME, acc.POSITION",
+            owner.replace("'", "''"),
+            in_clause
+        );
+        if let Ok(Some(mut cursor)) = connection.execute(&sql, ()) {
+            let mut buffers = TextRowSet::for_cursor(1000, &mut cursor, Some(8192))?;
+            let mut rs = cursor.bind_buffer(&mut buffers)?;
+            while let Some(batch) = rs.fetch()? {
+                for row in 0..batch.num_rows() {
+                    let tname = match decode_cell(batch, 0, row) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let cname = match decode_cell(batch, 1, row) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let col = match decode_cell(batch, 2, row) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let r_constraint = decode_cell(batch, 3, row).unwrap_or_default();
+                    let delete_rule = decode_cell(batch, 5, row);
+
+                    let fk = fk_map
+                        .entry(tname)
+                        .or_default()
+                        .entry(cname)
+                        .or_insert_with(|| FkInfo {
+                            r_constraint: r_constraint.clone(),
+                            delete_rule: delete_rule.clone(),
+                            ..Default::default()
+                        });
+                    fk.columns.push(col);
+                }
+            }
+        }
+
+        // Collect all unique referenced constraint names for batch lookup
+        let ref_constraints: Vec<String> = fk_map
+            .values()
+            .flat_map(|fks| fks.values().map(|f| f.r_constraint.clone()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        if !ref_constraints.is_empty() {
+            // Query 2: referenced table + columns for all referenced constraints at once
+            let ref_in = make_in_clause(&ref_constraints);
+            let sql = format!(
+                "SELECT acc.CONSTRAINT_NAME, ac.TABLE_NAME, ac.OWNER, acc.COLUMN_NAME \
+                 FROM ALL_CONS_COLUMNS acc \
+                 JOIN ALL_CONSTRAINTS ac ON acc.OWNER=ac.OWNER AND acc.CONSTRAINT_NAME=ac.CONSTRAINT_NAME \
+                 WHERE acc.CONSTRAINT_NAME IN ({}) \
+                 ORDER BY acc.CONSTRAINT_NAME, acc.POSITION",
+                ref_in
+            );
+
+            // ref_constraint_name → (ref_owner.ref_table, Vec<col>)
+            let mut ref_map: HashMap<String, (String, Vec<String>)> = HashMap::new();
+            if let Ok(Some(mut cursor)) = connection.execute(&sql, ()) {
+                let mut buffers = TextRowSet::for_cursor(1000, &mut cursor, Some(8192))?;
+                let mut rs = cursor.bind_buffer(&mut buffers)?;
+                while let Some(batch) = rs.fetch()? {
+                    for row in 0..batch.num_rows() {
+                        if let (Some(cname), Some(tname), Some(rowner), Some(col)) = (
+                            decode_cell(batch, 0, row),
+                            decode_cell(batch, 1, row),
+                            decode_cell(batch, 2, row),
+                            decode_cell(batch, 3, row),
+                        ) {
+                            let entry = ref_map
+                                .entry(cname)
+                                .or_insert_with(|| (format!("{}.{}", rowner, tname), vec![]));
+                            entry.1.push(col);
+                        }
+                    }
+                }
+            }
+
+            // Populate FKs into each table's entry
+            for (tname, fks) in fk_map {
+                if let Some(entry) = map.get_mut(&tname) {
+                    let mut fk_list: Vec<ForeignKey> = fks
+                        .into_iter()
+                        .filter_map(|(cname, fk)| {
+                            let (ref_table, ref_cols) = ref_map.get(&fk.r_constraint)?.clone();
+                            Some(ForeignKey {
+                                name: cname,
+                                columns: fk.columns,
+                                referenced_table: ref_table,
+                                referenced_columns: ref_cols,
+                                delete_rule: fk.delete_rule,
+                                update_rule: None,
+                            })
+                        })
+                        .collect();
+                    fk_list.sort_by(|a, b| a.name.cmp(&b.name));
+                    entry.foreign_keys = fk_list;
+                }
+            }
+        }
+    }
+
+    tracing::info!("get_tables_details_batch: [7/8] foreign keys done");
+
+    // ── 8. Triggers ───────────────────────────────────────────────────────
+    {
+        let sql_full = format!(
+            "SELECT TABLE_NAME, TRIGGER_NAME, TRIGGER_TYPE, TRIGGERING_EVENT, \
+                    WHEN_CLAUSE, TRIGGER_BODY, DESCRIPTION \
+             FROM ALL_TRIGGERS \
+             WHERE TABLE_OWNER='{}' AND TABLE_NAME IN ({}) \
+             ORDER BY TABLE_NAME, TRIGGER_NAME",
+            owner.replace("'", "''"),
+            in_clause
+        );
+        let sql_no_type = format!(
+            "SELECT TABLE_NAME, TRIGGER_NAME, NULL AS TRIGGER_TYPE, TRIGGERING_EVENT, \
+                    WHEN_CLAUSE, TRIGGER_BODY, NULL AS DESCRIPTION \
+             FROM ALL_TRIGGERS \
+             WHERE TABLE_OWNER='{}' AND TABLE_NAME IN ({}) \
+             ORDER BY TABLE_NAME, TRIGGER_NAME",
+            owner.replace("'", "''"),
+            in_clause
+        );
+        let sql_no_when = format!(
+            "SELECT TABLE_NAME, TRIGGER_NAME, NULL AS TRIGGER_TYPE, TRIGGERING_EVENT, \
+                    NULL AS WHEN_CLAUSE, TRIGGER_BODY, NULL AS DESCRIPTION \
+             FROM ALL_TRIGGERS \
+             WHERE TABLE_OWNER='{}' AND TABLE_NAME IN ({}) \
+             ORDER BY TABLE_NAME, TRIGGER_NAME",
+            owner.replace("'", "''"),
+            in_clause
+        );
+
+        let trigger_sqls = [sql_full, sql_no_type, sql_no_when];
+        let mut level: usize = 0;
+        'trig: loop {
+            match connection.execute(&trigger_sqls[level], ()) {
+                Ok(None) => break,
+                Ok(Some(mut cursor)) => {
+                    let mut buffers = TextRowSet::for_cursor(500, &mut cursor, Some(32768))?;
+                    let mut rs = cursor.bind_buffer(&mut buffers)?;
+                    while let Some(batch) = rs.fetch()? {
+                        for row in 0..batch.num_rows() {
+                            let tname = match decode_cell(batch, 0, row) {
+                                Some(n) => n,
+                                None => continue,
+                            };
+                            let entry = match map.get_mut(&tname) {
+                                Some(e) => e,
+                                None => continue,
+                            };
+                            let tr_name = decode_cell(batch, 1, row).unwrap_or_default();
+                            let trigger_type =
+                                decode_cell(batch, 2, row).unwrap_or_else(|| "BEFORE".to_string());
+                            let triggering_event =
+                                decode_cell(batch, 3, row).unwrap_or_else(|| "INSERT".to_string());
+                            let when_clause = decode_cell(batch, 4, row).unwrap_or_default();
+                            let body = decode_cell(batch, 5, row).unwrap_or_default();
+                            let description = decode_cell(batch, 6, row).unwrap_or_default();
+
+                            let normalized = triggering_event.replace(" OR ", ",");
+                            let mut events: Vec<String> = normalized
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            if events.is_empty() {
+                                events.push("INSERT".to_string());
+                            }
+
+                            let ttu = trigger_type.to_uppercase();
+                            let timing = if ttu.contains("INSTEAD") {
+                                "INSTEAD OF".to_string()
+                            } else if ttu.contains("AFTER") {
+                                "AFTER".to_string()
+                            } else {
+                                "BEFORE".to_string()
+                            };
+                            let each_row = description.to_uppercase().contains("EACH ROW")
+                                || ttu.contains("EACH ROW")
+                                || body.to_uppercase().contains(":NEW.")
+                                || body.to_uppercase().contains(":OLD.")
+                                || when_clause.to_uppercase().contains("NEW.");
+
+                            let mut trigger_body = String::new();
+                            if !when_clause.trim().is_empty() {
+                                trigger_body.push_str(&format!("WHEN ({})\n", when_clause.trim()));
+                            }
+                            trigger_body.push_str(body.trim());
+
+                            entry.triggers.push(TriggerDefinition {
+                                name: tr_name,
+                                table_name: tname.clone(),
+                                timing,
+                                events,
+                                each_row,
+                                body: trigger_body,
+                            });
+                        }
+                    }
+                    break 'trig;
+                }
+                Err(err) => {
+                    let err = anyhow!(err);
+                    if level < 2 && is_trigger_metadata_missing(&err) {
+                        level += 1;
+                        tracing::warn!("Batch trigger query fallback to level {}: {}", level, err);
+                        continue;
+                    }
+                    // Non-fatal: skip triggers on error
+                    tracing::warn!("Batch trigger query failed, skipping triggers: {}", err);
+                    break;
+                }
+            }
+        }
+    }
+
+    tracing::info!("get_tables_details_batch: [8/8] triggers done");
+
+    // Return in original order, preserving only tables that exist
+    let result = names_upper
+        .iter()
+        .filter_map(|n| map.remove(n))
+        .filter(|t| !t.columns.is_empty())
+        .collect();
     Ok(result)
 }

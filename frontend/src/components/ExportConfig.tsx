@@ -235,6 +235,7 @@ export default function ExportConfig() {
         drop_existing: values.drop_existing,
         include_row_counts: includeRowCountsSupported ? Boolean(values.include_row_counts) : false,
         strict_mode: Boolean(values.strict_mode),
+        identifier_case: (targetDialect === 'kingbase' || targetDialect === 'shentong') ? (values.identifier_case || 'lower') : undefined,
       }
 
       const results: { ddl?: string; data?: string } = {}
@@ -427,6 +428,23 @@ export default function ExportConfig() {
             ]}
           />
         </Form.Item>
+
+        {(watchedTargetDialect === 'kingbase' || watchedTargetDialect === 'shentong') && (
+          <Form.Item
+            label={<span style={{ fontFamily: 'JetBrains Mono' }}>标识符大小写</span>}
+            name="identifier_case"
+            initialValue="lower"
+          >
+            <Select
+              style={{ width: '100%', fontFamily: 'JetBrains Mono' }}
+              options={[
+                { value: 'lower', label: watchedTargetDialect === 'kingbase' ? '小写（Kingbase 推荐）' : '小写' },
+                { value: 'upper', label: '大写' },
+                { value: 'preserve', label: '保持原样' },
+              ]}
+            />
+          </Form.Item>
+        )}
 
         <Form.Item
           label={<span style={{ fontFamily: 'JetBrains Mono' }}>导出模式名</span>}

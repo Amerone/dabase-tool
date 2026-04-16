@@ -1,51 +1,452 @@
 use std::{
+    collections::HashSet,
     fs::{self, File},
     io::{BufWriter, Write},
 };
 
 use anyhow::{Context, Result};
-use odbc_api::{buffers::TextRowSet, Connection, Cursor};
+use chrono::Local;
+use odbc_api::Connection;
 
 use crate::{
-    db::schema::{self, decode_cell},
-    dialect::{renderer_for, DialectRenderer},
-    domain::canonical::{canonical_table_from_details, CanonicalRow, CanonicalValue, LogicalType},
+    db::schema::{fetch_sequences, get_tables_details_batch},
+    dialect::renderer_for,
     export::{
-        data::{has_lob_columns, topological_sort_by_foreign_keys},
+        ddl::{
+            filter_sequences_for_tables, generate_check_constraints, generate_foreign_keys,
+            generate_indexes, generate_primary_key, generate_triggers, generate_unique_constraints,
+            TriggerTerminator,
+        },
         orchestrator::LegacyExportPlan,
     },
-    models::{DbType, ForeignKey},
+    models::{Column, ConnectionConfig, DbType, Sequence, TableDetails},
 };
+
+use super::common::{apply_identifier_case, apply_sequence_case};
+
+/// Map a DM8 column type to its KingBase (PostgreSQL-compatible) equivalent.
+fn dm8_type_to_kingbase(column: &Column) -> String {
+    let raw = column.data_type.trim().to_uppercase();
+    let base = if let Some(pos) = raw.find('(') {
+        raw[..pos].trim().to_string()
+    } else {
+        raw.clone()
+    };
+
+    match base.as_str() {
+        // LOB / large object types
+        "BLOB" | "LONGVARBINARY" => "BYTEA".to_string(),
+        "CLOB" | "NCLOB" | "LONG" | "TEXT" => "TEXT".to_string(),
+
+        // Float / double
+        "DOUBLE" | "FLOAT" => "DOUBLE PRECISION".to_string(),
+        "REAL" => "REAL".to_string(),
+
+        // Binary
+        "RAW" | "BINARY" | "VARBINARY" => "BYTEA".to_string(),
+
+        // Tiny int (not in PostgreSQL)
+        "TINYINT" => "SMALLINT".to_string(),
+
+        // Oracle NUMBER → NUMERIC
+        "NUMBER" => {
+            if let Some(prec) = column.precision.filter(|p| *p > 0) {
+                let scale = column.scale.unwrap_or(0);
+                format!("NUMERIC({},{})", prec, scale)
+            } else {
+                "NUMERIC".to_string()
+            }
+        }
+
+        // DECIMAL / NUMERIC — preserve parenthetical if present but rename to NUMERIC
+        "DECIMAL" | "NUMERIC" => {
+            if let Some(prec) = column.precision.filter(|p| *p > 0) {
+                let scale = column.scale.unwrap_or(0);
+                format!("NUMERIC({},{})", prec, scale)
+            } else if raw.contains('(') {
+                raw.replacen("DECIMAL", "NUMERIC", 1)
+            } else {
+                "NUMERIC".to_string()
+            }
+        }
+
+        // VARCHAR / VARCHAR2 — strip CHAR/BYTE semantics qualifier
+        "VARCHAR" | "VARCHAR2" => {
+            if let Some(len) = column.length.filter(|l| *l > 0) {
+                format!("VARCHAR({})", len)
+            } else {
+                "TEXT".to_string()
+            }
+        }
+
+        // NVARCHAR / NVARCHAR2 → VARCHAR (KingBase uses UTF-8 natively)
+        "NVARCHAR" | "NVARCHAR2" => {
+            if let Some(len) = column.length.filter(|l| *l > 0) {
+                format!("VARCHAR({})", len)
+            } else {
+                "TEXT".to_string()
+            }
+        }
+
+        // CHAR — strip CHAR/BYTE semantics qualifier
+        "CHAR" => {
+            if let Some(len) = column.length.filter(|l| *l > 0) {
+                format!("CHAR({})", len)
+            } else {
+                "CHAR(1)".to_string()
+            }
+        }
+
+        // NCHAR → CHAR
+        "NCHAR" => {
+            if let Some(len) = column.length.filter(|l| *l > 0) {
+                format!("CHAR({})", len)
+            } else {
+                "CHAR(1)".to_string()
+            }
+        }
+
+        // TIMESTAMP / DATETIME — preserve fractional seconds precision
+        "TIMESTAMP" | "DATETIME" => {
+            if let Some(fsp) = column.scale.filter(|s| *s >= 0 && *s <= 9) {
+                if fsp != 6 {
+                    return format!("TIMESTAMP({})", fsp);
+                }
+            }
+            "TIMESTAMP".to_string()
+        }
+
+        // BIT → SMALLINT (KingBase BIT type has different semantics)
+        "BIT" => "SMALLINT".to_string(),
+
+        // DATE → TIMESTAMP(0): DM8/Oracle DATE includes time (to seconds),
+        // but KingBase/PostgreSQL DATE is date-only, causing Java LocalDateTime errors.
+        "DATE" => "TIMESTAMP(0)".to_string(),
+
+        // Pass through unchanged: INT, INTEGER, BIGINT, SMALLINT, BOOLEAN, etc.
+        _ => raw,
+    }
+}
+
+fn format_kingbase_column_def(column: &Column) -> String {
+    let mut parts = Vec::new();
+    parts.push(quote_identifier(&column.name));
+    let kb_type = dm8_type_to_kingbase(column);
+    parts.push(kb_type.clone());
+
+    if column.identity {
+        // KingBase IDENTITY 列只允许 tinyint/smallint/integer/bigint 类型，
+        // 当映射后的类型不在允许范围内时（如 NUMERIC），需要强制替换
+        let kb_upper = kb_type.to_uppercase();
+        let is_identity_compatible = kb_upper == "TINYINT"
+            || kb_upper == "SMALLINT"
+            || kb_upper == "INTEGER"
+            || kb_upper == "INT"
+            || kb_upper == "BIGINT";
+        if !is_identity_compatible {
+            // 根据精度选择最合适的整数类型
+            let int_type = match column.precision {
+                Some(p) if p <= 4 => "SMALLINT",
+                Some(p) if p <= 9 => "INTEGER",
+                _ => "BIGINT",
+            };
+            tracing::warn!(
+                "Converting identity column '{}' from {} to {} for KingBase IDENTITY compatibility",
+                column.name,
+                kb_type,
+                int_type
+            );
+            // 替换已 push 的类型
+            parts.pop();
+            parts.push(int_type.to_string());
+        }
+        let start = column.identity_start.unwrap_or(1);
+        let inc = column.identity_increment.unwrap_or(1);
+        parts.push(format!(
+            "GENERATED BY DEFAULT AS IDENTITY (START WITH {} INCREMENT BY {})",
+            start, inc
+        ));
+    } else if let Some(default) = column
+        .default_value
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        // Map common DM8-specific defaults to KingBase equivalents
+        let pg_default = match default.to_uppercase().as_str() {
+            "SYSDATE" => "CURRENT_TIMESTAMP".to_string(),
+            "SYSTIMESTAMP" => "CURRENT_TIMESTAMP".to_string(),
+            _ => default.to_string(),
+        };
+        parts.push(format!("DEFAULT {}", pg_default));
+    }
+
+    let nullability = if column.nullable { "NULL" } else { "NOT NULL" };
+    parts.push(nullability.to_string());
+
+    parts.join(" ")
+}
+
+fn generate_kingbase_create_table(table: &TableDetails) -> String {
+    let table_ident = quote_qualified_identifier(&table.name);
+
+    let column_lines = table
+        .columns
+        .iter()
+        .map(|col| format!("    {}", format_kingbase_column_def(col)))
+        .collect::<Vec<_>>()
+        .join(",\n");
+
+    let mut ddl = format!("CREATE TABLE {} (\n{}\n);\n", table_ident, column_lines);
+
+    if let Some(comment) = table
+        .comment
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        ddl.push_str(&format!(
+            "COMMENT ON TABLE {} IS '{}';\n",
+            table_ident,
+            comment.replace('\'', "''")
+        ));
+    }
+
+    for column in &table.columns {
+        if let Some(comment) = column
+            .comment
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            ddl.push_str(&format!(
+                "COMMENT ON COLUMN {}.{} IS '{}';\n",
+                table_ident,
+                quote_identifier(&column.name),
+                comment.replace('\'', "''")
+            ));
+        }
+    }
+
+    ddl.trim_end().to_string()
+}
+
+/// Generate KingBase-compatible CREATE SEQUENCE statements.
+/// KingBase (PostgreSQL) does not support ORDER/NOORDER; NOCACHE is expressed as CACHE 1.
+fn generate_sequences_for_kingbase(sequences: &[Sequence]) -> Vec<String> {
+    sequences
+        .iter()
+        .map(|seq| {
+            let mut stmt = format!("CREATE SEQUENCE {}", quote_identifier(&seq.name));
+            if let Some(start) = seq.start_with {
+                stmt.push_str(&format!(" START WITH {}", start));
+            }
+            if let Some(min) = seq.min_value {
+                stmt.push_str(&format!(" MINVALUE {}", min));
+            }
+            if let Some(max) = seq.max_value {
+                stmt.push_str(&format!(" MAXVALUE {}", max));
+            }
+            stmt.push_str(&format!(" INCREMENT BY {}", seq.increment_by));
+            match seq.cache_size {
+                Some(cache) if cache > 0 => stmt.push_str(&format!(" CACHE {}", cache)),
+                _ => stmt.push_str(" CACHE 1"), // KingBase has no NOCACHE; CACHE 1 disables caching
+            }
+            if seq.cycle {
+                stmt.push_str(" CYCLE");
+            } else {
+                stmt.push_str(" NO CYCLE");
+            }
+            // ORDER / NOORDER is Oracle-only — omit for KingBase
+            stmt.push(';');
+            stmt
+        })
+        .collect()
+}
 
 pub fn export_dm8_to_kingbase_ddl(
     connection: &Connection<'_>,
     plan: &LegacyExportPlan,
+    identifier_case: &str,
 ) -> Result<()> {
     if let Some(parent) = plan.output_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create output parent {}", parent.display()))?;
     }
 
+    let source_schema = plan.source_schema.to_uppercase();
+    let target_schema = plan.target_schema.to_uppercase();
+
+    // 批量查询所有表元数据
+    let table_names: Vec<String> = plan.tables.iter().map(|t| t.name.clone()).collect();
+    let mut table_cache: Vec<TableDetails> =
+        get_tables_details_batch(connection, &source_schema, &table_names)
+            .context("Failed to batch-fetch DM8 table metadata")?;
+
+    // Filter FK references to only the selected tables
+    let selected_tables: HashSet<String> = table_cache
+        .iter()
+        .map(|t| t.name.rsplit('.').next().unwrap_or(&t.name).to_uppercase())
+        .collect();
+    for table in &mut table_cache {
+        table.foreign_keys.retain(|fk| {
+            let ref_name = fk
+                .referenced_table
+                .rsplit('.')
+                .next()
+                .unwrap_or(&fk.referenced_table)
+                .to_uppercase();
+            selected_tables.contains(&ref_name)
+        });
+    }
+
+    // Fetch sequences and filter to those used by the selected tables
+    let all_sequences = fetch_sequences(connection, &source_schema).unwrap_or_default();
+    let mut sequences = filter_sequences_for_tables(&all_sequences, &table_cache);
+
+    // Apply identifier case transformation
+    for table in &mut table_cache {
+        apply_identifier_case(table, identifier_case);
+    }
+    for seq in &mut sequences {
+        apply_sequence_case(seq, identifier_case);
+    }
+
     let file = File::create(&plan.output_path)
         .with_context(|| format!("Failed to create {}", plan.output_path.display()))?;
-    let mut writer = BufWriter::new(file);
-    let renderer = renderer_for(&DbType::Kingbase);
+    let mut writer = BufWriter::with_capacity(1 << 20, file);
 
-    writeln!(writer, "-- DM8 -> KingBase DDL export script")?;
-    writeln!(writer, "-- source schema: {}", plan.source_schema)?;
-    writeln!(writer, "-- target schema: {}", plan.target_schema)?;
+    // File header
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let table_names: Vec<String> = table_cache.iter().map(|t| t.name.clone()).collect();
+    writeln!(writer, "-- ============================================")?;
+    writeln!(writer, "-- DM8 -> KingBase DDL 导出脚本")?;
+    writeln!(writer, "-- ============================================")?;
+    writeln!(writer, "-- 生成时间: {}", timestamp)?;
+    writeln!(writer, "-- 源模式: {}", source_schema)?;
+    writeln!(writer, "-- 目标模式: {}", target_schema)?;
+    writeln!(writer, "-- 表数量: {}", plan.tables.len())?;
+    writeln!(writer, "-- 涉及的表: {}", table_names.join(", "))?;
+    writeln!(writer, "--")?;
+    writeln!(
+        writer,
+        "-- 注意: 触发器使用 Oracle 兼容语法，请确保 KingBase 运行在 Oracle 兼容模式下"
+    )?;
+    writeln!(writer, "-- ============================================")?;
     writeln!(writer)?;
 
-    for (idx, table_id) in plan.tables.iter().enumerate() {
-        let details = schema::get_table_details(connection, &plan.source_schema, &table_id.name)
-            .with_context(|| format!("Failed to inspect DM8 table '{}'", table_id))?;
-        let mut table = canonical_table_from_details(&details);
-        table.name = format!("{}.{}", plan.target_schema, details.name);
-        let ddl = renderer.render_table_ddl(&table)?;
-        if idx > 0 {
+    // Per-table DDL: CREATE TABLE + comments + PK + unique + check + indexes
+    for (i, table_details) in table_cache.iter().enumerate() {
+        let mut render_table = table_details.clone();
+        // Use bare table name without schema prefix for KingBase
+        render_table.name = table_details.name.clone();
+        // Strip schema prefix from FK referenced tables
+        for fk in &mut render_table.foreign_keys {
+            if let Some((_schema, bare)) = fk.referenced_table.split_once('.') {
+                fk.referenced_table = bare.to_string();
+            }
+        }
+
+        if i > 0 {
             writeln!(writer)?;
         }
-        writeln!(writer, "{}", ddl)?;
+
+        writeln!(
+            writer,
+            "-- 表: {}",
+            quote_qualified_identifier(&render_table.name)
+        )?;
+        writeln!(writer, "{}", generate_kingbase_create_table(&render_table))?;
+
+        if let Some(pk_stmt) = generate_primary_key(&render_table) {
+            writeln!(writer)?;
+            writeln!(writer, "{}", pk_stmt)?;
+        }
+
+        let unique_stmts = generate_unique_constraints(&render_table);
+        if !unique_stmts.is_empty() {
+            writeln!(writer)?;
+            for stmt in unique_stmts {
+                writeln!(writer, "{}", stmt)?;
+            }
+        }
+
+        let check_stmts = generate_check_constraints(&render_table);
+        if !check_stmts.is_empty() {
+            writeln!(writer)?;
+            for stmt in check_stmts {
+                writeln!(writer, "{}", stmt)?;
+            }
+        }
+
+        let index_stmts = generate_indexes(&render_table);
+        if !index_stmts.is_empty() {
+            writeln!(writer)?;
+            for stmt in index_stmts {
+                writeln!(writer, "{}", stmt)?;
+            }
+        }
+    }
+
+    // Foreign keys — emit after all tables to reduce dependency issues
+    let mut fk_stmts: Vec<String> = Vec::new();
+    for table_details in &table_cache {
+        let mut render_table = table_details.clone();
+        render_table.name = table_details.name.clone();
+        for fk in &mut render_table.foreign_keys {
+            if let Some((_schema, bare)) = fk.referenced_table.split_once('.') {
+                fk.referenced_table = bare.to_string();
+            }
+        }
+        fk_stmts.extend(generate_foreign_keys(&render_table));
+    }
+    if !fk_stmts.is_empty() {
+        writeln!(writer)?;
+        writeln!(writer, "-- 外键")?;
+        for stmt in fk_stmts {
+            writeln!(writer, "{}", stmt)?;
+        }
+    }
+
+    // Sequences and triggers
+    let seq_stmts = generate_sequences_for_kingbase(&sequences);
+    let mut trig_stmts: Vec<String> = Vec::new();
+    for table_details in &table_cache {
+        let render_table = table_details.clone();
+        trig_stmts.extend(generate_triggers(
+            "",
+            &render_table.triggers,
+            TriggerTerminator::Plain,
+        ));
+    }
+
+    if !seq_stmts.is_empty() || !trig_stmts.is_empty() {
+        writeln!(writer)?;
+        writeln!(writer, "-- ============================================")?;
+        writeln!(writer, "-- 序列与触发器")?;
+        writeln!(writer, "-- ============================================")?;
+        writeln!(writer, "-- 重要: 必须先执行序列，再执行触发器")?;
+        writeln!(writer, "-- ============================================")?;
+    }
+
+    if !seq_stmts.is_empty() {
+        writeln!(writer)?;
+        writeln!(writer, "-- 序列（第一步：请先执行）")?;
+        for stmt in seq_stmts {
+            writeln!(writer, "{}", stmt)?;
+        }
+    }
+
+    if !trig_stmts.is_empty() {
+        writeln!(writer)?;
+        writeln!(
+            writer,
+            "-- 触发器（第二步：Oracle 兼容语法，需 KingBase Oracle 兼容模式）"
+        )?;
+        for stmt in trig_stmts {
+            writeln!(writer, "{}", stmt)?;
+            writeln!(writer)?;
+        }
     }
 
     writer
@@ -56,201 +457,39 @@ pub fn export_dm8_to_kingbase_ddl(
 
 pub fn export_dm8_to_kingbase_data(
     connection: &Connection<'_>,
+    config: &ConnectionConfig,
     plan: &LegacyExportPlan,
     batch_size: usize,
+    identifier_case: &str,
 ) -> Result<usize> {
-    if let Some(parent) = plan.output_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create output parent {}", parent.display()))?;
-    }
+    use crate::export::pipeline::DataExportPipeline;
 
-    let file = File::create(&plan.output_path)
-        .with_context(|| format!("Failed to create {}", plan.output_path.display()))?;
-    let mut writer = BufWriter::new(file);
+    // Batch-fetch all table metadata
+    let batch_table_names: Vec<String> = plan.tables.iter().map(|t| t.name.clone()).collect();
+    let all_details = get_tables_details_batch(connection, &plan.source_schema, &batch_table_names)
+        .context("Failed to batch-fetch DM8 table metadata for data export")?;
+
     let renderer = renderer_for(&DbType::Kingbase);
-    let mut total_rows = 0usize;
+    let pipeline = DataExportPipeline {
+        source_schema: plan.source_schema.clone(),
+        target_schema: plan.target_schema.clone(),
+        batch_size,
+        identifier_case: identifier_case.to_string(),
+        max_parallelism: 4,
+        skip_fk_toggle: true, // Cross-DB: DM8 FK constraint names don't exist in Kingbase
+        truncate_cascade: true, // Kingbase (PG-compat) requires CASCADE for FK-referenced tables
+        skip_trigger_toggle: false,
+        use_foreign_key_checks: false,
+        unicode_safe_text: false,
+    };
 
-    writeln!(writer, "-- DM8 -> KingBase data export script")?;
-    writeln!(writer, "-- source schema: {}", plan.source_schema)?;
-    writeln!(writer, "-- target schema: {}", plan.target_schema)?;
-    writeln!(writer)?;
-
-    // Phase 0: Collect table details and FK info for all tables
-    let mut all_details = Vec::with_capacity(plan.tables.len());
-    let mut table_names = Vec::with_capacity(plan.tables.len());
-    let mut table_fks: Vec<Vec<ForeignKey>> = Vec::with_capacity(plan.tables.len());
-
-    for table_id in &plan.tables {
-        let details = schema::get_table_details(connection, &plan.source_schema, &table_id.name)
-            .with_context(|| format!("Failed to inspect DM8 table '{}'", table_id))?;
-        table_names.push(details.name.clone());
-        table_fks.push(details.foreign_keys.clone());
-        all_details.push(details);
-    }
-
-    // Compute FK-aware ordering
-    let insert_order = topological_sort_by_foreign_keys(&table_names, &table_fks);
-    let truncate_order: Vec<usize> = insert_order.iter().copied().rev().collect();
-
-    // Phase 1: TRUNCATE all tables (children first)
-    writeln!(writer, "-- Phase 1: TRUNCATE tables (children before parents)")?;
-    for &idx in &truncate_order {
-        let target_name = format!("{}.{}", plan.target_schema, all_details[idx].name);
-        writeln!(writer, "TRUNCATE TABLE {};", quote_qualified_identifier(&target_name))?;
-    }
-    writeln!(writer)?;
-
-    // Phase 2: INSERT data (parents first)
-    writeln!(writer, "-- Phase 2: INSERT data (parents before children)")?;
-    for &idx in &insert_order {
-        let details = &all_details[idx];
-        let source_table = canonical_table_from_details(details);
-        let mut target_table = source_table.clone();
-        target_table.name = format!("{}.{}", plan.target_schema, details.name);
-
-        let count = if has_lob_columns(details) {
-            export_table_rows_rowwise(
-                connection,
-                &plan.source_schema,
-                &source_table,
-                &target_table,
-                renderer.as_ref(),
-                &mut writer,
-                batch_size,
-            )?
-        } else {
-            export_table_rows(
-                connection,
-                &plan.source_schema,
-                &source_table,
-                &target_table,
-                renderer.as_ref(),
-                &mut writer,
-                batch_size,
-            )?
-        };
-        total_rows += count;
-    }
-
-    writer
-        .flush()
-        .context("Failed to flush dm8->kingbase data export")?;
-    Ok(total_rows)
-}
-
-fn export_table_rows(
-    connection: &Connection<'_>,
-    schema: &str,
-    source_table: &crate::domain::canonical::CanonicalTable,
-    target_table: &crate::domain::canonical::CanonicalTable,
-    renderer: &dyn DialectRenderer,
-    writer: &mut BufWriter<File>,
-    batch_size: usize,
-) -> Result<usize> {
-    let select_cols = source_table
-        .columns
-        .iter()
-        .map(|col| {
-            let ident = quote_identifier(&col.name);
-            if col.logical_type == LogicalType::Binary {
-                format!("RAWTOHEX({}) AS {}", ident, ident)
-            } else {
-                ident
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let source_ident = format!(
-        "{}.{}",
-        quote_identifier(schema),
-        quote_identifier(&source_table.name)
-    );
-    let sql = format!("SELECT {} FROM {}", select_cols, source_ident);
-
-    let mut cursor = connection
-        .execute(&sql, ())
-        .with_context(|| format!("Failed to query DM8 table data: {}", source_table.name))?
-        .ok_or_else(|| anyhow::anyhow!("No cursor for data query"))?;
-
-    let mut buffers = TextRowSet::for_cursor(batch_size, &mut cursor, Some(16384))?;
-    let mut row_set_cursor = cursor.bind_buffer(&mut buffers)?;
-
-    let mut total_rows = 0usize;
-    while let Some(batch) = row_set_cursor.fetch()? {
-        let num_rows = batch.num_rows();
-        if num_rows == 0 {
-            break;
-        }
-
-        let mut rows = Vec::new();
-        for row_index in 0..num_rows {
-            let mut values = Vec::new();
-            for (col_index, col) in source_table.columns.iter().enumerate() {
-                let cell_value = decode_cell(batch, col_index, row_index);
-                let canonical_value = parse_dm8_value(&col.logical_type, cell_value);
-                values.push(canonical_value);
-            }
-            rows.push(CanonicalRow { values });
-        }
-
-        let insert_sql = renderer.render_insert_batch(target_table, &rows)?;
-        writeln!(writer, "{}", insert_sql)?;
-        total_rows += num_rows;
-    }
-
-    Ok(total_rows)
-}
-
-fn parse_dm8_value(logical_type: &LogicalType, raw: Option<String>) -> CanonicalValue {
-    match raw {
-        None => CanonicalValue::Null,
-        Some(s) if s.trim().is_empty() => match logical_type {
-            LogicalType::String | LogicalType::Text => CanonicalValue::String(String::new()),
-            _ => CanonicalValue::Null,
-        },
-        Some(s) => match logical_type {
-            LogicalType::Integer => s
-                .parse::<i64>()
-                .map(CanonicalValue::Integer)
-                .unwrap_or(CanonicalValue::Null),
-            LogicalType::Decimal => CanonicalValue::Decimal(s),
-            LogicalType::Float => s
-                .parse::<f64>()
-                .map(CanonicalValue::Float)
-                .unwrap_or(CanonicalValue::Null),
-            LogicalType::Boolean => {
-                let normalized = s.trim().to_uppercase();
-                let is_true = normalized == "Y"
-                    || normalized == "1"
-                    || normalized == "TRUE"
-                    || normalized == "T";
-                CanonicalValue::Boolean(is_true)
-            }
-            LogicalType::Binary => parse_hex_bytes(&s)
-                .map(CanonicalValue::Binary)
-                .unwrap_or(CanonicalValue::Null),
-            LogicalType::Date => CanonicalValue::Date(s),
-            LogicalType::DateTime => CanonicalValue::DateTime(s),
-            LogicalType::Json => CanonicalValue::Json(s),
-            LogicalType::String | LogicalType::Text => CanonicalValue::String(s),
-            LogicalType::Unknown => CanonicalValue::String(s),
-        },
-    }
-}
-
-fn parse_hex_bytes(hex_str: &str) -> Option<Vec<u8>> {
-    let trimmed = hex_str.trim().trim_start_matches("0x");
-    if trimmed.is_empty() {
-        return Some(vec![]);
-    }
-    if trimmed.len() % 2 != 0 {
-        return None;
-    }
-    (0..trimmed.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&trimmed[i..i + 2], 16).ok())
-        .collect()
+    pipeline.execute(
+        connection,
+        config,
+        renderer.as_ref(),
+        &all_details,
+        &plan.output_path,
+    )
 }
 
 fn quote_identifier(name: &str) -> String {
@@ -262,96 +501,4 @@ fn quote_qualified_identifier(name: &str) -> String {
         .map(quote_identifier)
         .collect::<Vec<_>>()
         .join(".")
-}
-
-/// Row-by-row export for tables with LOB columns to avoid TextRowSet truncation.
-fn export_table_rows_rowwise(
-    connection: &Connection<'_>,
-    schema: &str,
-    source_table: &crate::domain::canonical::CanonicalTable,
-    target_table: &crate::domain::canonical::CanonicalTable,
-    renderer: &dyn DialectRenderer,
-    writer: &mut BufWriter<File>,
-    batch_size: usize,
-) -> Result<usize> {
-    let source_qualified_table = format!(
-        "{}.{}",
-        schema.trim().to_uppercase(),
-        source_table.name.trim().to_uppercase()
-    );
-    let source_ident = quote_qualified_identifier(&source_qualified_table);
-    let select_columns = source_table
-        .columns
-        .iter()
-        .map(|col| quote_identifier(&col.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("SELECT {} FROM {}", select_columns, source_ident);
-
-    tracing::debug!(
-        "Using row-by-row export for {} (has LOB columns)",
-        source_qualified_table
-    );
-
-    let mut cursor = connection
-        .execute(&sql, ())
-        .with_context(|| format!("Failed to query DM8 table data: {}", source_table.name))?
-        .ok_or_else(|| anyhow::anyhow!("No cursor for data query"))?;
-
-    let mut batch_rows = Vec::with_capacity(batch_size);
-    let mut total_rows = 0usize;
-    let mut col_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-
-    while let Some(mut row) = cursor.next_row()? {
-        let mut values = Vec::with_capacity(source_table.columns.len());
-        for (col_index, column) in source_table.columns.iter().enumerate() {
-            let col_num = (col_index + 1) as u16;
-
-            if column.logical_type == LogicalType::Binary {
-                col_buf.clear();
-                let has_data = row.get_binary(col_num, &mut col_buf)
-                    .with_context(|| format!(
-                        "Failed to get binary data for column '{}' in table '{}'",
-                        column.name, source_qualified_table
-                    ))?;
-                if !has_data {
-                    values.push(CanonicalValue::Null);
-                } else {
-                    values.push(CanonicalValue::Binary(col_buf.clone()));
-                }
-            } else {
-                col_buf.clear();
-                let has_data = row.get_text(col_num, &mut col_buf)
-                    .with_context(|| format!(
-                        "Failed to get text data for column '{}' in table '{}'",
-                        column.name, source_qualified_table
-                    ))?;
-                if !has_data {
-                    values.push(CanonicalValue::Null);
-                } else {
-                    let text = match std::str::from_utf8(&col_buf) {
-                        Ok(s) => s.to_string(),
-                        Err(_) => encoding_rs::GB18030.decode(&col_buf).0.into_owned(),
-                    };
-                    values.push(parse_dm8_value(&column.logical_type, Some(text)));
-                }
-            }
-        }
-
-        batch_rows.push(CanonicalRow { values });
-        total_rows += 1;
-
-        if batch_rows.len() >= batch_size {
-            let insert_sql = renderer.render_insert_batch(target_table, &batch_rows)?;
-            writeln!(writer, "{}", insert_sql)?;
-            batch_rows.clear();
-        }
-    }
-
-    if !batch_rows.is_empty() {
-        let insert_sql = renderer.render_insert_batch(target_table, &batch_rows)?;
-        writeln!(writer, "{}", insert_sql)?;
-    }
-
-    Ok(total_rows)
 }

@@ -5,7 +5,6 @@
 ///   cargo run --bin shentong_query_test
 ///
 /// Requires aci.dll (Shentong client library) on PATH or in the working dir.
-
 use shentong::Connection;
 
 fn main() {
@@ -57,7 +56,9 @@ fn main() {
                         Err(e) => print!("[row error: {}] ", e),
                     }
                 }
-                if !found { print!("(no rows)"); }
+                if !found {
+                    print!("(no rows)");
+                }
                 println!();
             }
             Err(e) => println!("ERROR: {}", e),
@@ -82,7 +83,9 @@ fn main() {
                         Err(e) => print!("[row error: {}] ", e),
                     }
                 }
-                if !found { print!("(no rows)"); }
+                if !found {
+                    print!("(no rows)");
+                }
                 println!();
             }
             Err(e) => println!("ERROR: {}", e),
@@ -107,7 +110,9 @@ fn main() {
                         Err(e) => print!("[row error: {}] ", e),
                     }
                 }
-                if !found { print!("(no rows)"); }
+                if !found {
+                    print!("(no rows)");
+                }
                 println!();
             }
             Err(e) => println!("ERROR: {}", e),
@@ -116,7 +121,8 @@ fn main() {
 
     // 4. All SYSDBA tables
     {
-        let sql = "SELECT table_name, owner FROM all_tables WHERE owner = 'SYSDBA' ORDER BY table_name";
+        let sql =
+            "SELECT table_name, owner FROM all_tables WHERE owner = 'SYSDBA' ORDER BY table_name";
         print!("  [4] {} => ", sql);
         match conn.query(sql, &[]) {
             Ok(rows) => {
@@ -132,7 +138,9 @@ fn main() {
                         Err(e) => print!("[row error: {}] ", e),
                     }
                 }
-                if !found { print!("(no rows)"); }
+                if !found {
+                    print!("(no rows)");
+                }
                 println!();
             }
             Err(e) => println!("ERROR: {}", e),
@@ -156,7 +164,9 @@ fn main() {
                         Err(e) => print!("[row error: {}] ", e),
                     }
                 }
-                if !found { print!("(no rows)"); }
+                if !found {
+                    print!("(no rows)");
+                }
                 println!();
             }
             Err(e) => println!("ERROR: {}", e),
@@ -180,7 +190,10 @@ fn main() {
                 for row_result in rows {
                     match row_result {
                         Ok(_) => count += 1,
-                        Err(e) => { print!("[row error: {}] ", e); break; }
+                        Err(e) => {
+                            print!("[row error: {}] ", e);
+                            break;
+                        }
                     }
                 }
                 println!("OK ({} rows)", count);
@@ -206,7 +219,9 @@ fn main() {
                         Err(e) => print!("[row error: {}] ", e),
                     }
                 }
-                if !found { print!("(no rows)"); }
+                if !found {
+                    print!("(no rows)");
+                }
                 println!();
             }
             Err(e) => println!("ERROR: {}", e),
@@ -223,7 +238,10 @@ fn main() {
                 for row_result in rows {
                     match row_result {
                         Ok(_) => count += 1,
-                        Err(e) => { print!("[row error: {}] ", e); break; }
+                        Err(e) => {
+                            print!("[row error: {}] ", e);
+                            break;
+                        }
                     }
                 }
                 println!("OK ({} rows)", count);
@@ -242,7 +260,10 @@ fn main() {
                 for row_result in rows {
                     match row_result {
                         Ok(_) => count += 1,
-                        Err(e) => { print!("[row error: {}] ", e); break; }
+                        Err(e) => {
+                            print!("[row error: {}] ", e);
+                            break;
+                        }
                     }
                 }
                 println!("OK ({} rows)", count);
@@ -270,10 +291,15 @@ fn main() {
                             print!("nsp='{}' rel='{}' | ", nspname, relname);
                             found = true;
                         }
-                        Err(e) => { print!("[row error: {}] ", e); break; }
+                        Err(e) => {
+                            print!("[row error: {}] ", e);
+                            break;
+                        }
                     }
                 }
-                if !found { print!("(no rows in pg_class)"); }
+                if !found {
+                    print!("(no rows in pg_class)");
+                }
                 println!();
             }
             Err(e) => println!("ERROR: {}", e),
@@ -290,7 +316,10 @@ fn main() {
                             let n: String = row.get::<_, String>(0).unwrap_or_default();
                             print!("{} ", n);
                         }
-                        Err(e) => { print!("[err: {}] ", e); break; }
+                        Err(e) => {
+                            print!("[err: {}] ", e);
+                            break;
+                        }
                     }
                 }
                 println!();
@@ -304,7 +333,10 @@ fn main() {
             Ok(rows) => {
                 for r in rows {
                     match r {
-                        Ok(row) => { let v: String = row.get::<_, String>(0).unwrap_or_default(); print!("{}", v); }
+                        Ok(row) => {
+                            let v: String = row.get::<_, String>(0).unwrap_or_default();
+                            print!("{}", v);
+                        }
                         Err(e) => print!("[err: {}]", e),
                     }
                 }
@@ -319,20 +351,35 @@ fn main() {
         println!("\n  --- More access patterns ---");
         for (label, sql) in &[
             ("3-part name", "SELECT * FROM OSRDB.SYSDBA.TEST_01"),
-            ("3-part quoted", r#"SELECT * FROM "OSRDB"."SYSDBA"."TEST_01""#),
-            ("CREATE + SELECT", ""),  // special handling below
-            ("user_tables view", "SELECT table_name FROM user_tables WHERE ROWNUM <= 5"),
+            (
+                "3-part quoted",
+                r#"SELECT * FROM "OSRDB"."SYSDBA"."TEST_01""#,
+            ),
+            ("CREATE + SELECT", ""), // special handling below
+            (
+                "user_tables view",
+                "SELECT table_name FROM user_tables WHERE ROWNUM <= 5",
+            ),
             ("tab view", "SELECT tname FROM TAB WHERE ROWNUM <= 5"),
-            ("dba_tables", "SELECT owner, table_name FROM dba_tables WHERE table_name = 'TEST_01'"),
+            (
+                "dba_tables",
+                "SELECT owner, table_name FROM dba_tables WHERE table_name = 'TEST_01'",
+            ),
         ] {
             if *label == "CREATE + SELECT" {
                 print!("  [try] CREATE TABLE _ACI_TEST_ => ");
                 // Create a table, query it, drop it
                 let fresh = match Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003") {
                     Ok(c) => c,
-                    Err(e) => { println!("CONNECT ERROR: {}", e); continue; }
+                    Err(e) => {
+                        println!("CONNECT ERROR: {}", e);
+                        continue;
+                    }
                 };
-                match fresh.execute("CREATE TABLE _ACI_TEST_TBL_ (id NUMBER, val VARCHAR2(50))", &[]) {
+                match fresh.execute(
+                    "CREATE TABLE _ACI_TEST_TBL_ (id NUMBER, val VARCHAR2(50))",
+                    &[],
+                ) {
                     Ok(_) => {
                         print!("created. INSERT => ");
                         match fresh.execute("INSERT INTO _ACI_TEST_TBL_ VALUES (1, 'hello')", &[]) {
@@ -341,7 +388,13 @@ fn main() {
                                 match fresh.query("SELECT * FROM _ACI_TEST_TBL_", &[]) {
                                     Ok(rows) => {
                                         let mut count = 0;
-                                        for r in rows { if r.is_ok() { count += 1; } else { break; } }
+                                        for r in rows {
+                                            if r.is_ok() {
+                                                count += 1;
+                                            } else {
+                                                break;
+                                            }
+                                        }
                                         print!("OK ({} rows). ", count);
                                     }
                                     Err(e) => print!("SELECT FAILED: {}. ", e),
@@ -363,7 +416,10 @@ fn main() {
             print!("  [try] {} : {} => ", label, sql);
             let fresh = match Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003") {
                 Ok(c) => c,
-                Err(e) => { println!("CONNECT ERROR: {}", e); continue; }
+                Err(e) => {
+                    println!("CONNECT ERROR: {}", e);
+                    continue;
+                }
             };
             match fresh.query(sql, &[]) {
                 Ok(rows) => {
@@ -378,7 +434,10 @@ fn main() {
                                     first_vals.push(v);
                                 }
                             }
-                            Err(e) => { print!("[row err: {}] ", e); break; }
+                            Err(e) => {
+                                print!("[row err: {}] ", e);
+                                break;
+                            }
                         }
                     }
                     println!("OK ({} rows) first: {:?}", count, first_vals);
@@ -404,48 +463,72 @@ fn main() {
                             print!("'{}' ", n);
                             names.push(n);
                         }
-                        Err(e) => { print!("[err: {}] ", e); break; }
+                        Err(e) => {
+                            print!("[err: {}] ", e);
+                            break;
+                        }
                     }
                 }
                 println!();
 
                 // Now try SELECT from each found table
                 for name in &names {
-                    let fresh2 = Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
+                    let fresh2 =
+                        Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
                     // Try the exact name as returned from user_tables
                     let sql1 = format!("SELECT * FROM {}", name);
                     print!("    SELECT * FROM {} => ", name);
                     match fresh2.query(&sql1, &[]) {
                         Ok(rows) => {
                             let mut count = 0;
-                            for r in rows { if r.is_ok() { count += 1; } else { break; } }
+                            for r in rows {
+                                if r.is_ok() {
+                                    count += 1;
+                                } else {
+                                    break;
+                                }
+                            }
                             println!("OK ({} rows)", count);
                         }
                         Err(e) => println!("ERROR: {}", e),
                     }
 
                     // Try with double quotes around the exact name
-                    let fresh3 = Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
+                    let fresh3 =
+                        Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
                     let sql2 = format!(r#"SELECT * FROM "{}""#, name);
                     print!("    {} => ", sql2);
                     match fresh3.query(&sql2, &[]) {
                         Ok(rows) => {
                             let mut count = 0;
-                            for r in rows { if r.is_ok() { count += 1; } else { break; } }
+                            for r in rows {
+                                if r.is_ok() {
+                                    count += 1;
+                                } else {
+                                    break;
+                                }
+                            }
                             println!("OK ({} rows)", count);
                         }
                         Err(e) => println!("ERROR: {}", e),
                     }
 
                     // Try lowercase quoted
-                    let fresh4 = Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
+                    let fresh4 =
+                        Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
                     let lower_name = name.to_lowercase();
                     let sql3 = format!(r#"SELECT * FROM "{}""#, lower_name);
                     print!("    {} => ", sql3);
                     match fresh4.query(&sql3, &[]) {
                         Ok(rows) => {
                             let mut count = 0;
-                            for r in rows { if r.is_ok() { count += 1; } else { break; } }
+                            for r in rows {
+                                if r.is_ok() {
+                                    count += 1;
+                                } else {
+                                    break;
+                                }
+                            }
                             println!("OK ({} rows)", count);
                         }
                         Err(e) => println!("ERROR: {}", e),
@@ -468,11 +551,17 @@ fn main() {
                 println!("OK");
                 // Check user_tables
                 print!("  [cmp] user_tables name => ");
-                match fresh.query("SELECT table_name FROM user_tables WHERE table_name LIKE '%CMP%'", &[]) {
+                match fresh.query(
+                    "SELECT table_name FROM user_tables WHERE table_name LIKE '%CMP%'",
+                    &[],
+                ) {
                     Ok(rows) => {
                         for r in rows {
                             match r {
-                                Ok(row) => { let n: String = row.get::<_, String>(0).unwrap_or_default(); print!("'{}' ", n); }
+                                Ok(row) => {
+                                    let n: String = row.get::<_, String>(0).unwrap_or_default();
+                                    print!("'{}' ", n);
+                                }
                                 Err(e) => print!("[err: {}] ", e),
                             }
                         }
@@ -482,12 +571,19 @@ fn main() {
                 }
 
                 // Try from fresh connection
-                let fresh2 = Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
+                let fresh2 =
+                    Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
                 print!("  [cmp] SELECT from new conn => ");
                 match fresh2.query("SELECT * FROM _CMP_TEST_", &[]) {
                     Ok(rows) => {
                         let mut count = 0;
-                        for r in rows { if r.is_ok() { count += 1; } else { break; } }
+                        for r in rows {
+                            if r.is_ok() {
+                                count += 1;
+                            } else {
+                                break;
+                            }
+                        }
                         println!("OK ({} rows)", count);
                     }
                     Err(e) => println!("ERROR: {}", e),
@@ -509,7 +605,10 @@ fn main() {
             Ok(rows) => {
                 for r in rows {
                     match r {
-                        Ok(row) => { let v: String = row.get::<_, String>(0).unwrap_or_default(); print!("{}", v); }
+                        Ok(row) => {
+                            let v: String = row.get::<_, String>(0).unwrap_or_default();
+                            print!("{}", v);
+                        }
                         Err(_) => {}
                     }
                 }
@@ -523,7 +622,10 @@ fn main() {
             Ok(rows) => {
                 for r in rows {
                     match r {
-                        Ok(row) => { let v: String = row.get::<_, String>(0).unwrap_or_default(); print!("{} ", v); }
+                        Ok(row) => {
+                            let v: String = row.get::<_, String>(0).unwrap_or_default();
+                            print!("{} ", v);
+                        }
                         Err(_) => {}
                     }
                 }
@@ -573,7 +675,10 @@ fn main() {
                             let c1: String = row.get::<_, String>(1).unwrap_or("".to_string());
                             print!("'{}' '{}' | ", c0, c1);
                         }
-                        Err(e) => { print!("[err: {}] ", e); break; }
+                        Err(e) => {
+                            print!("[err: {}] ", e);
+                            break;
+                        }
                     }
                 }
                 println!();
@@ -587,7 +692,10 @@ fn main() {
             Ok(rows) => {
                 for r in rows {
                     match r {
-                        Ok(row) => { let v: String = row.get::<_, String>(0).unwrap_or_default(); print!("{} ", v); }
+                        Ok(row) => {
+                            let v: String = row.get::<_, String>(0).unwrap_or_default();
+                            print!("{} ", v);
+                        }
                         Err(_) => {}
                     }
                 }
@@ -612,7 +720,13 @@ fn main() {
                     match c.query("SELECT * FROM TEST_01", &[]) {
                         Ok(rows) => {
                             let mut count = 0;
-                            for r in rows { if r.is_ok() { count += 1; } else { break; } }
+                            for r in rows {
+                                if r.is_ok() {
+                                    count += 1;
+                                } else {
+                                    break;
+                                }
+                            }
                             println!("CONNECTED + SELECT OK ({} rows)", count);
                         }
                         Err(e) => {
@@ -620,7 +734,11 @@ fn main() {
                             let db = match c.query("SELECT current_database()", &[]) {
                                 Ok(r2) => {
                                     let mut d = String::new();
-                                    for r in r2 { if let Ok(row) = r { d = row.get::<_, String>(0).unwrap_or_default(); } }
+                                    for r in r2 {
+                                        if let Ok(row) = r {
+                                            d = row.get::<_, String>(0).unwrap_or_default();
+                                        }
+                                    }
                                     d
                                 }
                                 Err(_) => "?".to_string(),
@@ -682,25 +800,13 @@ fn main() {
 
     let tests: Vec<(&str, TestKind)> = vec![
         // (a) schema.table without quotes
-        (
-            "SELECT * FROM SYSDBA.TEST_01",
-            TestKind::SingleQuery,
-        ),
+        ("SELECT * FROM SYSDBA.TEST_01", TestKind::SingleQuery),
         // (b) both quoted
-        (
-            r#"SELECT * FROM "SYSDBA"."TEST_01""#,
-            TestKind::SingleQuery,
-        ),
+        (r#"SELECT * FROM "SYSDBA"."TEST_01""#, TestKind::SingleQuery),
         // (c) only table quoted
-        (
-            r#"SELECT * FROM SYSDBA."TEST_01""#,
-            TestKind::SingleQuery,
-        ),
+        (r#"SELECT * FROM SYSDBA."TEST_01""#, TestKind::SingleQuery),
         // (d) only schema quoted
-        (
-            r#"SELECT * FROM "SYSDBA".TEST_01"#,
-            TestKind::SingleQuery,
-        ),
+        (r#"SELECT * FROM "SYSDBA".TEST_01"#, TestKind::SingleQuery),
         // (e) SET search_path + SELECT in one statement
         (
             "SET search_path TO SYSDBA; SELECT * FROM TEST_01",
@@ -712,15 +818,9 @@ fn main() {
             TestKind::TwoStep,
         ),
         // (g) lowercase table name
-        (
-            "SELECT * FROM test_01",
-            TestKind::SingleQuery,
-        ),
+        ("SELECT * FROM test_01", TestKind::SingleQuery),
         // (h) all lowercase schema.table
-        (
-            "SELECT * FROM sysdba.test_01",
-            TestKind::SingleQuery,
-        ),
+        ("SELECT * FROM sysdba.test_01", TestKind::SingleQuery),
     ];
 
     let mut results: Vec<(&str, &str)> = Vec::new();

@@ -14,10 +14,7 @@ use crate::{
         logical_type_from_db_type, CanonicalColumn, CanonicalRow, CanonicalTable, CanonicalValue,
         LogicalType,
     },
-    export::{
-        data::topological_sort_by_foreign_keys,
-        orchestrator::LegacyExportPlan,
-    },
+    export::{data::topological_sort_by_foreign_keys, orchestrator::LegacyExportPlan},
     models::{ConnectionConfig, DbType, ForeignKey},
 };
 
@@ -165,7 +162,10 @@ async fn export_tables_data(
     let truncate_order: Vec<usize> = insert_order.iter().copied().rev().collect();
 
     // Phase 1: TRUNCATE all tables (children first) — MySQL backtick syntax
-    writeln!(writer, "-- Phase 1: TRUNCATE tables (children before parents)")?;
+    writeln!(
+        writer,
+        "-- Phase 1: TRUNCATE tables (children before parents)"
+    )?;
     for &idx in &truncate_order {
         let table_id = &plan.tables[idx];
         writeln!(
@@ -268,7 +268,11 @@ async fn fetch_fks_inline(
             ForeignKey {
                 name,
                 columns: agg.columns.into_iter().map(|(_, c)| c).collect(),
-                referenced_table: format!("{}.{}", schema, agg.referenced_table.unwrap_or_default()),
+                referenced_table: format!(
+                    "{}.{}",
+                    schema,
+                    agg.referenced_table.unwrap_or_default()
+                ),
                 referenced_columns: agg.referenced_columns.into_iter().map(|(_, c)| c).collect(),
                 delete_rule: None,
                 update_rule: None,
@@ -332,6 +336,7 @@ async fn inspect_canonical_table(
                 name,
                 logical_type: logical_type_from_db_type(&data_type),
                 nullable,
+                identity: false,
             }
         })
         .collect::<Vec<_>>();
@@ -543,11 +548,13 @@ mod tests {
             name: "payload".to_string(),
             logical_type: LogicalType::Binary,
             nullable: true,
+            identity: false,
         };
         let string_col = CanonicalColumn {
             name: "name".to_string(),
             logical_type: LogicalType::String,
             nullable: true,
+            identity: false,
         };
         assert_eq!(select_expr(&binary_col), "HEX(`payload`) AS `payload`");
         assert_eq!(select_expr(&string_col), "CAST(`name` AS CHAR) AS `name`");

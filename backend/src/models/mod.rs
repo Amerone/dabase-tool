@@ -17,6 +17,17 @@ pub enum DbType {
     Shentong,
 }
 
+impl DbType {
+    pub fn filename_label(&self) -> &'static str {
+        match self {
+            DbType::Dm8 => "dm8",
+            DbType::Mysql => "mysql",
+            DbType::Kingbase => "kingbase",
+            DbType::Shentong => "shentong",
+        }
+    }
+}
+
 fn default_db_type() -> DbType {
     DbType::Dm8
 }
@@ -31,6 +42,7 @@ pub struct ConnectionConfig {
     pub password: String,
     pub schema: String,
     pub export_schema: Option<String>,
+    pub database: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +163,7 @@ pub struct ExportRequest {
     pub include_row_counts: bool,
     #[serde(default = "default_false")]
     pub strict_mode: bool,
+    pub identifier_case: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

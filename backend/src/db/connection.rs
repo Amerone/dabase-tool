@@ -98,6 +98,10 @@ impl ConnectionConfig {
     fn dm8_driver_value() -> String {
         #[cfg(windows)]
         {
+            // Windows ODBC Driver Manager ONLY resolves DRIVER={name} via HKLM.
+            // Absolute DLL paths and HKCU registrations are both ignored (→ IM002).
+            // odbc_register::ensure_odbc_driver_registered() registers in HKLM (with
+            // UAC elevation if needed), so using the registered name here is correct.
             wrap_driver(odbc_register::DM8_DRIVER_NAME)
         }
 
@@ -224,7 +228,6 @@ impl ConnectionConfig {
         let server = render_odbc_attr_value(self.host.trim());
         let uid = render_odbc_attr_value(self.username.trim());
         let pwd = render_odbc_attr_value(&self.password);
-        let schema = render_odbc_attr_value(self.schema.trim());
 
         let cs = match self.db_type {
             DbType::Dm8 => {
@@ -237,15 +240,23 @@ impl ConnectionConfig {
                 )
             }
             DbType::Kingbase | DbType::Shentong => {
-                if self.schema.trim().is_empty() {
+                // Prefer explicit database field; fall back to schema for DATABASE param
+                let db_value = self
+                    .database
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(self.schema.trim());
+                if db_value.is_empty() {
                     format!(
                         "DRIVER={};SERVER={};PORT={};UID={};PWD={}",
                         driver, server, self.port, uid, pwd
                     )
                 } else {
+                    let database = render_odbc_attr_value(db_value);
                     format!(
                         "DRIVER={};SERVER={};PORT={};UID={};PWD={};DATABASE={}",
-                        driver, server, self.port, uid, pwd, schema
+                        driver, server, self.port, uid, pwd, database
                     )
                 }
             }
@@ -291,6 +302,7 @@ mod tests {
             password: "pa;ss".to_string(),
             schema: "SYSDBA".to_string(),
             export_schema: None,
+            database: None,
         };
 
         let cs = config
@@ -312,6 +324,7 @@ mod tests {
             password: "123456789".to_string(),
             schema: "platform".to_string(),
             export_schema: None,
+            database: None,
         };
 
         let cs = config

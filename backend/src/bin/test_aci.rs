@@ -17,10 +17,7 @@ fn main() {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
-    let aci_candidates = [
-        "drivers/shentong/windows",
-        "../drivers/shentong/windows",
-    ];
+    let aci_candidates = ["drivers/shentong/windows", "../drivers/shentong/windows"];
 
     // Set TNS_ADMIN to the ACI drivers source dir (which has tnsnames.aci + sqlnet.aci).
     // This is the same directory used by the successful direct FFI test.
@@ -56,7 +53,10 @@ fn main() {
                 let abs_str = abs.to_string_lossy().into_owned();
                 let abs_str = abs_str.trim_start_matches(r"\\?\").to_string();
                 let cur_path = std::env::var("PATH").unwrap_or_default();
-                if !cur_path.split(';').any(|p| p.eq_ignore_ascii_case(&abs_str)) {
+                if !cur_path
+                    .split(';')
+                    .any(|p| p.eq_ignore_ascii_case(&abs_str))
+                {
                     std::env::set_var("PATH", format!("{};{}", abs_str, cur_path));
                 }
                 break;

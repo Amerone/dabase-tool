@@ -3,23 +3,33 @@ use shentong::Connection;
 
 use crate::models::{Column, ConnectionConfig, DbType, ForeignKey, Table, TableDetails};
 
-/// Build a ShenTong ACI connect string: `host:port`
-/// ShenTong ACI uses `host:port` format. The database (service) name
-/// is NOT appended here — SYSDBA is a user/schema, not a database name.
+/// Build a ShenTong ACI connect string: `host:port` or `host:port/database`
+/// When `config.database` is set (non-empty), generates `host:port/database`
+/// to target a specific instance (e.g. `OSRDB`). Otherwise plain `host:port`.
 fn easy_connect(config: &ConnectionConfig) -> String {
-    format!("{}:{}", config.host.trim(), config.port)
+    let base = format!("{}:{}", config.host.trim(), config.port);
+    match config
+        .database
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(db) => format!("{}/{}", base, db),
+        None => base,
+    }
 }
 
 pub fn open(config: &ConnectionConfig) -> Result<Connection> {
     debug_assert_eq!(config.db_type, DbType::Shentong);
     let connect_string = easy_connect(config);
-    Connection::connect(config.username.trim(), &config.password, &connect_string)
-        .with_context(|| {
+    Connection::connect(config.username.trim(), &config.password, &connect_string).with_context(
+        || {
             format!(
                 "Failed to connect to ShenTong at {}:{} as {}",
                 config.host, config.port, config.username
             )
-        })
+        },
+    )
 }
 
 pub fn test_connection(config: &ConnectionConfig) -> Result<()> {
@@ -34,10 +44,7 @@ pub fn test_connection(config: &ConnectionConfig) -> Result<()> {
 pub fn get_schemas(config: &ConnectionConfig) -> Result<Vec<String>> {
     let conn = open(config)?;
     let rows = conn
-        .query_as::<String>(
-            "SELECT username FROM all_users ORDER BY username",
-            &[],
-        )
+        .query_as::<String>("SELECT username FROM all_users ORDER BY username", &[])
         .context("Failed to query OSCAR user schemas")?;
 
     let mut schemas = Vec::new();
@@ -101,7 +108,7 @@ pub fn get_table_details(
     })
 }
 
-fn fetch_columns(conn: &Connection, owner: &str, table: &str) -> Result<Vec<Column>> {
+pub fn fetch_columns(conn: &Connection, owner: &str, table: &str) -> Result<Vec<Column>> {
     let sql = "SELECT column_name, data_type, data_length, data_precision, data_scale, \
                       nullable, data_default \
                FROM all_tab_columns \
@@ -143,7 +150,7 @@ fn fetch_columns(conn: &Connection, owner: &str, table: &str) -> Result<Vec<Colu
     Ok(columns)
 }
 
-fn fetch_primary_keys(conn: &Connection, owner: &str, table: &str) -> Result<Vec<String>> {
+pub fn fetch_primary_keys(conn: &Connection, owner: &str, table: &str) -> Result<Vec<String>> {
     let sql = "SELECT acc.column_name \
                FROM all_constraints ac \
                JOIN all_cons_columns acc \
@@ -168,11 +175,7 @@ fn fetch_primary_keys(conn: &Connection, owner: &str, table: &str) -> Result<Vec
 
 /// Fetch foreign key constraints for a table using Oracle-compatible
 /// ALL_CONSTRAINTS + ALL_CONS_COLUMNS system views.
-pub fn fetch_foreign_keys(
-    conn: &Connection,
-    owner: &str,
-    table: &str,
-) -> Result<Vec<ForeignKey>> {
+pub fn fetch_foreign_keys(conn: &Connection, owner: &str, table: &str) -> Result<Vec<ForeignKey>> {
     let sql = "SELECT ac.constraint_name, \
                       acc.column_name, \
                       ac_ref.table_name AS referenced_table, \

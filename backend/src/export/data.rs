@@ -7,10 +7,16 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::Local;
-use odbc_api::{buffers::TextRowSet, Connection, Cursor};
+use odbc_api::{
+    buffers::TextRowSet,
+    parameter::{VarBinaryArray, VarCharArray},
+    Connection, Cursor,
+};
 
-use crate::db::schema::{decode_cell, fetch_row_count, fetch_sequences, get_table_details};
+use crate::db::schema::{decode_cell, fetch_row_count, fetch_sequences, get_tables_details_batch};
 use crate::models::{TableDetails, TableIdentifier};
+
+const STREAM_FETCH_CHUNK_BYTES: usize = 16 * 1024;
 
 pub fn export_table_data(
     connection: &Connection<'_>,
@@ -21,7 +27,6 @@ pub fn export_table_data(
     writer: &mut impl Write,
     batch_size: usize,
     compat: TriggerTerminator,
-    lob_proc_seq: &mut usize,
 ) -> Result<usize> {
     // Tables with LOB columns (BLOB/CLOB/TEXT etc.) use unbuffered row-by-row
     // fetching to avoid the 8KB TextRowSet truncation limit.
@@ -35,7 +40,6 @@ pub fn export_table_data(
             writer,
             batch_size,
             compat,
-            lob_proc_seq,
         );
     }
 
@@ -112,9 +116,8 @@ pub fn export_table_data(
 
 /// Row-by-row export for tables containing LOB (BLOB/CLOB) columns.
 ///
-/// Uses `cursor.next_row()` + `get_binary()`/`get_text()` which handle
-/// arbitrarily large data by growing the buffer automatically, unlike
-/// `TextRowSet` which truncates at a fixed limit.
+/// Uses `cursor.next_row()` + chunked `get_data()` to avoid `TextRowSet`
+/// truncation and to bypass buggy ODBC length indicators for large values.
 pub fn export_table_data_rowwise(
     connection: &Connection<'_>,
     source_schema: &str,
@@ -124,7 +127,6 @@ pub fn export_table_data_rowwise(
     writer: &mut impl Write,
     batch_size: usize,
     compat: TriggerTerminator,
-    lob_proc_seq: &mut usize,
 ) -> Result<usize> {
     let source_schema_upper = source_schema.to_uppercase();
     let target_schema_upper = target_schema.to_uppercase();
@@ -158,8 +160,6 @@ pub fn export_table_data_rowwise(
 
     let mut batch: Vec<String> = Vec::with_capacity(batch_size);
     let mut row_count = 0;
-    // Pre-allocate buffer; get_text/get_binary will grow it as needed
-    let mut col_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
 
     while let Some(mut row) = cursor.next_row()? {
         let mut values = Vec::with_capacity(table_details.columns.len());
@@ -171,40 +171,35 @@ pub fn export_table_data_rowwise(
 
             if is_binary_type(&column.data_type) {
                 // Binary/BLOB: fetch raw bytes, convert to hex
-                col_buf.clear();
-                let has_data = row.get_binary(col_num, &mut col_buf)
-                    .with_context(|| format!(
-                        "Failed to get binary data for column '{}' in table '{}'",
+                let binary = fetch_binary_column(&mut row, col_num).with_context(|| {
+                    format!(
+                        "Failed to stream binary data for column '{}' in table '{}'",
                         column.name, source_qualified_table
-                    ))?;
-                if !has_data {
-                    values.push("NULL".to_string());
-                } else if col_buf.len() > HEXTORAW_MAX_BYTES {
-                    // Large BLOB: placeholder now, will use DBMS_LOB block
-                    large_blobs.push((col_index, col_buf.clone()));
-                    values.push("NULL".to_string()); // placeholder, replaced later
+                    )
+                })?;
+                if let Some(binary) = binary {
+                    if binary.len() > HEXTORAW_MAX_BYTES {
+                        // Large BLOB: placeholder now, will use DBMS_LOB block
+                        large_blobs.push((col_index, binary));
+                        values.push("NULL".to_string());
+                    } else {
+                        values.push(format_hextoraw(&binary));
+                    }
                 } else {
-                    values.push(format_hextoraw(&col_buf));
+                    values.push("NULL".to_string());
                 }
             } else {
                 // All other types: fetch as text
-                col_buf.clear();
-                let has_data = row.get_text(col_num, &mut col_buf)
-                    .with_context(|| format!(
-                        "Failed to get text data for column '{}' in table '{}'",
+                let text = fetch_text_column(&mut row, col_num).with_context(|| {
+                    format!(
+                        "Failed to stream text data for column '{}' in table '{}'",
                         column.name, source_qualified_table
-                    ))?;
-                if !has_data {
-                    values.push("NULL".to_string());
-                } else if col_buf.is_empty() {
-                    values.push(format_literal(&column.data_type, ""));
-                } else {
-                    // Try UTF-8 first, fallback to GB18030 for Chinese encoding
-                    let text = match std::str::from_utf8(&col_buf) {
-                        Ok(s) => s.to_string(),
-                        Err(_) => encoding_rs::GB18030.decode(&col_buf).0.into_owned(),
-                    };
+                    )
+                })?;
+                if let Some(text) = text {
                     values.push(format_literal(&column.data_type, &text));
+                } else {
+                    values.push("NULL".to_string());
                 }
             }
         }
@@ -223,7 +218,6 @@ pub fn export_table_data_rowwise(
                 &values,
                 &large_blobs,
                 compat,
-                lob_proc_seq,
             )?;
         } else {
             batch.push(format!("({})", values.join(", ")));
@@ -245,6 +239,58 @@ pub fn export_table_data_rowwise(
         source_qualified_table
     );
     Ok(row_count)
+}
+
+fn fetch_text_column(row: &mut odbc_api::CursorRow<'_>, col_num: u16) -> Result<Option<String>> {
+    let bytes = fetch_text_bytes(row, col_num)?;
+    Ok(bytes.map(|bytes| decode_driver_text(&bytes)))
+}
+
+fn fetch_text_bytes(row: &mut odbc_api::CursorRow<'_>, col_num: u16) -> Result<Option<Vec<u8>>> {
+    let mut chunk = VarCharArray::<STREAM_FETCH_CHUNK_BYTES>::NULL;
+    let mut value = Vec::new();
+
+    loop {
+        row.get_data(col_num, &mut chunk)?;
+        match chunk.as_bytes() {
+            Some(bytes) => value.extend_from_slice(bytes),
+            None if value.is_empty() => return Ok(None),
+            None => break,
+        }
+
+        if chunk.is_complete() {
+            break;
+        }
+    }
+
+    Ok(Some(value))
+}
+
+fn fetch_binary_column(row: &mut odbc_api::CursorRow<'_>, col_num: u16) -> Result<Option<Vec<u8>>> {
+    let mut chunk = VarBinaryArray::<STREAM_FETCH_CHUNK_BYTES>::NULL;
+    let mut value = Vec::new();
+
+    loop {
+        row.get_data(col_num, &mut chunk)?;
+        match chunk.as_bytes() {
+            Some(bytes) => value.extend_from_slice(bytes),
+            None if value.is_empty() => return Ok(None),
+            None => break,
+        }
+
+        if chunk.is_complete() {
+            break;
+        }
+    }
+
+    Ok(Some(value))
+}
+
+fn decode_driver_text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => encoding_rs::GB18030.decode(bytes).0.into_owned(),
+    }
 }
 
 /// Check if a table has any LOB (large object) columns that need
@@ -308,9 +354,10 @@ use crate::export::ddl::TriggerTerminator;
 /// Write a PL/SQL block that uses DBMS_LOB.APPEND to insert a row
 /// with large BLOB data that exceeds HEXTORAW's 16383-byte limit.
 ///
-/// For `Script` mode (DIsql/SQLArk/DBeaver): anonymous DECLARE...END; /
-/// For `DataGrip`/`DataGripScript` modes: CREATE PROCEDURE wrapper
-///   so that DataGrip's script runner does not split at internal `;`.
+/// All modes emit an anonymous `DECLARE...BEGIN...END; /` block.
+/// For DataGrip/DataGripScript modes, the block is wrapped with
+/// `--@delimiter /` and `--@delimiter ;` directives so that DataGrip's
+/// "Run Script" mode does not split at internal semicolons.
 fn write_lob_insert_block(
     writer: &mut impl Write,
     target_ident: &str,
@@ -318,7 +365,6 @@ fn write_lob_insert_block(
     column_values: &[String],
     large_blobs: &[(usize, Vec<u8>)], // (column_index, raw_bytes)
     compat: TriggerTerminator,
-    lob_proc_seq: &mut usize,
 ) -> Result<()> {
     // Build VALUES with v_blob placeholders substituted
     let mut final_values = column_values.to_vec();
@@ -326,20 +372,16 @@ fn write_lob_insert_block(
         final_values[*col_idx] = format!("v_blob{}", i);
     }
 
-    let use_proc_wrapper = matches!(
+    let use_delimiter_directive = matches!(
         compat,
         TriggerTerminator::DataGrip | TriggerTerminator::DataGripScript
     );
 
-    if use_proc_wrapper {
-        // DataGrip mode: wrap in CREATE PROCEDURE so the script runner
-        // treats the entire body (including internal ;) as one DDL statement.
-        let proc_name = format!("\"_TMP_LOB_{}\"", lob_proc_seq);
-        *lob_proc_seq += 1;
-        writeln!(writer, "CREATE OR REPLACE PROCEDURE {}() AS", proc_name)?;
-    } else {
-        writeln!(writer, "DECLARE")?;
+    if use_delimiter_directive {
+        writeln!(writer, "--@delimiter /")?;
     }
+
+    writeln!(writer, "DECLARE")?;
 
     // Variable declarations
     for (i, _) in large_blobs.iter().enumerate() {
@@ -371,16 +413,10 @@ fn write_lob_insert_block(
         writeln!(writer, "  DBMS_LOB.FREETEMPORARY(v_blob{});", i)?;
     }
     writeln!(writer, "END;")?;
+    writeln!(writer, "/")?;
 
-    if use_proc_wrapper {
-        // DataGrip: CALL then DROP the temp procedure
-        let proc_name = format!("\"_TMP_LOB_{}\"", *lob_proc_seq - 1);
-        writeln!(writer, "/")?;
-        writeln!(writer, "CALL {}();", proc_name)?;
-        writeln!(writer, "DROP PROCEDURE {};", proc_name)?;
-    } else {
-        // DIsql/SQLArk: anonymous block terminated by /
-        writeln!(writer, "/")?;
+    if use_delimiter_directive {
+        writeln!(writer, "--@delimiter ;")?;
     }
     Ok(())
 }
@@ -399,16 +435,11 @@ pub fn export_schema_data(
     let target_schema_upper = target_schema.to_uppercase();
     let all_sequences = fetch_sequences(connection, &source_schema_upper).unwrap_or_default();
 
-    // Pre-fetch table details so we can filter sequences to only those related to selected tables.
-    let mut table_details_cache: Vec<crate::models::TableDetails> = Vec::new();
-    for table_id in tables {
-        let details =
-            get_table_details(connection, &source_schema_upper, &table_id.name)
-                .with_context(|| {
-                    format!("Failed to get table details for {}", table_id.name)
-                })?;
-        table_details_cache.push(details);
-    }
+    // Pre-fetch table details（批量查询，减少 ODBC 往返次数）
+    let table_names: Vec<String> = tables.iter().map(|t| t.name.clone()).collect();
+    let table_details_cache: Vec<crate::models::TableDetails> =
+        get_tables_details_batch(connection, &source_schema_upper, &table_names)
+            .context("Failed to batch-fetch table metadata")?;
 
     // Compute FK-aware table ordering (parents before children for INSERT)
     let insert_order = topological_sort_by_fk(tables, &table_details_cache);
@@ -545,7 +576,6 @@ pub fn export_schema_data(
     writeln!(writer)?;
 
     let mut exported_total: usize = 0;
-    let mut lob_proc_seq: usize = 0;
 
     for (seq, &idx) in insert_order.iter().enumerate() {
         if seq > 0 {
@@ -581,7 +611,6 @@ pub fn export_schema_data(
             &mut writer,
             batch_size,
             compat,
-            &mut lob_proc_seq,
         )
         .with_context(|| format!("Failed to export data for table '{}'", tables[idx].name))?;
 
@@ -596,10 +625,7 @@ pub fn export_schema_data(
     if !fk_constraints.is_empty() {
         writeln!(writer)?;
         writeln!(writer, "-- ========================================")?;
-        writeln!(
-            writer,
-            "-- 阶段三：重新启用外键约束"
-        )?;
+        writeln!(writer, "-- 阶段三：重新启用外键约束")?;
         writeln!(writer, "-- ========================================")?;
         writeln!(writer)?;
         for (qualified_table, fk_names) in &fk_constraints {
@@ -720,6 +746,109 @@ pub fn topological_sort_by_foreign_keys(
     sorted
 }
 
+/// FK-aware topological sort that returns **layers** instead of a flat list.
+///
+/// Each layer is a `Vec<usize>` of table indices that share the same depth in
+/// the FK dependency graph. Tables within the same layer have no mutual FK
+/// dependencies and can be safely exported in parallel.
+///
+/// - Layer 0: root tables (no FK dependencies within the selected set)
+/// - Layer 1: tables that only depend on Layer 0 tables
+/// - Layer N: tables that only depend on Layer 0..N-1 tables
+///
+/// If cycles exist, remaining tables are placed in a final catch-all layer.
+pub fn topological_sort_into_layers(
+    table_names: &[String],
+    table_fks: &[Vec<crate::models::ForeignKey>],
+) -> Vec<Vec<usize>> {
+    let n = table_names.len();
+    if n == 0 {
+        return vec![];
+    }
+    if n == 1 {
+        return vec![vec![0]];
+    }
+
+    // Build name → index map (uppercase table names)
+    let name_to_idx: HashMap<String, usize> = table_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.to_uppercase(), i))
+        .collect();
+
+    // Collect unique directed edges: parent_idx → child_idx
+    let mut edges: HashSet<(usize, usize)> = HashSet::new();
+    for (child_idx, fks) in table_fks.iter().enumerate() {
+        for fk in fks {
+            let ref_table_name = fk
+                .referenced_table
+                .split('.')
+                .last()
+                .unwrap_or(&fk.referenced_table)
+                .to_uppercase();
+            if let Some(&parent_idx) = name_to_idx.get(&ref_table_name) {
+                if parent_idx != child_idx {
+                    edges.insert((parent_idx, child_idx));
+                }
+            }
+        }
+    }
+
+    if edges.is_empty() {
+        // No FK dependencies — all tables in a single layer
+        return vec![(0..n).collect()];
+    }
+
+    // Build adjacency list and in-degree counts
+    let mut in_degree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![vec![]; n];
+    for &(parent, child) in &edges {
+        in_degree[child] += 1;
+        dependents[parent].push(child);
+    }
+
+    // Modified Kahn's algorithm: process one full layer at a time
+    let mut current_layer: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+    let mut layers: Vec<Vec<usize>> = Vec::new();
+    let mut processed = 0usize;
+
+    while !current_layer.is_empty() {
+        let mut next_layer: Vec<usize> = Vec::new();
+        for &idx in &current_layer {
+            for &child in &dependents[idx] {
+                in_degree[child] -= 1;
+                if in_degree[child] == 0 {
+                    next_layer.push(child);
+                }
+            }
+        }
+        processed += current_layer.len();
+        layers.push(current_layer);
+        current_layer = next_layer;
+    }
+
+    // Handle cycles: append remaining tables as a final layer
+    if processed < n {
+        let in_layers: HashSet<usize> = layers.iter().flatten().copied().collect();
+        let cyclic: Vec<usize> = (0..n).filter(|i| !in_layers.contains(i)).collect();
+        let cyclic_names: Vec<&str> = cyclic.iter().map(|&i| table_names[i].as_str()).collect();
+        tracing::warn!(
+            "Circular FK dependencies detected among tables: {:?}. \
+             Placed in final catch-all layer.",
+            cyclic_names
+        );
+        layers.push(cyclic);
+    }
+
+    tracing::debug!(
+        "FK layer sort: {} layers, tables per layer: {:?}",
+        layers.len(),
+        layers.iter().map(|l| l.len()).collect::<Vec<_>>()
+    );
+
+    layers
+}
+
 /// Topological sort of tables based on foreign key dependencies.
 ///
 /// Returns indices into the original `tables` array, ordered so that
@@ -730,8 +859,10 @@ fn topological_sort_by_fk(
     table_details: &[TableDetails],
 ) -> Vec<usize> {
     let names: Vec<String> = tables.iter().map(|t| t.name.clone()).collect();
-    let fks: Vec<Vec<crate::models::ForeignKey>> =
-        table_details.iter().map(|d| d.foreign_keys.clone()).collect();
+    let fks: Vec<Vec<crate::models::ForeignKey>> = table_details
+        .iter()
+        .map(|d| d.foreign_keys.clone())
+        .collect();
     topological_sort_by_foreign_keys(&names, &fks)
 }
 
@@ -1049,11 +1180,7 @@ mod tests {
 
     #[test]
     fn topo_sort_no_fks_preserves_order() {
-        let tables = vec![
-            make_table_id("A"),
-            make_table_id("B"),
-            make_table_id("C"),
-        ];
+        let tables = vec![make_table_id("A"), make_table_id("B"), make_table_id("C")];
         let details = vec![
             make_details("A", vec![]),
             make_details("B", vec![]),
@@ -1067,11 +1194,7 @@ mod tests {
     #[test]
     fn topo_sort_chain_a_b_c() {
         // C -> B -> A
-        let tables = vec![
-            make_table_id("A"),
-            make_table_id("B"),
-            make_table_id("C"),
-        ];
+        let tables = vec![make_table_id("A"), make_table_id("B"), make_table_id("C")];
         let details = vec![
             make_details("A", vec![]),
             make_details("B", vec![make_fk("A")]),
@@ -1124,5 +1247,185 @@ mod tests {
         assert!(rendered.contains("-- 警告: 本脚本会先 TRUNCATE 表，再执行数据插入。"));
         assert!(rendered.contains("-- 说明: 插入前会将序列重置到 START 值。"));
         assert!(!rendered.contains("DM8 Data Export"));
+    }
+
+    #[test]
+    fn write_lob_insert_block_datagrip_uses_delimiter_directive() {
+        use super::write_lob_insert_block;
+        use crate::export::ddl::TriggerTerminator;
+
+        let mut buf = Vec::new();
+        // Simulate a row with one large blob column (col index 1)
+        let values = vec!["'hello'".to_string(), "NULL".to_string()];
+        let large_blobs = vec![(1usize, vec![0xABu8; 100])];
+
+        write_lob_insert_block(
+            &mut buf,
+            "\"S\".\"T\"",
+            "\"COL1\", \"COL2\"",
+            &values,
+            &large_blobs,
+            TriggerTerminator::DataGrip,
+        )
+        .unwrap();
+
+        let rendered = String::from_utf8(buf).unwrap();
+        // Should have --@delimiter directives
+        assert!(
+            rendered.starts_with("--@delimiter /\n"),
+            "should start with --@delimiter /"
+        );
+        assert!(
+            rendered.trim_end().ends_with("--@delimiter ;"),
+            "should end with --@delimiter ;"
+        );
+        // Should use anonymous DECLARE block, NOT CREATE PROCEDURE
+        assert!(rendered.contains("DECLARE"), "should use DECLARE block");
+        assert!(
+            !rendered.contains("CREATE OR REPLACE PROCEDURE"),
+            "should NOT use CREATE PROCEDURE"
+        );
+        assert!(
+            !rendered.contains("_TMP_LOB_"),
+            "should NOT have temp procedure name"
+        );
+        // Should have proper PL/SQL structure
+        assert!(rendered.contains("DBMS_LOB.CREATETEMPORARY(v_blob0, TRUE);"));
+        assert!(rendered.contains("DBMS_LOB.APPEND(v_blob0, HEXTORAW("));
+        assert!(rendered.contains("INSERT INTO"));
+        assert!(rendered.contains("DBMS_LOB.FREETEMPORARY(v_blob0);"));
+        assert!(rendered.contains("END;\n/\n"));
+    }
+
+    #[test]
+    fn write_lob_insert_block_script_mode_no_delimiter_directive() {
+        use super::write_lob_insert_block;
+        use crate::export::ddl::TriggerTerminator;
+
+        let mut buf = Vec::new();
+        let values = vec!["'hello'".to_string(), "NULL".to_string()];
+        let large_blobs = vec![(1usize, vec![0xCDu8; 50])];
+
+        write_lob_insert_block(
+            &mut buf,
+            "\"S\".\"T\"",
+            "\"COL1\", \"COL2\"",
+            &values,
+            &large_blobs,
+            TriggerTerminator::Script,
+        )
+        .unwrap();
+
+        let rendered = String::from_utf8(buf).unwrap();
+        // Should NOT have --@delimiter directives
+        assert!(
+            !rendered.contains("--@delimiter"),
+            "Script mode should not have --@delimiter"
+        );
+        // Should use anonymous DECLARE block
+        assert!(rendered.contains("DECLARE"));
+        assert!(rendered.contains("END;\n/\n"));
+    }
+
+    #[test]
+    fn write_lob_insert_block_datagrip_script_uses_delimiter_directive() {
+        use super::write_lob_insert_block;
+        use crate::export::ddl::TriggerTerminator;
+
+        let mut buf = Vec::new();
+        let values = vec!["NULL".to_string()];
+        let large_blobs = vec![(0usize, vec![0xEFu8; 30])];
+
+        write_lob_insert_block(
+            &mut buf,
+            "\"S\".\"T\"",
+            "\"COL1\"",
+            &values,
+            &large_blobs,
+            TriggerTerminator::DataGripScript,
+        )
+        .unwrap();
+
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains("--@delimiter /"));
+        assert!(rendered.contains("--@delimiter ;"));
+        assert!(rendered.contains("DECLARE"));
+        assert!(!rendered.contains("CREATE OR REPLACE PROCEDURE"));
+    }
+
+    // ── topological_sort_into_layers tests ───────────────────────────
+
+    fn make_fk_vec(ref_table: &str) -> Vec<ForeignKey> {
+        vec![make_fk(ref_table)]
+    }
+
+    #[test]
+    fn layers_no_fks_all_in_single_layer() {
+        use super::topological_sort_into_layers;
+        let names: Vec<String> = vec!["A", "B", "C"].into_iter().map(String::from).collect();
+        let fks: Vec<Vec<ForeignKey>> = vec![vec![], vec![], vec![]];
+        let layers = topological_sort_into_layers(&names, &fks);
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].len(), 3);
+    }
+
+    #[test]
+    fn layers_chain_produces_sequential_layers() {
+        use super::topological_sort_into_layers;
+        // A <- B <- C (C depends on B, B depends on A)
+        let names: Vec<String> = vec!["A", "B", "C"].into_iter().map(String::from).collect();
+        let fks: Vec<Vec<ForeignKey>> = vec![
+            vec![],           // A has no FK
+            make_fk_vec("A"), // B -> A
+            make_fk_vec("B"), // C -> B
+        ];
+        let layers = topological_sort_into_layers(&names, &fks);
+        assert_eq!(layers.len(), 3);
+        assert_eq!(layers[0], vec![0]); // A
+        assert_eq!(layers[1], vec![1]); // B
+        assert_eq!(layers[2], vec![2]); // C
+    }
+
+    #[test]
+    fn layers_diamond_two_layers() {
+        use super::topological_sort_into_layers;
+        // PARENT <- CHILD1, PARENT <- CHILD2 (both children depend on parent)
+        let names: Vec<String> = vec!["PARENT", "CHILD1", "CHILD2"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let fks: Vec<Vec<ForeignKey>> = vec![
+            vec![],                // PARENT
+            make_fk_vec("PARENT"), // CHILD1 -> PARENT
+            make_fk_vec("PARENT"), // CHILD2 -> PARENT
+        ];
+        let layers = topological_sort_into_layers(&names, &fks);
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0], vec![0]); // PARENT in layer 0
+                                        // CHILD1 and CHILD2 in layer 1 (parallel-safe)
+        assert!(layers[1].contains(&1));
+        assert!(layers[1].contains(&2));
+    }
+
+    #[test]
+    fn layers_cycle_appends_catch_all_layer() {
+        use super::topological_sort_into_layers;
+        // A -> B, B -> A (cycle), C has no FK
+        let names: Vec<String> = vec!["A", "B", "C"].into_iter().map(String::from).collect();
+        let fks: Vec<Vec<ForeignKey>> = vec![
+            make_fk_vec("B"), // A -> B
+            make_fk_vec("A"), // B -> A
+            vec![],           // C has no FK
+        ];
+        let layers = topological_sort_into_layers(&names, &fks);
+        // C should be in layer 0 (no deps), A and B in a catch-all layer
+        let flat: Vec<usize> = layers.iter().flatten().copied().collect();
+        assert_eq!(flat.len(), 3);
+        // C should appear before A and B
+        let c_pos = flat.iter().position(|&x| x == 2).unwrap();
+        let a_pos = flat.iter().position(|&x| x == 0).unwrap();
+        let b_pos = flat.iter().position(|&x| x == 1).unwrap();
+        assert!(c_pos < a_pos);
+        assert!(c_pos < b_pos);
     }
 }

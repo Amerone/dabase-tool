@@ -59,11 +59,16 @@ pub async fn export_ddl(
     let (config, source_schema, target_schema) = build_export_context(&mut req);
 
     let date_suffix = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let output_path =
-        match format_export_filename(&source_schema, &target_schema, "ddl", &date_suffix) {
-            Ok(p) => p,
-            Err(e) => return response::err(StatusCode::INTERNAL_SERVER_ERROR, e),
-        };
+    let output_path = match format_export_filename(
+        &source_schema,
+        target_dialect.filename_label(),
+        &target_schema,
+        "ddl",
+        &date_suffix,
+    ) {
+        Ok(p) => p,
+        Err(e) => return response::err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
 
     let plan = LegacyExportPlan {
         source_schema,
@@ -79,6 +84,7 @@ pub async fn export_ddl(
         &plan,
         req.drop_existing,
         resolve_compat(req.export_compat.as_deref()),
+        req.identifier_case,
     )
     .await;
 
@@ -155,11 +161,16 @@ pub async fn export_data(
     let (config, source_schema, target_schema) = build_export_context(&mut req);
 
     let date_suffix = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let output_path =
-        match format_export_filename(&source_schema, &target_schema, "data", &date_suffix) {
-            Ok(p) => p,
-            Err(e) => return response::err(StatusCode::INTERNAL_SERVER_ERROR, e),
-        };
+    let output_path = match format_export_filename(
+        &source_schema,
+        target_dialect.filename_label(),
+        &target_schema,
+        "data",
+        &date_suffix,
+    ) {
+        Ok(p) => p,
+        Err(e) => return response::err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
     let batch_size = match resolve_batch_size(req.batch_size) {
         Ok(size) => size,
         Err(message) => return response::err(StatusCode::BAD_REQUEST, message),
@@ -180,6 +191,7 @@ pub async fn export_data(
         batch_size,
         include_row_counts,
         resolve_compat(req.export_compat.as_deref()),
+        req.identifier_case,
     )
     .await;
 
@@ -244,6 +256,7 @@ mod tests {
                 password: "SYSDBA".to_string(),
                 schema: "SYSDBA".to_string(),
                 export_schema: None,
+                database: None,
             },
             target_dialect: None,
             export_schema: None,
@@ -255,6 +268,7 @@ mod tests {
             drop_existing: true,
             include_row_counts: false,
             strict_mode: false,
+            identifier_case: None,
         }
     }
 

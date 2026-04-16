@@ -160,7 +160,7 @@ impl ConfigStore {
         let row = if let Some(db_type) = db_type {
             let connection_name = default_connection_name(&db_type);
             let mut stmt = conn.prepare(
-                "SELECT db_type, host, port, username, password, schema, export_schema, updated_at \
+                "SELECT db_type, host, port, username, password, schema, export_schema, updated_at, database \
                  FROM connections \
                  WHERE name = ?1 \
                  LIMIT 1",
@@ -178,12 +178,13 @@ impl ConfigStore {
                     row.get::<_, String>(5)?,
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })
             .optional()?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT db_type, host, port, username, password, schema, export_schema, updated_at \
+                "SELECT db_type, host, port, username, password, schema, export_schema, updated_at, database \
                  FROM connections \
                  WHERE name LIKE 'default-%' \
                  ORDER BY updated_at DESC LIMIT 1",
@@ -201,6 +202,7 @@ impl ConfigStore {
                     row.get::<_, String>(5)?,
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })
             .optional()?
@@ -216,6 +218,7 @@ impl ConfigStore {
                 schema,
                 export_schema,
                 updated_at,
+                database,
             )) => {
                 let db_type = db_type_from_str(&db_type_raw)?;
                 let password = decrypt_value(&stored_password, &self.encryption_key)?;
@@ -228,6 +231,7 @@ impl ConfigStore {
                         password,
                         schema,
                         export_schema,
+                        database,
                     },
                     source: ConfigSource::Sqlite,
                     updated_at,
@@ -247,12 +251,12 @@ impl ConfigStore {
         let db_type = db_type_as_str(&config.db_type);
 
         conn.execute(
-            "INSERT INTO connections (name, db_type, host, port, username, password, schema, export_schema, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+            "INSERT INTO connections (name, db_type, host, port, username, password, schema, export_schema, database, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
              ON CONFLICT(name) DO UPDATE SET \
              db_type=excluded.db_type, host=excluded.host, port=excluded.port, \
              username=excluded.username, password=excluded.password, schema=excluded.schema, \
-             export_schema=excluded.export_schema, updated_at=excluded.updated_at",
+             export_schema=excluded.export_schema, database=excluded.database, updated_at=excluded.updated_at",
             params![
                 &connection_name,
                 db_type,
@@ -262,6 +266,7 @@ impl ConfigStore {
                 &encrypted_password,
                 &config.schema,
                 &config.export_schema,
+                &config.database,
                 &updated_at
             ],
         )?;
@@ -278,7 +283,7 @@ impl ConfigStore {
             .with_context(|| format!("Failed to open SQLite at {:?}", self.db_path))?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, name, db_type, host, port, username, password, schema, export_schema, updated_at \
+            "SELECT id, name, db_type, host, port, username, password, schema, export_schema, updated_at, database \
              FROM connections ORDER BY updated_at DESC, id DESC",
         )?;
 
@@ -310,12 +315,12 @@ impl ConfigStore {
         let db_type = db_type_as_str(&config.db_type);
 
         conn.execute(
-            "INSERT INTO connections (name, db_type, host, port, username, password, schema, export_schema, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+            "INSERT INTO connections (name, db_type, host, port, username, password, schema, export_schema, database, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
              ON CONFLICT(name) DO UPDATE SET \
              db_type=excluded.db_type, host=excluded.host, port=excluded.port, \
              username=excluded.username, password=excluded.password, schema=excluded.schema, \
-             export_schema=excluded.export_schema, updated_at=excluded.updated_at",
+             export_schema=excluded.export_schema, database=excluded.database, updated_at=excluded.updated_at",
             params![
                 normalized_name,
                 db_type,
@@ -325,12 +330,13 @@ impl ConfigStore {
                 &encrypted_password,
                 &config.schema,
                 &config.export_schema,
+                &config.database,
                 &updated_at
             ],
         )?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, name, db_type, host, port, username, password, schema, export_schema, updated_at \
+            "SELECT id, name, db_type, host, port, username, password, schema, export_schema, updated_at, database \
              FROM connections WHERE name = ?1 LIMIT 1",
         )?;
         let row = stmt
@@ -369,6 +375,7 @@ impl ConfigStore {
         )?;
 
         ensure_export_schema_column(&conn)?;
+        ensure_database_column(&conn)?;
 
         Ok(())
     }
@@ -413,6 +420,7 @@ impl ConfigStore {
                 password,
                 schema: row.get(7)?,
                 export_schema: row.get(8)?,
+                database: row.get(10)?,
             },
             updated_at: row.get(9)?,
         })
@@ -439,6 +447,26 @@ fn ensure_export_schema_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_database_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(connections)")?;
+    let mut rows = stmt.query([])?;
+    let mut has_column = false;
+
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "database" {
+            has_column = true;
+            break;
+        }
+    }
+
+    if !has_column {
+        conn.execute("ALTER TABLE connections ADD COLUMN database TEXT", [])?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +482,7 @@ mod tests {
             password: "SYSDBA".into(),
             schema: "SYSDBA".into(),
             export_schema: Some("APP".into()),
+            database: None,
         }
     }
 

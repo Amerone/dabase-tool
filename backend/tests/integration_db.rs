@@ -14,7 +14,7 @@ use axum::extract::Json;
 use dm8_export_backend::{
     api::export::{export_data, export_ddl},
     db::service,
-    models::{ConnectionConfig, DbType, ExportRequest},
+    models::{ConnectionConfig, DbType, ExportRequest, TableIdentifier},
 };
 
 // ─── 全局初始化 ──────────────────────────────────────────────────────────────
@@ -83,6 +83,7 @@ fn dm8_config() -> ConnectionConfig {
         password: std::env::var("DM8_PASS").unwrap_or_else(|_| "SYSDBA001".into()),
         schema: std::env::var("DM8_SCHEMA").unwrap_or_else(|_| "PLATFORM".into()),
         export_schema: None,
+        database: None,
     }
 }
 
@@ -99,6 +100,7 @@ fn mysql_config() -> Option<ConnectionConfig> {
         password: std::env::var("MYSQL_PASS").unwrap_or_default(),
         schema: std::env::var("MYSQL_SCHEMA").unwrap_or_else(|_| "test".into()),
         export_schema: None,
+        database: None,
     })
 }
 
@@ -115,6 +117,7 @@ fn kingbase_config() -> Option<ConnectionConfig> {
         password: std::env::var("KB_PASS").unwrap_or_default(),
         schema: std::env::var("KB_SCHEMA").unwrap_or_else(|_| "public".into()),
         export_schema: None,
+        database: None,
     })
 }
 
@@ -131,6 +134,7 @@ fn shentong_config() -> Option<ConnectionConfig> {
         password: std::env::var("ST_PASS").unwrap_or_default(),
         schema: std::env::var("ST_SCHEMA").unwrap_or_else(|_| "sysdba".into()),
         export_schema: None,
+        database: std::env::var("ST_DATABASE").ok(),
     })
 }
 
@@ -147,7 +151,19 @@ fn base_export_req(config: ConnectionConfig) -> ExportRequest {
         drop_existing: true,
         include_row_counts: false,
         strict_mode: false,
+        identifier_case: None,
     }
+}
+
+/// Convert a list of table name strings into `TableIdentifier` with the given schema.
+fn table_ids(schema: &str, names: Vec<String>) -> Vec<TableIdentifier> {
+    names
+        .into_iter()
+        .map(|name| TableIdentifier {
+            schema: schema.to_string(),
+            name,
+        })
+        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -200,7 +216,7 @@ async fn dm8_04_table_details() {
     assert!(!tables.is_empty(), "无表可查");
 
     let name = &tables[0].name;
-    let d = service::get_table_details(&cfg, name)
+    let d = service::get_table_details(&cfg, &cfg.schema, name)
         .await
         .expect("get_table_details 失败");
     println!(
@@ -225,7 +241,7 @@ async fn dm8_05_export_ddl_self() {
     let names: Vec<String> = tables.iter().take(2).map(|t| t.name.clone()).collect();
     let mut req = base_export_req(cfg.clone());
     req.target_dialect = Some(DbType::Dm8);
-    req.tables = names;
+    req.tables = table_ids(&cfg.schema, names);
 
     let result = export_ddl(Json(req)).await;
     match &result {
@@ -246,7 +262,7 @@ async fn dm8_06_export_data_self() {
     let names: Vec<String> = tables.iter().take(1).map(|t| t.name.clone()).collect();
     let mut req = base_export_req(cfg.clone());
     req.target_dialect = Some(DbType::Dm8);
-    req.tables = names;
+    req.tables = table_ids(&cfg.schema, names);
     req.include_ddl = false;
     req.include_data = true;
     req.include_row_counts = true;
@@ -271,7 +287,7 @@ async fn dm8_07_export_ddl_to_mysql() {
     let mut req = base_export_req(cfg.clone());
     req.target_dialect = Some(DbType::Mysql);
     req.export_compat = None;
-    req.tables = names;
+    req.tables = table_ids(&cfg.schema, names);
 
     let result = export_ddl(Json(req)).await;
     match &result {
@@ -292,7 +308,7 @@ async fn dm8_08_export_ddl_to_kingbase() {
     let names: Vec<String> = tables.iter().take(2).map(|t| t.name.clone()).collect();
     let mut req = base_export_req(cfg.clone());
     req.target_dialect = Some(DbType::Kingbase);
-    req.tables = names;
+    req.tables = table_ids(&cfg.schema, names);
 
     let result = export_ddl(Json(req)).await;
     match &result {
@@ -367,7 +383,7 @@ async fn mysql_04_table_details() {
         return;
     }
     let name = &tables[0].name;
-    let d = service::get_table_details(&cfg, name)
+    let d = service::get_table_details(&cfg, &cfg.schema, name)
         .await
         .expect("get_table_details 失败");
     println!(
@@ -398,7 +414,7 @@ async fn mysql_05_export_ddl_self() {
     let mut req = base_export_req(cfg.clone());
     req.target_dialect = Some(DbType::Mysql);
     req.export_compat = None;
-    req.tables = names;
+    req.tables = table_ids(&cfg.schema, names);
 
     let result = export_ddl(Json(req)).await;
     match &result {
@@ -425,7 +441,7 @@ async fn mysql_06_export_ddl_to_dm8() {
     let names: Vec<String> = tables.iter().take(2).map(|t| t.name.clone()).collect();
     let mut req = base_export_req(cfg.clone());
     req.target_dialect = Some(DbType::Dm8);
-    req.tables = names;
+    req.tables = table_ids(&cfg.schema, names);
 
     let result = export_ddl(Json(req)).await;
     match &result {
@@ -481,7 +497,7 @@ async fn kingbase_03_table_details() {
         return;
     }
     let name = &tables[0].name;
-    let d = service::get_table_details(&cfg, name)
+    let d = service::get_table_details(&cfg, &cfg.schema, name)
         .await
         .expect("get_table_details 失败");
     println!(
@@ -510,7 +526,7 @@ async fn kingbase_04_export_ddl_self() {
     let names: Vec<String> = tables.iter().take(2).map(|t| t.name.clone()).collect();
     let mut req = base_export_req(cfg.clone());
     req.target_dialect = Some(DbType::Kingbase);
-    req.tables = names;
+    req.tables = table_ids(&cfg.schema, names);
 
     let result = export_ddl(Json(req)).await;
     match &result {
@@ -541,7 +557,7 @@ async fn kingbase_05_export_ddl_to_mysql() {
     let mut req = base_export_req(cfg.clone());
     req.target_dialect = Some(DbType::Mysql);
     req.export_compat = None;
-    req.tables = names;
+    req.tables = table_ids(&cfg.schema, names);
 
     let result = export_ddl(Json(req)).await;
     match &result {
@@ -599,7 +615,7 @@ async fn shentong_03_table_details() {
         return;
     }
     let name = &tables[0].name;
-    let d = service::get_table_details(&cfg, name)
+    let d = service::get_table_details(&cfg, &cfg.schema, name)
         .await
         .expect("get_table_details 失败");
     println!(

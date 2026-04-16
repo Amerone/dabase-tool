@@ -98,7 +98,11 @@ pub fn get_tables(config: &ConnectionConfig) -> Result<Vec<Table>> {
     Ok(tables)
 }
 
-pub fn get_table_details(config: &ConnectionConfig, schema: &str, table: &str) -> Result<TableDetails> {
+pub fn get_table_details(
+    config: &ConnectionConfig,
+    schema: &str,
+    table: &str,
+) -> Result<TableDetails> {
     config
         .validate()
         .context("Invalid ODBC connection configuration")?;

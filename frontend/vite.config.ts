@@ -13,26 +13,22 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks(id) {
-          if (id.includes('node_modules/antd')) {
-            return 'vendor-antd-core'
-          }
-          if (id.includes('node_modules/rc-')) {
-            return 'vendor-antd-rc'
-          }
+          const moduleId = id.replace(/\\/g, '/')
+
           if (
-            id.includes('node_modules/react') ||
-            id.includes('node_modules/react-dom') ||
-            id.includes('node_modules/react-router-dom')
+            moduleId.includes('node_modules/react') ||
+            moduleId.includes('node_modules/react-dom') ||
+            moduleId.includes('node_modules/react-router-dom')
           ) {
             return 'vendor-react'
           }
           if (
-            id.includes('node_modules/@tanstack/react-query') ||
-            id.includes('node_modules/axios')
+            moduleId.includes('node_modules/@tanstack/react-query') ||
+            moduleId.includes('node_modules/axios')
           ) {
             return 'vendor-query'
           }
-          if (id.includes('node_modules/animejs')) {
+          if (moduleId.includes('node_modules/animejs')) {
             return 'vendor-motion'
           }
           return undefined

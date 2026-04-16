@@ -62,11 +62,14 @@ fn resolve_bundled_driver_dll(env_var: &str, candidates: &[&str]) -> Option<Stri
 fn register_bundled_driver(driver_name: &str, env_var: &str, candidates: &[&str], required: bool) {
     match resolve_bundled_driver_dll(env_var, candidates) {
         Some(driver_dll) => {
-            // Add the DLL's directory to the process PATH so that Windows can find
-            // the sibling dependencies (e.g. libkci.dll, libssl, libcrypto) when the
-            // ODBC Driver Manager loads the driver DLL.
+            // Add the DLL's directory to both PATH and via AddDllDirectory Win32 API.
+            // AddDllDirectory is more reliable on modern Windows: the ODBC Driver Manager
+            // may use LoadLibraryEx with LOAD_LIBRARY_SEARCH_* flags that ignore PATH but
+            // do honour directories registered via AddDllDirectory.
             if let Some(dir) = std::path::Path::new(&driver_dll).parent() {
                 let dir_str = dir.display().to_string();
+
+                // PATH (legacy search path — kept for compatibility)
                 let current_path = std::env::var("PATH").unwrap_or_default();
                 if !current_path
                     .split(';')
@@ -75,6 +78,23 @@ fn register_bundled_driver(driver_name: &str, env_var: &str, candidates: &[&str]
                     let new_path = format!("{};{}", dir_str, current_path);
                     std::env::set_var("PATH", &new_path);
                     tracing::debug!("Added ODBC driver directory to PATH: {}", dir_str);
+                }
+
+                // AddDllDirectory (modern search path — works even with restricted flags)
+                #[link(name = "kernel32")]
+                extern "system" {
+                    fn AddDllDirectory(NewDirectory: *const u16) -> *mut std::ffi::c_void;
+                }
+                use std::os::windows::ffi::OsStrExt;
+                let wide: Vec<u16> = std::ffi::OsStr::new(&dir_str)
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let cookie = unsafe { AddDllDirectory(wide.as_ptr()) };
+                if !cookie.is_null() {
+                    tracing::debug!("AddDllDirectory succeeded for: {}", dir_str);
+                } else {
+                    tracing::warn!("AddDllDirectory failed for: {}", dir_str);
                 }
             }
 
@@ -123,10 +143,7 @@ fn register_bundled_driver(driver_name: &str, env_var: &str, candidates: &[&str]
 /// Also sets TNS_ADMIN so ACI can find tnsnames.aci / sqlnet.aci.
 #[cfg(windows)]
 fn inject_shentong_aci_path() {
-    let candidates = [
-        "drivers/shentong/windows",
-        "../drivers/shentong/windows",
-    ];
+    let candidates = ["drivers/shentong/windows", "../drivers/shentong/windows"];
 
     for dir in &candidates {
         let p = std::path::Path::new(dir).join("aci.dll");

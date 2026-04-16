@@ -1,4 +1,4 @@
-﻿import { useEffect, useRef, useLayoutEffect } from 'react'
+import { Suspense, lazy, useEffect, useRef, useLayoutEffect } from 'react'
 import { Steps, Space, Row, Col } from 'antd'
 import {
   DatabaseOutlined,
@@ -9,13 +9,14 @@ import {
 } from '@ant-design/icons'
 import { createLayout } from 'animejs'
 import { useExportStore } from '@/store/useExportStore'
-import ConnectionForm from '@/components/ConnectionForm'
-import SchemaExplorer from '@/components/SchemaExplorer'
-import TableSelector from '@/components/TableSelector'
-import ExportConfig from '@/components/ExportConfig'
 import { TechButton } from '@/components/common/TechButton'
 
 type LayoutController = ReturnType<typeof createLayout>
+
+const ConnectionForm = lazy(() => import('@/components/ConnectionForm'))
+const SchemaExplorer = lazy(() => import('@/components/SchemaExplorer'))
+const TableSelector = lazy(() => import('@/components/TableSelector'))
+const ExportConfig = lazy(() => import('@/components/ExportConfig'))
 
 export default function ExportWizard() {
   const currentStep = useExportStore((state) => state.currentStep)
@@ -70,6 +71,22 @@ export default function ExportWizard() {
     },
   ]
 
+  const loadingFallback = (
+    <div
+      style={{
+        minHeight: 280,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        color: 'rgba(255,255,255,0.65)',
+        fontFamily: 'JetBrains Mono',
+        letterSpacing: 1,
+      }}
+    >
+      正在加载模块...
+    </div>
+  )
+
   const handleNext = () => {
     layoutRef.current?.record()
     nextStep()
@@ -101,7 +118,7 @@ export default function ExportWizard() {
       </div>
 
       <div ref={contentRef} style={{ minHeight: '300px', marginBottom: '70px' }}>
-        {steps[currentStep].content}
+        <Suspense fallback={loadingFallback}>{steps[currentStep].content}</Suspense>
       </div>
 
       <div

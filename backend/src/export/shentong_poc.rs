@@ -7,13 +7,12 @@ use anyhow::{Context, Result};
 
 use crate::{
     db::shentong as db_shentong,
-    dialect::renderer_for,
-    domain::canonical::{canonical_table_from_details, CanonicalRow, CanonicalValue, LogicalType},
-    export::{
-        data::topological_sort_by_foreign_keys,
-        orchestrator::LegacyExportPlan,
+    dialect::{
+        renderer_for, shentong_format_value, shentong_quote_ident, SHENTONG_INLINE_BLOB_MAX_BYTES,
     },
-    models::{Column, ConnectionConfig, DbType, ForeignKey, TableDetails},
+    domain::canonical::{canonical_table_from_details, CanonicalRow, CanonicalValue, LogicalType},
+    export::{data::topological_sort_by_foreign_keys, orchestrator::LegacyExportPlan},
+    models::{ConnectionConfig, DbType, ForeignKey, TableDetails},
 };
 
 pub fn export_shentong_to_shentong_ddl(
@@ -84,15 +83,16 @@ pub fn export_shentong_to_shentong_data(
     writeln!(writer, "-- target schema: {}", plan.target_schema)?;
     writeln!(writer)?;
 
-    // Phase 0: Collect FK info for all tables
-    let fk_conn = db_shentong::open(config)?;
+    // Use a single connection for FK metadata and all data queries
+    let conn = db_shentong::open(config)?;
     let owner = plan.source_schema.trim().to_uppercase();
+
+    // Phase 0: Collect FK info for all tables + collect constraint names
     let mut table_names = Vec::with_capacity(plan.tables.len());
     let mut table_fks: Vec<Vec<ForeignKey>> = Vec::with_capacity(plan.tables.len());
     for table_id in &plan.tables {
         let table_upper = table_id.name.trim().to_uppercase();
-        let fks = db_shentong::fetch_foreign_keys(&fk_conn, &owner, &table_upper)
-            .unwrap_or_default();
+        let fks = db_shentong::fetch_foreign_keys(&conn, &owner, &table_upper).unwrap_or_default();
         table_names.push(table_id.name.clone());
         table_fks.push(fks);
     }
@@ -101,8 +101,30 @@ pub fn export_shentong_to_shentong_data(
     let insert_order = topological_sort_by_foreign_keys(&table_names, &table_fks);
     let truncate_order: Vec<usize> = insert_order.iter().copied().rev().collect();
 
-    // Phase 1: TRUNCATE all tables (children first) — double-quote syntax
-    writeln!(writer, "-- Phase 1: TRUNCATE tables (children before parents)")?;
+    // Phase 0: Disable FK constraints to allow TRUNCATE and out-of-order INSERT
+    let has_fks = table_fks.iter().any(|fks| !fks.is_empty());
+    if has_fks {
+        writeln!(writer, "-- Phase 0: Disable FK constraints")?;
+        for (idx, fks) in table_fks.iter().enumerate() {
+            let table_id = &plan.tables[idx];
+            for fk in fks {
+                writeln!(
+                    writer,
+                    "ALTER TABLE {}.{} DISABLE CONSTRAINT {};",
+                    quote_ident(&plan.target_schema),
+                    quote_ident(&table_id.name),
+                    quote_ident(&fk.name)
+                )?;
+            }
+        }
+        writeln!(writer)?;
+    }
+
+    // Phase 1: TRUNCATE all tables (children first)
+    writeln!(
+        writer,
+        "-- Phase 1: TRUNCATE tables (children before parents)"
+    )?;
     for &idx in &truncate_order {
         let table_id = &plan.tables[idx];
         writeln!(
@@ -114,24 +136,19 @@ pub fn export_shentong_to_shentong_data(
     }
     writeln!(writer)?;
 
-    // Phase 2: INSERT data (parents first)
+    // Phase 2: INSERT data (parents first) — reuse same connection
     writeln!(writer, "-- Phase 2: INSERT data (parents before children)")?;
     for &idx in &insert_order {
         let table_id = &plan.tables[idx];
-        // Open a single connection for each table — reuse it for both
-        // metadata inspection and data export.
-        let table_conn = db_shentong::open(config)?;
-        let details = inspect_table_details(&table_conn, &plan.source_schema, &table_id.name)
+        let details = inspect_table_details(&conn, &plan.source_schema, &table_id.name)
             .with_context(|| format!("Failed to inspect Shentong table '{}'", table_id))?;
 
         let source_table = canonical_table_from_details(&details);
         let mut target_table = canonical_table_from_details(&details);
         target_table.name = format!("{}.{}", plan.target_schema, details.name);
 
-        // Reuse the same connection for data export
         let count = export_table_rows(
-            config,
-            &table_conn,
+            &conn,
             &plan.source_schema,
             &source_table,
             &target_table,
@@ -147,12 +164,30 @@ pub fn export_shentong_to_shentong_data(
         }
     }
 
+    // Phase 3: Re-enable FK constraints
+    if has_fks {
+        writeln!(writer, "-- Phase 3: Re-enable FK constraints")?;
+        for (idx, fks) in table_fks.iter().enumerate() {
+            let table_id = &plan.tables[idx];
+            for fk in fks {
+                writeln!(
+                    writer,
+                    "ALTER TABLE {}.{} ENABLE CONSTRAINT {};",
+                    quote_ident(&plan.target_schema),
+                    quote_ident(&table_id.name),
+                    quote_ident(&fk.name)
+                )?;
+            }
+        }
+    }
+
     writer
         .flush()
         .context("Failed to flush shentong data export")?;
     Ok(total_rows)
 }
 
+/// Inspect table metadata via db_shentong (reuses public functions from db::shentong).
 fn inspect_table_details(
     conn: &shentong::Connection,
     schema: &str,
@@ -161,8 +196,8 @@ fn inspect_table_details(
     let owner = schema.trim().to_uppercase();
     let table_name = table.trim().to_uppercase();
 
-    let columns = fetch_columns(conn, &owner, &table_name)?;
-    let primary_keys = fetch_primary_keys(conn, &owner, &table_name)?;
+    let columns = db_shentong::fetch_columns(conn, &owner, &table_name)?;
+    let primary_keys = db_shentong::fetch_primary_keys(conn, &owner, &table_name)?;
 
     Ok(TableDetails {
         name: table.trim().to_string(),
@@ -177,73 +212,7 @@ fn inspect_table_details(
     })
 }
 
-fn fetch_columns(conn: &shentong::Connection, owner: &str, table: &str) -> Result<Vec<Column>> {
-    let sql = "SELECT column_name, data_type, data_length, data_precision, data_scale, \
-                      nullable, data_default \
-               FROM all_tab_columns \
-               WHERE owner = :1 AND table_name = :2 \
-               ORDER BY column_id";
-
-    let rows = conn
-        .query(sql, &[&owner, &table])
-        .context("Failed to query Shentong columns")?;
-
-    let mut columns = Vec::new();
-    for row_result in rows {
-        let row = row_result.context("Error reading column row")?;
-
-        let name: String = row.get(0)?;
-        let data_type: String = row.get(1)?;
-        let length: Option<i32> = row.get::<_, Option<i32>>(2).unwrap_or(None);
-        let precision: Option<i32> = row.get::<_, Option<i32>>(3).unwrap_or(None);
-        let scale: Option<i32> = row.get::<_, Option<i32>>(4).unwrap_or(None);
-        let nullable_str: String = row.get::<_, String>(5).unwrap_or_else(|_| "Y".to_string());
-        let nullable = nullable_str.trim() != "N";
-        let default_value: Option<String> = row.get::<_, Option<String>>(6).unwrap_or(None);
-
-        columns.push(Column {
-            name,
-            data_type,
-            length,
-            precision,
-            scale,
-            char_semantics: None,
-            nullable,
-            comment: None,
-            default_value,
-            identity: false,
-            identity_start: None,
-            identity_increment: None,
-        });
-    }
-    Ok(columns)
-}
-
-fn fetch_primary_keys(conn: &shentong::Connection, owner: &str, table: &str) -> Result<Vec<String>> {
-    let sql = "SELECT acc.column_name \
-               FROM all_constraints ac \
-               JOIN all_cons_columns acc \
-                 ON ac.constraint_name = acc.constraint_name \
-                AND ac.owner = acc.owner \
-               WHERE ac.constraint_type = 'P' \
-                 AND ac.owner = :1 \
-                 AND ac.table_name = :2 \
-               ORDER BY acc.position";
-
-    let rows = conn
-        .query(sql, &[&owner, &table])
-        .context("Failed to query Shentong primary keys")?;
-
-    let mut keys = Vec::new();
-    for row_result in rows {
-        let row = row_result.context("Error reading pk row")?;
-        keys.push(row.get::<_, String>(0)?);
-    }
-    Ok(keys)
-}
-
 fn export_table_rows(
-    _config: &ConnectionConfig,
     conn: &shentong::Connection,
     source_schema: &str,
     source_table: &crate::domain::canonical::CanonicalTable,
@@ -257,22 +226,26 @@ fn export_table_rows(
     }
 
     // Shentong OSCAR ACI: set search_path so unqualified table names resolve
-    let set_sql = format!("SET search_path TO {}, public", source_schema);
+    let set_sql = format!("SET search_path TO {}, public", quote_ident(source_schema));
     tracing::debug!(sql = %set_sql, "Setting Shentong search_path");
     match conn.execute(&set_sql, &[]) {
         Ok(_) => tracing::debug!("search_path set successfully"),
         Err(e) => tracing::warn!(error = ?e, "Failed to set search_path"),
     }
 
-    // Now query using unqualified table name
-    let selected_columns_unquoted = source_table
+    // Build SELECT with properly quoted column names
+    let selected_columns = source_table
         .columns
         .iter()
-        .map(|col| col.name.clone())
+        .map(|col| quote_ident(&col.name))
         .collect::<Vec<_>>()
         .join(", ");
 
-    let sql = format!("SELECT {} FROM {}", selected_columns_unquoted, source_table.name);
+    let sql = format!(
+        "SELECT {} FROM {}",
+        selected_columns,
+        quote_ident(&source_table.name)
+    );
 
     tracing::debug!(sql = %sql, "Shentong data export query");
 
@@ -289,24 +262,68 @@ fn export_table_rows(
     let mut total_rows = 0usize;
     let mut batch = Vec::with_capacity(batch_size);
 
+    // Pre-compute target table identifier and column list for LOB blocks
+    let target_ident = shentong_quote_ident(&target_table.name);
+    let columns_str = target_table
+        .columns
+        .iter()
+        .map(|col| shentong_quote_ident(&col.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     for row_result in query_rows {
         let row = row_result.context("Error reading data row")?;
 
         let mut values = Vec::with_capacity(source_table.columns.len());
+        let mut large_blobs: Vec<(usize, Vec<u8>)> = Vec::new();
+
         for (col_index, logical_type) in logical_types.iter().enumerate() {
             let raw: Option<String> = row.get::<_, Option<String>>(col_index).unwrap_or(None);
-            values.push(parse_value(logical_type, raw));
+            let val = parse_value(logical_type, raw);
+            // Detect large binary values that need DBMS_LOB treatment
+            if let CanonicalValue::Binary(ref bytes) = val {
+                if bytes.len() > SHENTONG_INLINE_BLOB_MAX_BYTES {
+                    large_blobs.push((col_index, bytes.clone()));
+                    values.push(CanonicalValue::Null); // placeholder
+                    continue;
+                }
+            }
+            values.push(val);
         }
-        batch.push(CanonicalRow { values });
 
-        if batch.len() >= batch_size {
-            writeln!(
+        if !large_blobs.is_empty() {
+            // Flush pending normal batch first
+            if !batch.is_empty() {
+                writeln!(
+                    writer,
+                    "{}",
+                    renderer.render_insert_batch(target_table, &batch)?
+                )?;
+                total_rows += batch.len();
+                batch.clear();
+            }
+            // Format non-blob values as SQL literals
+            let formatted_values: Vec<String> = values.iter().map(shentong_format_value).collect();
+            crate::dialect::write_shentong_lob_insert_block(
                 writer,
-                "{}",
-                renderer.render_insert_batch(target_table, &batch)?
+                &target_ident,
+                &columns_str,
+                &formatted_values,
+                &large_blobs,
             )?;
-            total_rows += batch.len();
-            batch.clear();
+            total_rows += 1;
+        } else {
+            batch.push(CanonicalRow { values });
+
+            if batch.len() >= batch_size {
+                writeln!(
+                    writer,
+                    "{}",
+                    renderer.render_insert_batch(target_table, &batch)?
+                )?;
+                total_rows += batch.len();
+                batch.clear();
+            }
         }
     }
 

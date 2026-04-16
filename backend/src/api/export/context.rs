@@ -147,14 +147,16 @@ pub(super) fn exports_dir() -> Result<PathBuf, String> {
 
 pub(super) fn format_export_filename(
     source: &str,
+    dialect: &str,
     target: &str,
     kind: &str,
     suffix: &str,
 ) -> Result<PathBuf, String> {
     let dir = exports_dir()?;
     Ok(dir.join(format!(
-        "{}_to_{}_{}_{}.sql",
+        "{}_to_{}_{}_{}_{}.sql",
         sanitize_filename_part(source),
+        sanitize_filename_part(dialect),
         sanitize_filename_part(target),
         kind,
         suffix
@@ -192,6 +194,7 @@ pub(super) fn build_export_context(req: &mut ExportRequest) -> (ConnectionConfig
         password: std::mem::take(&mut req.config.password),
         schema: req.config.schema.clone(),
         export_schema: req.config.export_schema.clone(),
+        database: req.config.database.clone(),
     };
 
     let source_schema = config.schema.clone();
@@ -230,18 +233,19 @@ mod tests {
 
     #[test]
     fn format_export_filename_includes_source_and_target() {
-        let path = format_export_filename("SRC", "TGT", "ddl", "20260130_120000_000").unwrap();
+        let path =
+            format_export_filename("SRC", "dm8", "TGT", "ddl", "20260130_120000_000").unwrap();
         assert!(path.is_absolute(), "export path must be absolute");
         let name = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(name, "SRC_to_TGT_ddl_20260130_120000_000.sql");
+        assert_eq!(name, "SRC_to_dm8_TGT_ddl_20260130_120000_000.sql");
     }
 
     #[test]
     fn format_export_filename_sanitizes_special_chars() {
-        let path = format_export_filename("../evil", "a;b", "ddl", "ts").unwrap();
+        let path = format_export_filename("../evil", "dm8", "a;b", "ddl", "ts").unwrap();
         assert!(path.is_absolute(), "export path must be absolute");
         let name = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(name, "___evil_to_a_b_ddl_ts.sql");
+        assert_eq!(name, "___evil_to_dm8_a_b_ddl_ts.sql");
     }
 
     #[test]
@@ -287,6 +291,7 @@ mod tests {
                 password: "SYSDBA".to_string(),
                 schema: "SYSDBA".to_string(),
                 export_schema: None,
+                database: None,
             },
             target_dialect: None,
             export_schema: None,
@@ -298,6 +303,7 @@ mod tests {
             drop_existing: true,
             include_row_counts: false,
             strict_mode: false,
+            identifier_case: None,
         }
     }
 

@@ -11,7 +11,7 @@ use chrono::Local;
 use odbc_api::Connection;
 
 use crate::{
-    db::schema::{fetch_sequences, get_table_details},
+    db::schema::{fetch_sequences, get_tables_details_batch},
     models::{Column, Index, Sequence, TableDetails, TableIdentifier, TriggerDefinition},
 };
 
@@ -20,6 +20,9 @@ pub enum TriggerTerminator {
     DataGrip,
     Script,
     DataGripScript,
+    /// Plain SQL terminator: `END;` without `/` delimiter.
+    /// Suitable for PostgreSQL-compatible targets (e.g. Kingbase).
+    Plain,
 }
 
 pub fn generate_create_table(table: &TableDetails) -> String {
@@ -424,13 +427,23 @@ pub fn generate_triggers(
             };
 
             let events = tr.events.join(" OR ");
-            let mut stmt = format!(
-                "CREATE OR REPLACE TRIGGER {}.{}\n{} {} ON {}",
-                quote_identifier(schema),
-                quote_identifier(&tr.name),
-                tr.timing,
-                events,
+            let trigger_ident = if schema.is_empty() {
+                quote_identifier(&tr.name)
+            } else {
+                format!(
+                    "{}.{}",
+                    quote_identifier(schema),
+                    quote_identifier(&tr.name)
+                )
+            };
+            let table_ident = if schema.is_empty() {
+                quote_identifier(&tr.table_name)
+            } else {
                 quote_identifier(&format!("{}.{}", schema, tr.table_name))
+            };
+            let mut stmt = format!(
+                "CREATE OR REPLACE TRIGGER {}\n{} {} ON {}",
+                trigger_ident, tr.timing, events, table_ident
             );
             if tr.each_row {
                 stmt.push_str(" REFERENCING OLD AS OLD NEW AS NEW");
@@ -472,7 +485,10 @@ fn apply_trigger_terminator(stmt: &mut String, terminator: TriggerTerminator) {
         stmt.push(';');
     }
 
-    if terminator == TriggerTerminator::Script {
+    if matches!(
+        terminator,
+        TriggerTerminator::Script | TriggerTerminator::DataGrip
+    ) {
         let trimmed = stmt.trim_end();
         if !trimmed.ends_with('/') {
             if !stmt.ends_with('\n') {
@@ -495,13 +511,10 @@ pub fn export_schema_ddl(
     let source_schema = source_schema.to_uppercase();
     let target_schema = target_schema.to_uppercase();
 
-    // Cache table details to avoid repeated queries.
-    let mut table_cache = Vec::new();
-    for table_id in tables {
-        let details = get_table_details(connection, &source_schema, &table_id.name)
-            .with_context(|| format!("Failed to fetch table metadata for '{}'", table_id))?;
-        table_cache.push(details);
-    }
+    // 批量查询所有表元数据（替代逐表串行查询）
+    let table_names: Vec<String> = tables.iter().map(|t| t.name.clone()).collect();
+    let mut table_cache = get_tables_details_batch(connection, &source_schema, &table_names)
+        .context("Failed to batch-fetch table metadata")?;
 
     let selected_tables: HashSet<String> = table_cache
         .iter()
@@ -530,7 +543,7 @@ pub fn export_schema_ddl(
             output_path.display()
         )
     })?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::with_capacity(1 << 20, file);
 
     // File header
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -742,7 +755,13 @@ pub fn export_schema_ddl(
         writeln!(writer)?;
         writeln!(writer, "-- 触发器（第二步：请在序列之后执行）")?;
         for stmt in trig_stmts {
+            if trigger_terminator == TriggerTerminator::DataGrip {
+                writeln!(writer, "--@delimiter /")?;
+            }
             writeln!(writer, "{}", stmt)?;
+            if trigger_terminator == TriggerTerminator::DataGrip {
+                writeln!(writer, "--@delimiter ;")?;
+            }
         }
     }
 
@@ -1124,11 +1143,7 @@ fn has_timezone(expr: &str) -> bool {
     if let Some(pos) = expr.rfind('+') {
         let rest = &expr[pos..];
         // Timezone pattern: +HH:MM or +HHMM
-        return rest.len() >= 5
-            && rest[1..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_digit());
+        return rest.len() >= 5 && rest[1..].chars().next().is_some_and(|c| c.is_ascii_digit());
     }
     if let Some(pos) = expr.rfind('-') {
         // Make sure it's not a date separator (position should be after time part)
@@ -1937,10 +1952,10 @@ mod tests {
         // Verify referencing clause
         assert!(stmt.contains("REFERENCING OLD AS OLD NEW AS NEW"));
 
-        // Verify trigger terminator
+        // Verify trigger terminator (DataGrip mode now includes / terminator)
         assert!(
-            stmt.trim_end().ends_with(';'),
-            "Trigger should end with ';'"
+            stmt.trim_end().ends_with('/'),
+            "Trigger should end with '/' in DataGrip mode"
         );
     }
 
@@ -2019,7 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_triggers_datagrip_has_no_slash_terminator() {
+    fn generate_triggers_datagrip_has_slash_terminator() {
         let triggers = vec![TriggerDefinition {
             name: "TRG_TEST_ID".to_string(),
             table_name: "TEST_TABLE".to_string(),
@@ -2032,8 +2047,10 @@ mod tests {
         let statements = generate_triggers("PLATFORM", &triggers, TriggerTerminator::DataGrip);
         assert_eq!(statements.len(), 1);
         let stmt = &statements[0];
-        assert!(stmt.trim_end().ends_with(';'));
-        assert!(!stmt.contains("\n/"));
+        assert!(
+            stmt.trim_end().ends_with('/'),
+            "DataGrip mode should now have / terminator"
+        );
     }
 
     #[test]

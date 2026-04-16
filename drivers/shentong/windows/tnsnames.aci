@@ -1,0 +1,3 @@
+osrdb = localhost:2003/osrdb
+OSRDB = localhost:2003/osrdb
+remote_osrdb = 192.168.3.34:2003/osrdb

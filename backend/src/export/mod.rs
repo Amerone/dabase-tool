@@ -1,12 +1,15 @@
 pub mod capability;
+pub mod common;
 pub mod data;
 pub mod ddl;
 pub mod dm8_to_kingbase_poc;
 pub mod dm8_to_mysql_poc;
+pub mod dm8_to_shentong_poc;
 pub mod kingbase_poc;
 pub mod kingbase_to_other_poc;
 pub mod mysql_poc;
 pub mod mysql_to_dm8_poc;
 pub mod mysql_to_kingbase_poc;
 pub mod orchestrator;
+pub mod pipeline;
 pub mod shentong_poc;

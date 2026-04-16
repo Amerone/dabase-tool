@@ -136,7 +136,11 @@ pub async fn get_tables(config: &ConnectionConfig) -> Result<Vec<Table>> {
     Ok(tables)
 }
 
-pub async fn get_table_details(config: &ConnectionConfig, schema: &str, table: &str) -> Result<TableDetails> {
+pub async fn get_table_details(
+    config: &ConnectionConfig,
+    schema: &str,
+    table: &str,
+) -> Result<TableDetails> {
     let client = connect(config).await?;
     let table = table.trim().to_string();
     let schema = schema.trim().to_string();
@@ -350,7 +354,11 @@ async fn fetch_indexes(client: &Client, schema: &str, table: &str) -> Result<Vec
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            Index { name, columns, unique }
+            Index {
+                name,
+                columns,
+                unique,
+            }
         })
         .collect();
 
@@ -522,4 +530,3 @@ async fn fetch_triggers(
         })
         .collect())
 }
-

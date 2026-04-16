@@ -1,3 +1,4 @@
+use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -5,6 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::env;
+use tracing::error;
 
 use crate::{
     api::response::{self, ApiResult},
@@ -26,15 +28,37 @@ pub struct GetConnectionQuery {
     pub db_type: Option<DbType>,
 }
 
+async fn run_store_task<T, F>(task_name: &'static str, task: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(task).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => {
+            error!(task = task_name, error = ?err, "Config store task failed");
+            Err(err)
+        }
+        Err(err) => {
+            error!(task = task_name, error = ?err, "Config store task join failed");
+            Err(err.into())
+        }
+    }
+}
+
 pub async fn get_connection(
     State(state): State<AppState>,
     Query(query): Query<GetConnectionQuery>,
 ) -> ApiResult<StoredConnectionResponse> {
     let store = state.config_store.clone();
     let requested_db_type = query.db_type.clone();
-    match tokio::task::spawn_blocking(move || store.get_default_for(requested_db_type)).await {
-        Ok(Ok(Some(stored))) => response::ok(to_response(stored)),
-        Ok(Ok(None)) => match env_connection_config(query.db_type) {
+    match run_store_task("get_connection", move || {
+        store.get_default_for(requested_db_type)
+    })
+    .await
+    {
+        Ok(Some(stored)) => response::ok(to_response(stored)),
+        Ok(None) => match env_connection_config(query.db_type) {
             Ok(config) => response::ok(StoredConnectionResponse {
                 config: redact_password(config),
                 source: ConfigSource::Env,
@@ -45,10 +69,6 @@ pub async fn get_connection(
                 format!("No saved connection and failed to read env: {}", e),
             ),
         },
-        Ok(Err(_)) => response::err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to read saved config",
-        ),
         Err(_) => response::err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to read saved config",
@@ -68,12 +88,8 @@ pub async fn save_connection(
     }
 
     let store = state.config_store.clone();
-    match tokio::task::spawn_blocking(move || store.upsert_default(&config)).await {
-        Ok(Ok(stored)) => response::ok(to_response(stored)),
-        Ok(Err(_)) => response::err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to save connection",
-        ),
+    match run_store_task("save_connection", move || store.upsert_default(&config)).await {
+        Ok(stored) => response::ok(to_response(stored)),
         Err(_) => response::err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to save connection",
@@ -85,15 +101,11 @@ pub async fn list_connections(
     State(state): State<AppState>,
 ) -> ApiResult<Vec<NamedConnectionResponse>> {
     let store = state.config_store.clone();
-    match tokio::task::spawn_blocking(move || store.list_connections()).await {
-        Ok(Ok(items)) => {
+    match run_store_task("list_connections", move || store.list_connections()).await {
+        Ok(items) => {
             let data = items.into_iter().map(to_named_response).collect::<Vec<_>>();
             response::ok(data)
         }
-        Ok(Err(_)) => response::err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to list connections",
-        ),
         Err(_) => response::err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to list connections",
@@ -117,12 +129,12 @@ pub async fn save_named_connection(
     }
 
     let store = state.config_store.clone();
-    match tokio::task::spawn_blocking(move || store.upsert_named(&req.name, &req.config)).await {
-        Ok(Ok(stored)) => response::ok(to_named_response(stored)),
-        Ok(Err(_)) => response::err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to save named connection",
-        ),
+    match run_store_task("save_named_connection", move || {
+        store.upsert_named(&req.name, &req.config)
+    })
+    .await
+    {
+        Ok(stored) => response::ok(to_named_response(stored)),
         Err(_) => response::err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to save named connection",
@@ -135,12 +147,12 @@ pub async fn delete_connection(
     Path(id): Path<i64>,
 ) -> ApiResult<bool> {
     let store = state.config_store.clone();
-    match tokio::task::spawn_blocking(move || store.delete_connection_by_id(id)).await {
-        Ok(Ok(deleted)) => response::ok(deleted),
-        Ok(Err(_)) => response::err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to delete connection",
-        ),
+    match run_store_task("delete_connection", move || {
+        store.delete_connection_by_id(id)
+    })
+    .await
+    {
+        Ok(deleted) => response::ok(deleted),
         Err(_) => response::err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to delete connection",
@@ -183,6 +195,7 @@ fn env_connection_config(requested_db_type: Option<DbType>) -> Result<Connection
         password,
         schema,
         export_schema: None,
+        database: None,
     };
 
     if let Some(requested) = requested_db_type {
@@ -312,6 +325,7 @@ mod tests {
             password: "dm8-pass".to_string(),
             schema: "dm8-schema".to_string(),
             export_schema: None,
+            database: None,
         };
         let mysql = ConnectionConfig {
             db_type: DbType::Mysql,
@@ -321,6 +335,7 @@ mod tests {
             password: "mysql-pass".to_string(),
             schema: "mysql-schema".to_string(),
             export_schema: None,
+            database: None,
         };
 
         let _ = save_connection(State(state.clone()), Json(dm8))
@@ -362,6 +377,7 @@ mod tests {
                 password: "secret".to_string(),
                 schema: "demo".to_string(),
                 export_schema: None,
+                database: None,
             },
         };
 
@@ -401,6 +417,7 @@ mod tests {
             password: "".to_string(),
             schema: "SYSDBA".to_string(),
             export_schema: None,
+            database: None,
         };
 
         let err = save_connection(State(state), Json(invalid))
@@ -435,6 +452,7 @@ mod tests {
                 password: "SYSDBA".to_string(),
                 schema: "SYSDBA".to_string(),
                 export_schema: None,
+                database: None,
             },
         };
 

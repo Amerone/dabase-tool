@@ -2,6 +2,92 @@
 name = "dm8-export-backend"
 version = "0.1.0"
 edition = "2021"
+default-run = "dm8-export-backend"
+autobins = false
+
+[features]
+default = []
+diagnostic-bins = []
+
+[[bin]]
+name = "dm8-export-backend"
+path = "src/main.rs"
+test = false
+
+[[bin]]
+name = "test_two_envs"
+path = "src/bin/test_two_envs.rs"
+required-features = ["diagnostic-bins"]
+
+[[bin]]
+name = "test_odpi_ffi"
+path = "src/bin/test_odpi_ffi.rs"
+required-features = ["diagnostic-bins"]
+
+[[bin]]
+name = "test_aci_stack"
+path = "src/bin/test_aci_stack.rs"
+required-features = ["diagnostic-bins"]
+
+[[bin]]
+name = "test_aci_rodata"
+path = "src/bin/test_aci_rodata.rs"
+required-features = ["diagnostic-bins"]
+
+[[bin]]
+name = "test_aci_reuse"
+path = "src/bin/test_aci_reuse.rs"
+required-features = ["diagnostic-bins"]
+
+[[bin]]
+name = "test_aci_ptr"
+path = "src/bin/test_aci_ptr.rs"
+required-features = ["diagnostic-bins"]
+
+[[bin]]
+name = "test_aci_noloop"
+path = "src/bin/test_aci_noloop.rs"
+required-features = ["diagnostic-bins"]
+
+[[bin]]
+name = "test_aci_minimal"
+path = "src/bin/test_aci_minimal.rs"
+required-features = ["diagnostic-bins"]
+
+[[bin]]
+name = "test_aci_loop"
+path = "src/bin/test_aci_loop.rs"
+required-features = ["diagnostic-bins"]
+
+[[bin]]
+name = "test_aci_frames"
+path = "src/bin/test_aci_frames.rs"
+required-features = ["diagnostic-bins"]
+
+[[bin]]
+name = "test_aci_ffi"
+path = "src/bin/test_aci_ffi.rs"
+required-features = ["diagnostic-bins"]
+
+[[bin]]
+name = "test_aci_direct"
+path = "src/bin/test_aci_direct.rs"
+required-features = ["diagnostic-bins"]
+
+[[bin]]
+name = "test_aci_clone"
+path = "src/bin/test_aci_clone.rs"
+required-features = ["diagnostic-bins"]
+
+[[bin]]
+name = "test_aci"
+path = "src/bin/test_aci.rs"
+required-features = ["diagnostic-bins"]
+
+[[bin]]
+name = "shentong_query_test"
+path = "src/bin/shentong_query_test.rs"
+required-features = ["diagnostic-bins"]
 
 [dependencies]
 # Web framework

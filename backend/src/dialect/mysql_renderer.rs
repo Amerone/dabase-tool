@@ -14,6 +14,10 @@ impl DialectRenderer for MySqlDialectRenderer {
         DbType::Mysql
     }
 
+    fn quote_identifier(&self, name: &str) -> String {
+        format!("`{}`", name.replace('`', "``"))
+    }
+
     fn capabilities(&self) -> CapabilityProfile {
         CapabilityProfile {
             items: vec![
@@ -183,14 +187,16 @@ fn format_value(value: &CanonicalValue) -> String {
         | CanonicalValue::DateTime(v)
         | CanonicalValue::Json(v) => format!("'{}'", escape_single_quotes(v)),
         CanonicalValue::Binary(v) => {
-            let hex = v.iter().map(|b| format!("{:02X}", b)).collect::<String>();
+            let hex = super::bytes_to_hex_upper(v);
             format!("X'{}'", hex)
         }
     }
 }
 
 fn escape_single_quotes(input: &str) -> String {
-    input.replace('\'', "''")
+    // MySQL treats backslash as escape character by default (unless NO_BACKSLASH_ESCAPES is set).
+    // Must escape \ before ' to avoid breaking JSON strings like ["{\"type\":\"input\"}"].
+    input.replace('\\', "\\\\").replace('\'', "''")
 }
 
 #[cfg(test)]
@@ -210,16 +216,19 @@ mod tests {
                     name: "id".to_string(),
                     logical_type: LogicalType::Integer,
                     nullable: false,
+                    identity: false,
                 },
                 CanonicalColumn {
                     name: "name".to_string(),
                     logical_type: LogicalType::String,
                     nullable: false,
+                    identity: false,
                 },
                 CanonicalColumn {
                     name: "active".to_string(),
                     logical_type: LogicalType::Boolean,
                     nullable: false,
+                    identity: false,
                 },
             ],
             primary_keys: vec!["id".to_string()],
@@ -259,6 +268,38 @@ mod tests {
 
         assert!(sql.contains("INSERT INTO `users` (`id`, `name`, `active`) VALUES"));
         assert!(sql.contains("(1, 'O''Reilly', 1)"));
+    }
+
+    #[test]
+    fn render_insert_batch_escapes_backslashes_in_json() {
+        let renderer = MySqlDialectRenderer;
+        let sql = renderer
+            .render_insert_batch(
+                &sample_table(),
+                &[CanonicalRow {
+                    values: vec![
+                        CanonicalValue::Integer(1),
+                        CanonicalValue::String(r#"["{\"type\":\"input\"}"]"#.to_string()),
+                        CanonicalValue::Boolean(false),
+                    ],
+                }],
+            )
+            .unwrap();
+
+        // Backslashes must be doubled for MySQL
+        // Input:  ["{\"type\":\"input\"}"]
+        // Output: '{"\\"type\\":\\"input\\"}"]'  (each \ becomes \\)
+        assert!(
+            sql.contains(r#"'["{\\\"type\\\":\\\"input\\\"}"]'"#) || sql.contains(r#"{\\"#),
+            "Backslashes in JSON strings must be escaped for MySQL. Got: {}",
+            sql
+        );
+        // Verify no unescaped backslash-quote sequence remains
+        assert!(
+            !sql.contains(r#"\""#) || sql.contains(r#"\\""#),
+            "All backslashes must be doubled. Got: {}",
+            sql
+        );
     }
 
     #[test]

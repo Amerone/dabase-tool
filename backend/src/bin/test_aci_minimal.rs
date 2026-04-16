@@ -44,27 +44,44 @@ fn run(aci_dir: Option<String>) {
         None => "aci.dll\0".to_string(),
     };
     let module = unsafe { LoadLibraryA(dll_path.as_ptr()) };
-    if module.is_null() { eprintln!("LoadLibraryA failed!"); return; }
+    if module.is_null() {
+        eprintln!("LoadLibraryA failed!");
+        return;
+    }
     println!("DLL: {:p}", module);
 
     macro_rules! sym {
         ($name:expr, $ty:ty) => {
             unsafe {
                 let cname = CString::new($name).unwrap();
-                std::mem::transmute::<*mut c_void, $ty>(
-                    GetProcAddress(module, cname.as_ptr() as *const u8)
-                )
+                std::mem::transmute::<*mut c_void, $ty>(GetProcAddress(
+                    module,
+                    cname.as_ptr() as *const u8,
+                ))
             }
         };
     }
 
-    type FnEnvNls = unsafe extern "C" fn(*mut *mut c_void, u32, *mut c_void, *mut c_void,
-        *mut c_void, *mut c_void, usize, *mut *mut c_void, u16, u16) -> i32;
-    type FnAlloc = unsafe extern "C" fn(*mut c_void, *mut *mut c_void, u32, usize, *mut *mut c_void) -> i32;
+    type FnEnvNls = unsafe extern "C" fn(
+        *mut *mut c_void,
+        u32,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        usize,
+        *mut *mut c_void,
+        u16,
+        u16,
+    ) -> i32;
+    type FnAlloc =
+        unsafe extern "C" fn(*mut c_void, *mut *mut c_void, u32, usize, *mut *mut c_void) -> i32;
     type FnAttach = unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, i32, u32) -> i32;
-    type FnAttrSet = unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32, u32, *mut c_void) -> i32;
+    type FnAttrSet =
+        unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32, u32, *mut c_void) -> i32;
     type FnSessBegin = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u32) -> i32;
-    type FnErrGet = unsafe extern "C" fn(*mut c_void, u32, *const u8, *mut i32, *mut u8, u32, u32) -> i32;
+    type FnErrGet =
+        unsafe extern "C" fn(*mut c_void, u32, *const u8, *mut i32, *mut u8, u32, u32) -> i32;
 
     let env_nls: FnEnvNls = sym!("ACIEnvNlsCreate", FnEnvNls);
     let alloc: FnAlloc = sym!("ACIHandleAlloc", FnAlloc);
@@ -75,9 +92,24 @@ fn run(aci_dir: Option<String>) {
 
     let try_connect = |cs: &str, label: &str| -> bool {
         let mut env: *mut c_void = std::ptr::null_mut();
-        let rc = unsafe { env_nls(&mut env, 2, std::ptr::null_mut(), std::ptr::null_mut(),
-            std::ptr::null_mut(), std::ptr::null_mut(), 0, std::ptr::null_mut(), 871, 871) };
-        if rc != 0 || env.is_null() { println!("  [{}] EnvNlsCreate FAIL", label); return false; }
+        let rc = unsafe {
+            env_nls(
+                &mut env,
+                2,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                871,
+                871,
+            )
+        };
+        if rc != 0 || env.is_null() {
+            println!("  [{}] EnvNlsCreate FAIL", label);
+            return false;
+        }
         let mut err: *mut c_void = std::ptr::null_mut();
         let mut svc: *mut c_void = std::ptr::null_mut();
         let mut srv: *mut c_void = std::ptr::null_mut();
@@ -95,7 +127,8 @@ fn run(aci_dir: Option<String>) {
             unsafe {
                 attr_set(svc, 3, srv, 0, 6, err);
                 alloc(env, &mut ses, 9, 0, std::ptr::null_mut());
-                let u = b"sysdba"; let p = b"szoscar55";
+                let u = b"sysdba";
+                let p = b"szoscar55";
                 attr_set(ses, 9, u.as_ptr() as *mut c_void, u.len() as u32, 22, err);
                 attr_set(ses, 9, p.as_ptr() as *mut c_void, p.len() as u32, 23, err);
                 attr_set(svc, 3, ses, 0, 7, err);
@@ -104,11 +137,26 @@ fn run(aci_dir: Option<String>) {
             println!("  [{}] SessionBegin: rc={}", label, rc3);
             rc3 == 0
         } else {
-            let mut buf = vec![0u8; 256]; let mut code: i32 = 0;
-            unsafe { err_get(err, 1, std::ptr::null(), &mut code, buf.as_mut_ptr(), 256, 2); }
+            let mut buf = vec![0u8; 256];
+            let mut code: i32 = 0;
+            unsafe {
+                err_get(
+                    err,
+                    1,
+                    std::ptr::null(),
+                    &mut code,
+                    buf.as_mut_ptr(),
+                    256,
+                    2,
+                );
+            }
             let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            println!("  [{}] attach FAIL code={} '{}'", label, code,
-                String::from_utf8_lossy(&buf[..end]));
+            println!(
+                "  [{}] attach FAIL code={} '{}'",
+                label,
+                code,
+                String::from_utf8_lossy(&buf[..end])
+            );
             false
         }
     };
@@ -120,11 +168,23 @@ fn run(aci_dir: Option<String>) {
     println!("\n--- Test B: localhost first (prime), then 192.168.3.34 ---");
     try_connect("localhost:2003/osrdb", "B-prime");
     let b = try_connect("192.168.3.34:2003/osrdb", "B-real");
-    println!("  Test B: {}", if b { "SUCCESS (priming works!)" } else { "FAIL (priming not enough)" });
+    println!(
+        "  Test B: {}",
+        if b {
+            "SUCCESS (priming works!)"
+        } else {
+            "FAIL (priming not enough)"
+        }
+    );
 
-    println!("\nConclusion: {}",
-        if b && !a { "PRIMING CONFIRMED: hostname attempt needed before IP connect" }
-        else if a { "No priming needed" }
-        else { "Both fail - different root cause" }
+    println!(
+        "\nConclusion: {}",
+        if b && !a {
+            "PRIMING CONFIRMED: hostname attempt needed before IP connect"
+        } else if a {
+            "No priming needed"
+        } else {
+            "Both fail - different root cause"
+        }
     );
 }

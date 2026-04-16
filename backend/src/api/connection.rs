@@ -17,6 +17,22 @@ pub struct TestConnectionRequest {
     pub username: String,
     pub password: String,
     pub schema: String,
+    pub database: Option<String>,
+}
+
+impl TestConnectionRequest {
+    fn into_config(self) -> ConnectionConfig {
+        ConnectionConfig {
+            db_type: self.db_type,
+            host: self.host,
+            port: self.port,
+            username: self.username,
+            password: self.password,
+            schema: self.schema,
+            export_schema: None,
+            database: self.database,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -28,15 +44,7 @@ pub struct TestConnectionResponse {
 pub async fn test_connection(
     Json(req): Json<TestConnectionRequest>,
 ) -> ApiResult<TestConnectionResponse> {
-    let config = ConnectionConfig {
-        db_type: req.db_type,
-        host: req.host,
-        port: req.port,
-        username: req.username,
-        password: req.password,
-        schema: req.schema,
-        export_schema: None,
-    };
+    let config = req.into_config();
 
     match service::test_connection(&config).await {
         Ok(_) => response::ok(TestConnectionResponse {

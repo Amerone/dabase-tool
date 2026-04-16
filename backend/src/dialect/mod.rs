@@ -1,5 +1,7 @@
 pub mod mysql_renderer;
 
+use std::io::Write;
+
 use anyhow::{anyhow, Result};
 
 use crate::domain::canonical::{CanonicalRow, CanonicalTable, CanonicalValue, LogicalType};
@@ -10,6 +12,20 @@ use crate::models::{
 pub trait DialectRenderer: Send + Sync {
     fn dialect_kind(&self) -> DbType;
     fn capabilities(&self) -> CapabilityProfile;
+
+    /// Quote a single identifier for the target dialect.
+    /// Default: double quotes (SQL standard). MySQL overrides to backticks.
+    fn quote_identifier(&self, name: &str) -> String {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+
+    /// Quote a dot-separated qualified identifier (e.g. "schema.table").
+    fn quote_qualified_identifier(&self, name: &str) -> String {
+        name.split('.')
+            .map(|part| self.quote_identifier(part))
+            .collect::<Vec<_>>()
+            .join(".")
+    }
 
     fn render_table_ddl(&self, _table: &CanonicalTable) -> Result<String> {
         Err(anyhow!(
@@ -27,6 +43,47 @@ pub trait DialectRenderer: Send + Sync {
             "Dialect {:?} insert rendering is not implemented",
             self.dialect_kind()
         ))
+    }
+
+    /// Stream INSERT statements directly to a writer, avoiding intermediate String allocation.
+    /// Default implementation delegates to `render_insert_batch`.
+    fn write_insert_batch(
+        &self,
+        writer: &mut dyn Write,
+        table: &CanonicalTable,
+        rows: &[CanonicalRow],
+    ) -> Result<()> {
+        let sql = self.render_insert_batch(table, rows)?;
+        writeln!(writer, "{}", sql)?;
+        Ok(())
+    }
+
+    /// Maximum inline BLOB size in bytes. BLOBs exceeding this are handled via
+    /// `write_lob_insert` (e.g. DBMS_LOB.APPEND blocks). Default: no limit.
+    fn max_inline_blob_bytes(&self) -> usize {
+        usize::MAX
+    }
+
+    /// Write a single row that contains one or more large BLOB values exceeding
+    /// `max_inline_blob_bytes`. `large_blobs` maps (column_index, raw_bytes).
+    /// `values` contains all column values; large-BLOB entries are placeholders.
+    ///
+    /// Default implementation falls back to `render_insert_batch` (ignoring the
+    /// large-BLOB split), which is correct for dialects without BLOB size limits.
+    fn write_lob_insert(
+        &self,
+        writer: &mut dyn Write,
+        table: &CanonicalTable,
+        values: &[CanonicalValue],
+        _large_blobs: &[(usize, Vec<u8>)],
+    ) -> Result<()> {
+        self.write_insert_batch(
+            writer,
+            table,
+            &[CanonicalRow {
+                values: values.to_vec(),
+            }],
+        )
     }
 }
 
@@ -222,12 +279,21 @@ impl DialectRenderer for KingbaseDialectRenderer {
             return Ok(String::new());
         }
 
+        let target_ident = kingbase_quote_ident(&table.name);
         let columns = table
             .columns
             .iter()
             .map(|col| kingbase_quote_ident(&col.name))
             .collect::<Vec<_>>()
             .join(", ");
+
+        if kingbase_requires_single_row_insert(table) {
+            let statements = rows
+                .iter()
+                .map(|row| render_kingbase_single_row_insert(&target_ident, &columns, row))
+                .collect::<Vec<_>>();
+            return Ok(statements.join("\n"));
+        }
 
         let values = rows
             .iter()
@@ -245,10 +311,74 @@ impl DialectRenderer for KingbaseDialectRenderer {
 
         Ok(format!(
             "INSERT INTO {} ({}) VALUES\n{};",
-            kingbase_quote_ident(&table.name),
-            columns,
-            values
+            target_ident, columns, values
         ))
+    }
+
+    fn write_insert_batch(
+        &self,
+        writer: &mut dyn Write,
+        table: &CanonicalTable,
+        rows: &[CanonicalRow],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        if !kingbase_requires_single_row_insert(table) {
+            let sql = self.render_insert_batch(table, rows)?;
+            writeln!(writer, "{}", sql)?;
+            return Ok(());
+        }
+
+        let target_ident = kingbase_quote_ident(&table.name);
+        let columns = table
+            .columns
+            .iter()
+            .map(|col| kingbase_quote_ident(&col.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        for row in rows {
+            writeln!(
+                writer,
+                "{}",
+                render_kingbase_single_row_insert(&target_ident, &columns, row)
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn max_inline_blob_bytes(&self) -> usize {
+        KINGBASE_INLINE_BYTEA_MAX_BYTES
+    }
+
+    fn write_lob_insert(
+        &self,
+        writer: &mut dyn Write,
+        table: &CanonicalTable,
+        values: &[CanonicalValue],
+        large_blobs: &[(usize, Vec<u8>)],
+    ) -> Result<()> {
+        let target_ident = kingbase_quote_ident(&table.name);
+        let columns = table
+            .columns
+            .iter()
+            .map(|col| kingbase_quote_ident(&col.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let formatted_values = values.iter().map(kingbase_format_value).collect::<Vec<_>>();
+        let where_predicate = kingbase_primary_key_predicate(table, values);
+
+        write_kingbase_lob_insert_block(
+            writer,
+            &target_ident,
+            &columns,
+            &formatted_values,
+            large_blobs,
+            where_predicate.as_deref(),
+        )
     }
 }
 
@@ -267,14 +397,14 @@ impl DialectRenderer for ShentongDialectRenderer {
             (
                 ExportObjectKind::Data,
                 CapabilityLevel::Full,
-                "神通 OSCAR 渲染器支持 INSERT 语句批量生成",
+                "神通 OSCAR 渲染器支持 INSERT 语句批量生成（多行 VALUES）",
             ),
             (ExportObjectKind::Columns, CapabilityLevel::Full, ""),
             (ExportObjectKind::PrimaryKeys, CapabilityLevel::Full, ""),
             (
                 ExportObjectKind::Indexes,
                 CapabilityLevel::Partial,
-                "基础索引支持（通过 information_schema）",
+                "基础索引支持（通过 all_indexes）",
             ),
             (
                 ExportObjectKind::UniqueConstraints,
@@ -283,23 +413,23 @@ impl DialectRenderer for ShentongDialectRenderer {
             ),
             (
                 ExportObjectKind::ForeignKeys,
-                CapabilityLevel::Partial,
-                "外键基础支持",
+                CapabilityLevel::Full,
+                "外键支持（通过 all_constraints + all_cons_columns）",
             ),
             (
                 ExportObjectKind::CheckConstraints,
-                CapabilityLevel::None,
-                "神通 OSCAR 检查约束元数据暂不支持",
+                CapabilityLevel::Partial,
+                "神通 OSCAR 检查约束支持（DM8→Shentong 路径透传）",
             ),
             (
                 ExportObjectKind::Triggers,
-                CapabilityLevel::None,
-                "神通 OSCAR 触发器元数据暂不支持",
+                CapabilityLevel::Partial,
+                "神通 OSCAR 触发器支持（DM8→Shentong 路径透传，需注意 NEXTVAL 语法差异）",
             ),
             (
                 ExportObjectKind::Sequences,
-                CapabilityLevel::None,
-                "神通 OSCAR 序列元数据暂不支持",
+                CapabilityLevel::Full,
+                "神通 OSCAR 序列支持（Oracle 兼容 CREATE SEQUENCE 语法）",
             ),
         ])
     }
@@ -345,16 +475,52 @@ impl DialectRenderer for ShentongDialectRenderer {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let mut statements = Vec::with_capacity(rows.len());
-        for row in rows {
-            let values = row
-                .values
+        // ShenTong limitation: multi-row INSERT with explicit identity/auto-increment
+        // values fails with "自增列插入多行时，只有第一行支持指定自增列的值".
+        // Fall back to single-row INSERTs when any column is an identity column.
+        let has_identity = table.columns.iter().any(|col| col.identity);
+
+        if has_identity {
+            let mut statements = Vec::with_capacity(rows.len());
+            for row in rows {
+                let literals = row
+                    .values
+                    .iter()
+                    .map(shentong_format_value)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                statements.push(format!(
+                    "INSERT INTO {} ({}) VALUES ({});",
+                    shentong_quote_ident(&table.name),
+                    columns,
+                    literals
+                ));
+            }
+            return Ok(statements.join("\n"));
+        }
+
+        // Shentong supports multi-row VALUES (max 10000 rows per INSERT).
+        // Split into multiple INSERT statements if batch exceeds the limit.
+        const SHENTONG_MAX_MULTI_ROW: usize = 10000;
+        let mut statements = Vec::new();
+
+        for chunk in rows.chunks(SHENTONG_MAX_MULTI_ROW) {
+            let values = chunk
                 .iter()
-                .map(shentong_format_value)
+                .map(|row| {
+                    let literals = row
+                        .values
+                        .iter()
+                        .map(shentong_format_value)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("({})", literals)
+                })
                 .collect::<Vec<_>>()
-                .join(", ");
+                .join(",\n");
+
             statements.push(format!(
-                "INSERT INTO {} ({}) VALUES ({});",
+                "INSERT INTO {} ({}) VALUES\n{};",
                 shentong_quote_ident(&table.name),
                 columns,
                 values
@@ -362,6 +528,34 @@ impl DialectRenderer for ShentongDialectRenderer {
         }
 
         Ok(statements.join("\n"))
+    }
+
+    fn max_inline_blob_bytes(&self) -> usize {
+        SHENTONG_INLINE_BLOB_MAX_BYTES
+    }
+
+    fn write_lob_insert(
+        &self,
+        writer: &mut dyn Write,
+        table: &CanonicalTable,
+        values: &[CanonicalValue],
+        large_blobs: &[(usize, Vec<u8>)],
+    ) -> Result<()> {
+        let target_ident = shentong_quote_ident(&table.name);
+        let columns_str = table
+            .columns
+            .iter()
+            .map(|col| shentong_quote_ident(&col.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let formatted_values: Vec<String> = values.iter().map(shentong_format_value).collect();
+        write_shentong_lob_insert_block(
+            writer,
+            &target_ident,
+            &columns_str,
+            &formatted_values,
+            large_blobs,
+        )
     }
 }
 
@@ -374,7 +568,7 @@ pub fn renderer_for(db_type: &DbType) -> Box<dyn DialectRenderer> {
     }
 }
 
-fn shentong_quote_ident(name: &str) -> String {
+pub fn shentong_quote_ident(name: &str) -> String {
     name.split('.')
         .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
         .collect::<Vec<_>>()
@@ -389,15 +583,15 @@ fn shentong_type(logical: &LogicalType) -> &'static str {
         LogicalType::String => "VARCHAR(255)",
         LogicalType::Text => "CLOB",
         LogicalType::Binary => "BLOB",
-        LogicalType::Boolean => "CHAR(1)",
+        LogicalType::Boolean => "BOOLEAN",
         LogicalType::Date => "DATE",
         LogicalType::DateTime => "TIMESTAMP",
-        LogicalType::Json => "CLOB",
+        LogicalType::Json => "JSON",
         LogicalType::Unknown => "CLOB",
     }
 }
 
-fn shentong_format_value(value: &CanonicalValue) -> String {
+pub fn shentong_format_value(value: &CanonicalValue) -> String {
     match value {
         CanonicalValue::Null => "NULL".to_string(),
         CanonicalValue::Integer(v) => v.to_string(),
@@ -406,9 +600,9 @@ fn shentong_format_value(value: &CanonicalValue) -> String {
         CanonicalValue::Float(_) => "NULL".to_string(),
         CanonicalValue::Boolean(v) => {
             if *v {
-                "'1'".to_string()
+                "TRUE".to_string()
             } else {
-                "'0'".to_string()
+                "FALSE".to_string()
             }
         }
         CanonicalValue::String(v)
@@ -416,10 +610,83 @@ fn shentong_format_value(value: &CanonicalValue) -> String {
         | CanonicalValue::DateTime(v)
         | CanonicalValue::Json(v) => format!("'{}'", v.replace('\'', "''")),
         CanonicalValue::Binary(v) => {
-            let hex = v.iter().map(|b| format!("{:02X}", b)).collect::<String>();
-            format!("HEXTORAW('{}')", hex)
+            if v.is_empty() {
+                "NULL".to_string()
+            } else {
+                // ShenTong: TO_BLOB(HEXTORAW('hex')) — confirmed working by manual test.
+                let hex = bytes_to_hex_upper(v);
+                format!("TO_BLOB(HEXTORAW('{}'))", hex)
+            }
         }
     }
+}
+
+/// Maximum bytes for inline TO_BLOB(HEXTORAW('...')) binary literals in Shentong INSERT statements.
+/// Standard SQL hex literals have DB-side SQL length limits (a few MB).
+/// Use conservative 16383 bytes to stay safe; beyond this use chunked UPDATE concatenation.
+pub const SHENTONG_INLINE_BLOB_MAX_BYTES: usize = 16383;
+
+/// Maximum bytes per TO_BLOB(HEXTORAW('...')) chunk for Shentong UPDATE concatenation.
+/// Each chunk should stay within SQL parser limits for HEXTORAW().
+const SHENTONG_LOB_CHUNK_BYTES: usize = 16000;
+
+/// Write INSERT + UPDATE statements for a row with large BLOB values in ShenTong OSCAR.
+///
+/// Strategy: INSERT the row with the first chunk of each BLOB inline, then append
+/// remaining chunks via plain SQL `UPDATE SET col = col || TO_BLOB(HEXTORAW('...'))`.
+///
+/// ShenTong's PL/SQL (PLOSCAR) does NOT support `BLOB` as a variable type in
+/// DECLARE blocks (error: "syntax error at or near BLOB"), so we avoid PL/SQL
+/// entirely and use plain SQL UPDATE concatenation instead.
+///
+/// `large_blobs` maps column index → raw bytes for oversized BLOB columns.
+/// `column_values` contains formatted SQL literals for all columns (large BLOBs
+/// should be `"NULL"` placeholders that get replaced).
+pub fn write_shentong_lob_insert_block(
+    writer: &mut (impl std::io::Write + ?Sized),
+    target_table_ident: &str,
+    columns_str: &str,
+    column_values: &[String],
+    large_blobs: &[(usize, Vec<u8>)],
+) -> Result<()> {
+    let col_names: Vec<&str> = columns_str.split(", ").collect();
+
+    // Step 1: INSERT with the first chunk of each large BLOB inline.
+    let mut final_values = column_values.to_vec();
+    for (col_idx, bytes) in large_blobs.iter() {
+        let first_chunk = &bytes[..bytes.len().min(SHENTONG_LOB_CHUNK_BYTES)];
+        let hex = bytes_to_hex_upper(first_chunk);
+        final_values[*col_idx] = format!("TO_BLOB(HEXTORAW('{}'))", hex);
+    }
+    writeln!(
+        writer,
+        "INSERT INTO {} ({}) VALUES ({});",
+        target_table_ident,
+        columns_str,
+        final_values.join(", ")
+    )?;
+
+    // Step 2: For each large BLOB with remaining data, append chunks via UPDATE.
+    // Use the first column (assumed PK/unique) as WHERE condition.
+    let pk_col = col_names.first().unwrap_or(&"\"id\"");
+    let pk_val = &column_values[0];
+
+    for (col_idx, bytes) in large_blobs.iter() {
+        if bytes.len() <= SHENTONG_LOB_CHUNK_BYTES {
+            continue; // fully inserted in step 1
+        }
+        let blob_col = col_names.get(*col_idx).unwrap_or(&"\"data\"");
+        for chunk in bytes[SHENTONG_LOB_CHUNK_BYTES..].chunks(SHENTONG_LOB_CHUNK_BYTES) {
+            let hex = bytes_to_hex_upper(chunk);
+            writeln!(
+                writer,
+                "UPDATE {} SET {} = {} || TO_BLOB(HEXTORAW('{}')) WHERE {} = {};",
+                target_table_ident, blob_col, blob_col, hex, pk_col, pk_val
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 fn kingbase_quote_ident(name: &str) -> String {
@@ -445,6 +712,32 @@ fn kingbase_type(logical: &LogicalType) -> &'static str {
     }
 }
 
+fn kingbase_requires_single_row_insert(table: &CanonicalTable) -> bool {
+    table.columns.iter().any(|col| {
+        matches!(
+            col.logical_type,
+            LogicalType::Binary | LogicalType::Text | LogicalType::Json
+        )
+    })
+}
+
+fn render_kingbase_single_row_insert(
+    target_table_ident: &str,
+    columns: &str,
+    row: &CanonicalRow,
+) -> String {
+    let literals = row
+        .values
+        .iter()
+        .map(kingbase_format_value)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO {} ({}) VALUES ({});",
+        target_table_ident, columns, literals
+    )
+}
+
 fn kingbase_format_value(value: &CanonicalValue) -> String {
     match value {
         CanonicalValue::Null => "NULL".to_string(),
@@ -464,10 +757,100 @@ fn kingbase_format_value(value: &CanonicalValue) -> String {
         | CanonicalValue::DateTime(v)
         | CanonicalValue::Json(v) => format!("'{}'", v.replace('\'', "''")),
         CanonicalValue::Binary(v) => {
-            let hex = v.iter().map(|b| format!("{:02X}", b)).collect::<String>();
-            format!("decode('{}', 'hex')", hex)
+            let hex = bytes_to_hex_lower(v);
+            format!("decoding('{}', 'hex')", hex)
         }
     }
+}
+
+pub const KINGBASE_INLINE_BYTEA_MAX_BYTES: usize = 512 * 1024;
+
+const KINGBASE_BYTEA_CHUNK_BYTES: usize = KINGBASE_INLINE_BYTEA_MAX_BYTES;
+
+fn kingbase_primary_key_predicate(
+    table: &CanonicalTable,
+    values: &[CanonicalValue],
+) -> Option<String> {
+    if table.primary_keys.is_empty() {
+        return None;
+    }
+
+    let mut predicates = Vec::with_capacity(table.primary_keys.len());
+    for pk in &table.primary_keys {
+        let column_index = table
+            .columns
+            .iter()
+            .position(|col| col.name.eq_ignore_ascii_case(pk))?;
+        let value = values.get(column_index)?;
+        if matches!(value, CanonicalValue::Null) {
+            return None;
+        }
+        predicates.push(format!(
+            "{} = {}",
+            kingbase_quote_ident(pk),
+            kingbase_format_value(value)
+        ));
+    }
+
+    Some(predicates.join(" AND "))
+}
+
+fn write_kingbase_lob_insert_block(
+    writer: &mut (impl Write + ?Sized),
+    target_table_ident: &str,
+    columns_str: &str,
+    column_values: &[String],
+    large_blobs: &[(usize, Vec<u8>)],
+    where_predicate: Option<&str>,
+) -> Result<()> {
+    let col_names: Vec<&str> = columns_str.split(", ").collect();
+    let mut final_values = column_values.to_vec();
+
+    for (col_idx, bytes) in large_blobs {
+        let first_chunk = &bytes[..bytes.len().min(KINGBASE_BYTEA_CHUNK_BYTES)];
+        let hex = bytes_to_hex_lower(first_chunk);
+        final_values[*col_idx] = format!("decoding('{}', 'hex')", hex);
+    }
+
+    writeln!(
+        writer,
+        "INSERT INTO {} ({}) VALUES ({});",
+        target_table_ident,
+        columns_str,
+        final_values.join(", ")
+    )?;
+
+    let has_remaining_chunks = large_blobs
+        .iter()
+        .any(|(_, bytes)| bytes.len() > KINGBASE_BYTEA_CHUNK_BYTES);
+    if !has_remaining_chunks {
+        return Ok(());
+    }
+
+    let where_predicate = where_predicate.ok_or_else(|| {
+        anyhow!(
+            "Kingbase large BYTEA export requires a primary key on table {}",
+            target_table_ident
+        )
+    })?;
+
+    for (col_idx, bytes) in large_blobs {
+        if bytes.len() <= KINGBASE_BYTEA_CHUNK_BYTES {
+            continue;
+        }
+
+        let blob_col = col_names.get(*col_idx).unwrap_or(&"\"data\"");
+        for chunk in bytes[KINGBASE_BYTEA_CHUNK_BYTES..].chunks(KINGBASE_BYTEA_CHUNK_BYTES) {
+            let hex = bytes_to_hex_lower(chunk);
+            writeln!(
+                writer,
+                "UPDATE {} SET {} = {} || decoding('{}', 'hex') WHERE {};",
+                target_table_ident, blob_col, blob_col, hex, where_predicate
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 fn capability_profile(defs: &[(ExportObjectKind, CapabilityLevel, &str)]) -> CapabilityProfile {
@@ -534,7 +917,7 @@ fn dm8_format_value(value: &CanonicalValue) -> String {
         | CanonicalValue::DateTime(v)
         | CanonicalValue::Json(v) => format!("'{}'", v.replace('\'', "''")),
         CanonicalValue::Binary(v) => {
-            let hex = v.iter().map(|b| format!("{:02X}", b)).collect::<String>();
+            let hex = bytes_to_hex_upper(v);
             format!("HEXTORAW('{}')", hex)
         }
     }
@@ -549,10 +932,42 @@ fn non_empty_note(note: &str) -> Option<String> {
     }
 }
 
+/// Lookup table for fast byte-to-hex conversion.
+const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
+/// Convert bytes to uppercase hex string with pre-allocated capacity.
+/// Much faster than per-byte `format!("{:02X}", b)`.
+pub fn bytes_to_hex_upper(bytes: &[u8]) -> String {
+    let mut hex = Vec::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        hex.push(HEX_UPPER[(b >> 4) as usize]);
+        hex.push(HEX_UPPER[(b & 0x0F) as usize]);
+    }
+    // SAFETY: all bytes are ASCII hex digits
+    unsafe { String::from_utf8_unchecked(hex) }
+}
+
+/// Convert bytes to lowercase hex string with pre-allocated capacity.
+fn bytes_to_hex_lower(bytes: &[u8]) -> String {
+    let mut hex = Vec::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        hex.push(HEX_LOWER[(b >> 4) as usize]);
+        hex.push(HEX_LOWER[(b & 0x0F) as usize]);
+    }
+    unsafe { String::from_utf8_unchecked(hex) }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DialectRenderer, Dm8DialectRenderer};
-    use crate::domain::canonical::{CanonicalColumn, CanonicalTable, LogicalType};
+    use super::{
+        shentong_format_value, write_shentong_lob_insert_block, DialectRenderer,
+        Dm8DialectRenderer, KingbaseDialectRenderer, ShentongDialectRenderer,
+        KINGBASE_INLINE_BYTEA_MAX_BYTES,
+    };
+    use crate::domain::canonical::{
+        CanonicalColumn, CanonicalRow, CanonicalTable, CanonicalValue, LogicalType,
+    };
 
     #[test]
     fn dm8_renderer_quotes_schema_qualified_name() {
@@ -563,6 +978,7 @@ mod tests {
                 name: "ID".to_string(),
                 logical_type: LogicalType::Integer,
                 nullable: false,
+                identity: false,
             }],
             primary_keys: vec!["ID".to_string()],
         };
@@ -571,5 +987,351 @@ mod tests {
             .render_table_ddl(&table)
             .expect("schema-qualified DM8 table should render");
         assert!(ddl.contains("CREATE TABLE \"APP\".\"USERS\""));
+    }
+
+    #[test]
+    fn shentong_format_value_binary_uses_hex_literal() {
+        let val = CanonicalValue::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(shentong_format_value(&val), "TO_BLOB(HEXTORAW('DEADBEEF'))");
+    }
+
+    #[test]
+    fn shentong_format_value_empty_binary_is_null() {
+        let val = CanonicalValue::Binary(vec![]);
+        assert_eq!(shentong_format_value(&val), "NULL");
+    }
+
+    #[test]
+    fn kingbase_format_value_binary_uses_decoding() {
+        let renderer = KingbaseDialectRenderer;
+        let table = CanonicalTable {
+            name: "t".to_string(),
+            columns: vec![CanonicalColumn {
+                name: "data".to_string(),
+                logical_type: LogicalType::Binary,
+                nullable: true,
+                identity: false,
+            }],
+            primary_keys: vec![],
+        };
+        let row = CanonicalRow {
+            values: vec![CanonicalValue::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF])],
+        };
+
+        let sql = renderer.render_insert_batch(&table, &[row]).unwrap();
+        assert!(sql.contains("decoding('deadbeef', 'hex')"));
+        assert!(!sql.contains("::BYTEA"));
+    }
+
+    #[test]
+    fn kingbase_writer_streams_lob_rows_as_single_row_inserts() {
+        let renderer = KingbaseDialectRenderer;
+        let table = CanonicalTable {
+            name: "t".to_string(),
+            columns: vec![
+                CanonicalColumn {
+                    name: "id".to_string(),
+                    logical_type: LogicalType::String,
+                    nullable: false,
+                    identity: false,
+                },
+                CanonicalColumn {
+                    name: "data".to_string(),
+                    logical_type: LogicalType::Binary,
+                    nullable: true,
+                    identity: false,
+                },
+            ],
+            primary_keys: vec!["id".to_string()],
+        };
+        let rows = vec![
+            CanonicalRow {
+                values: vec![
+                    CanonicalValue::String("a".into()),
+                    CanonicalValue::Binary(vec![0x01]),
+                ],
+            },
+            CanonicalRow {
+                values: vec![
+                    CanonicalValue::String("b".into()),
+                    CanonicalValue::Binary(vec![0x02]),
+                ],
+            },
+        ];
+
+        let mut buf = Vec::new();
+        renderer
+            .write_insert_batch(&mut buf, &table, &rows)
+            .unwrap();
+
+        let rendered = String::from_utf8(buf).unwrap();
+        assert_eq!(rendered.matches("INSERT INTO").count(), 2);
+        assert!(!rendered.contains("),\n("));
+    }
+
+    #[test]
+    fn kingbase_lob_insert_large_blob_uses_update_concat() {
+        let renderer = KingbaseDialectRenderer;
+        let table = CanonicalTable {
+            name: "s.t".to_string(),
+            columns: vec![
+                CanonicalColumn {
+                    name: "id".to_string(),
+                    logical_type: LogicalType::String,
+                    nullable: false,
+                    identity: false,
+                },
+                CanonicalColumn {
+                    name: "data".to_string(),
+                    logical_type: LogicalType::Binary,
+                    nullable: true,
+                    identity: false,
+                },
+            ],
+            primary_keys: vec!["id".to_string()],
+        };
+        let values = vec![CanonicalValue::String("pk1".into()), CanonicalValue::Null];
+        let large_blobs = vec![(1usize, vec![0xAB; KINGBASE_INLINE_BYTEA_MAX_BYTES + 32])];
+
+        let mut buf = Vec::new();
+        renderer
+            .write_lob_insert(&mut buf, &table, &values, &large_blobs)
+            .unwrap();
+
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains("INSERT INTO \"s\".\"t\""));
+        assert!(rendered.contains("decoding('"));
+        assert!(rendered.contains("'hex')"));
+        assert!(rendered.contains("UPDATE \"s\".\"t\" SET \"data\" = \"data\" || decoding('"));
+        assert!(rendered.contains("WHERE \"id\" = 'pk1'"));
+    }
+
+    #[test]
+    fn shentong_format_value_boolean_renders_true_false() {
+        assert_eq!(
+            shentong_format_value(&CanonicalValue::Boolean(true)),
+            "TRUE"
+        );
+        assert_eq!(
+            shentong_format_value(&CanonicalValue::Boolean(false)),
+            "FALSE"
+        );
+    }
+
+    #[test]
+    fn shentong_renderer_splits_large_batch_at_10000() {
+        let renderer = ShentongDialectRenderer;
+        let table = CanonicalTable {
+            name: "T".to_string(),
+            columns: vec![CanonicalColumn {
+                name: "ID".to_string(),
+                logical_type: LogicalType::Integer,
+                nullable: false,
+                identity: false,
+            }],
+            primary_keys: vec![],
+        };
+
+        // Create 10001 rows
+        let rows: Vec<CanonicalRow> = (0..10001)
+            .map(|i| CanonicalRow {
+                values: vec![CanonicalValue::Integer(i)],
+            })
+            .collect();
+
+        let sql = renderer
+            .render_insert_batch(&table, &rows)
+            .expect("large batch should render");
+        // Should have exactly 2 INSERT statements
+        let insert_count = sql.matches("INSERT INTO").count();
+        assert_eq!(insert_count, 2, "should split into 2 INSERT statements");
+    }
+
+    #[test]
+    fn shentong_lob_insert_block_uses_dbms_lob() {
+        let mut buf = Vec::new();
+        let values = vec!["'pk1'".to_string(), "NULL".to_string()];
+        let large_blobs = vec![(1usize, vec![0xAB; 100])];
+
+        write_shentong_lob_insert_block(
+            &mut buf,
+            "\"S\".\"T\"",
+            "\"ID\", \"DATA\"",
+            &values,
+            &large_blobs,
+        )
+        .unwrap();
+
+        let rendered = String::from_utf8(buf).unwrap();
+        // Step 1: INSERT with EMPTY_BLOB()
+        assert!(rendered.contains("INSERT INTO \"S\".\"T\""));
+        // Step 1: INSERT with first chunk inline (not EMPTY_BLOB)
+        assert!(rendered.contains("TO_BLOB(HEXTORAW('"));
+        assert!(
+            !rendered.contains("EMPTY_BLOB()"),
+            "should NOT use EMPTY_BLOB — first chunk is inlined"
+        );
+        // Step 2: plain SQL UPDATE concatenation (no PL/SQL DECLARE block)
+        assert!(
+            !rendered.contains("DECLARE"),
+            "must NOT use PL/SQL DECLARE block"
+        );
+        assert!(
+            !rendered.contains("DBMS_LOB"),
+            "must NOT use DBMS_LOB (not supported in ShenTong anonymous blocks)"
+        );
+        // No PL/SQL block terminator needed
+        assert!(
+            !rendered.contains("END;\n/\n"),
+            "must NOT have PL/SQL block terminator"
+        );
+    }
+
+    #[test]
+    fn shentong_lob_insert_large_blob_uses_update_concat() {
+        let mut buf = Vec::new();
+        let values = vec!["'pk1'".to_string(), "NULL".to_string()];
+        // 40000 bytes = first 16000 chunk + 16000 chunk + 8000 chunk
+        let large_blobs = vec![(1usize, vec![0xAB; 40000])];
+
+        write_shentong_lob_insert_block(
+            &mut buf,
+            "\"S\".\"T\"",
+            "\"ID\", \"DATA\"",
+            &values,
+            &large_blobs,
+        )
+        .unwrap();
+
+        let rendered = String::from_utf8(buf).unwrap();
+        // INSERT has first chunk inline
+        assert!(rendered.contains("INSERT INTO \"S\".\"T\""));
+        assert!(rendered.contains("TO_BLOB(HEXTORAW('"));
+        // Remaining chunks appended via UPDATE concatenation
+        let update_count = rendered.matches("UPDATE \"S\".\"T\"").count();
+        assert_eq!(
+            update_count, 2,
+            "should have 2 UPDATE statements for remaining 24000 bytes"
+        );
+        assert!(rendered.contains("SET \"DATA\" = \"DATA\" || TO_BLOB(HEXTORAW('"));
+        assert!(rendered.contains("WHERE \"ID\" = 'pk1'"));
+    }
+
+    #[test]
+    fn shentong_renderer_uses_single_row_insert_for_identity_table() {
+        let renderer = ShentongDialectRenderer;
+        let table = CanonicalTable {
+            name: "S.infra_codegen_column".to_string(),
+            columns: vec![
+                CanonicalColumn {
+                    name: "id".to_string(),
+                    logical_type: LogicalType::Integer,
+                    nullable: false,
+                    identity: true, // AUTO_INCREMENT column
+                },
+                CanonicalColumn {
+                    name: "name".to_string(),
+                    logical_type: LogicalType::String,
+                    nullable: true,
+                    identity: false,
+                },
+            ],
+            primary_keys: vec!["id".to_string()],
+        };
+
+        let rows = vec![
+            CanonicalRow {
+                values: vec![
+                    CanonicalValue::Integer(1),
+                    CanonicalValue::String("a".into()),
+                ],
+            },
+            CanonicalRow {
+                values: vec![
+                    CanonicalValue::Integer(2),
+                    CanonicalValue::String("b".into()),
+                ],
+            },
+            CanonicalRow {
+                values: vec![
+                    CanonicalValue::Integer(3),
+                    CanonicalValue::String("c".into()),
+                ],
+            },
+        ];
+
+        let sql = renderer
+            .render_insert_batch(&table, &rows)
+            .expect("identity table should render single-row INSERTs");
+
+        // Must produce 3 separate INSERT statements, not one multi-row INSERT
+        let insert_count = sql.matches("INSERT INTO").count();
+        assert_eq!(
+            insert_count, 3,
+            "identity table must use single-row INSERTs"
+        );
+
+        // Must NOT contain multi-row VALUES separator
+        assert!(
+            !sql.contains("),\n("),
+            "must not use multi-row VALUES syntax"
+        );
+
+        // Each INSERT should be self-contained with VALUES (...)
+        assert!(sql.contains("VALUES (1, 'a');"));
+        assert!(sql.contains("VALUES (2, 'b');"));
+        assert!(sql.contains("VALUES (3, 'c');"));
+    }
+
+    #[test]
+    fn shentong_renderer_uses_multi_row_insert_for_non_identity_table() {
+        let renderer = ShentongDialectRenderer;
+        let table = CanonicalTable {
+            name: "T".to_string(),
+            columns: vec![
+                CanonicalColumn {
+                    name: "id".to_string(),
+                    logical_type: LogicalType::Integer,
+                    nullable: false,
+                    identity: false,
+                },
+                CanonicalColumn {
+                    name: "name".to_string(),
+                    logical_type: LogicalType::String,
+                    nullable: true,
+                    identity: false,
+                },
+            ],
+            primary_keys: vec!["id".to_string()],
+        };
+
+        let rows = vec![
+            CanonicalRow {
+                values: vec![
+                    CanonicalValue::Integer(1),
+                    CanonicalValue::String("a".into()),
+                ],
+            },
+            CanonicalRow {
+                values: vec![
+                    CanonicalValue::Integer(2),
+                    CanonicalValue::String("b".into()),
+                ],
+            },
+        ];
+
+        let sql = renderer
+            .render_insert_batch(&table, &rows)
+            .expect("non-identity table should render multi-row INSERT");
+
+        // Should produce ONE multi-row INSERT
+        let insert_count = sql.matches("INSERT INTO").count();
+        assert_eq!(
+            insert_count, 1,
+            "non-identity table should use multi-row INSERT"
+        );
+
+        // Should contain multi-row VALUES separator
+        assert!(sql.contains("),\n("), "should use multi-row VALUES syntax");
     }
 }

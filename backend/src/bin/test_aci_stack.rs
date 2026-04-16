@@ -15,7 +15,11 @@ extern "system" {
 fn get_fn(module: *mut c_void, name: &str) -> Option<*mut c_void> {
     let cname = CString::new(name).unwrap();
     let ptr = unsafe { GetProcAddress(module, cname.as_ptr() as *const u8) };
-    if ptr.is_null() { None } else { Some(ptr) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
 }
 
 fn main() {
@@ -50,27 +54,57 @@ fn run(aci_dir: Option<String>) {
         None => "aci.dll\0".to_string(),
     };
     let module = unsafe { LoadLibraryA(dll_path.as_ptr()) };
-    if module.is_null() { eprintln!("LoadLibraryA failed!"); return; }
+    if module.is_null() {
+        eprintln!("LoadLibraryA failed!");
+        return;
+    }
     println!("DLL: {:p}", module);
 
-    type FnEnvNls = unsafe extern "C" fn(*mut *mut c_void, u32, *mut c_void, *mut c_void,
-        *mut c_void, *mut c_void, usize, *mut *mut c_void, u16, u16) -> i32;
-    type FnAlloc = unsafe extern "C" fn(*mut c_void, *mut *mut c_void, u32, usize, *mut *mut c_void) -> i32;
+    type FnEnvNls = unsafe extern "C" fn(
+        *mut *mut c_void,
+        u32,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        usize,
+        *mut *mut c_void,
+        u16,
+        u16,
+    ) -> i32;
+    type FnAlloc =
+        unsafe extern "C" fn(*mut c_void, *mut *mut c_void, u32, usize, *mut *mut c_void) -> i32;
     type FnAttach = unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, i32, u32) -> i32;
-    type FnAttrSet = unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32, u32, *mut c_void) -> i32;
+    type FnAttrSet =
+        unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32, u32, *mut c_void) -> i32;
     type FnSessBegin = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u32) -> i32;
-    type FnErrGet = unsafe extern "C" fn(*mut c_void, u32, *const u8, *mut i32, *mut u8, u32, u32) -> i32;
+    type FnErrGet =
+        unsafe extern "C" fn(*mut c_void, u32, *const u8, *mut i32, *mut u8, u32, u32) -> i32;
 
-    let env_nls: FnEnvNls = unsafe { std::mem::transmute(get_fn(module, "ACIEnvNlsCreate").unwrap()) };
+    let env_nls: FnEnvNls =
+        unsafe { std::mem::transmute(get_fn(module, "ACIEnvNlsCreate").unwrap()) };
     let alloc: FnAlloc = unsafe { std::mem::transmute(get_fn(module, "ACIHandleAlloc").unwrap()) };
-    let attach: FnAttach = unsafe { std::mem::transmute(get_fn(module, "ACIServerAttach").unwrap()) };
+    let attach: FnAttach =
+        unsafe { std::mem::transmute(get_fn(module, "ACIServerAttach").unwrap()) };
     let attr_set: FnAttrSet = unsafe { std::mem::transmute(get_fn(module, "ACIAttrSet").unwrap()) };
-    let sess_begin: FnSessBegin = unsafe { std::mem::transmute(get_fn(module, "ACISessionBegin").unwrap()) };
+    let sess_begin: FnSessBegin =
+        unsafe { std::mem::transmute(get_fn(module, "ACISessionBegin").unwrap()) };
     let err_get: FnErrGet = unsafe { std::mem::transmute(get_fn(module, "ACIErrorGet").unwrap()) };
 
     let get_error = |err_h: *mut c_void| {
-        let mut buf = vec![0u8; 256]; let mut code: i32 = 0;
-        unsafe { err_get(err_h, 1, std::ptr::null(), &mut code, buf.as_mut_ptr(), 256, 2); }
+        let mut buf = vec![0u8; 256];
+        let mut code: i32 = 0;
+        unsafe {
+            err_get(
+                err_h,
+                1,
+                std::ptr::null(),
+                &mut code,
+                buf.as_mut_ptr(),
+                256,
+                2,
+            );
+        }
         let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         (code, String::from_utf8_lossy(&buf[..end]).to_string())
     };
@@ -80,8 +114,20 @@ fn run(aci_dir: Option<String>) {
     {
         // localhost - these variables stay ALIVE in this block
         let mut env1: *mut c_void = std::ptr::null_mut();
-        let rc = unsafe { env_nls(&mut env1, 2, std::ptr::null_mut(), std::ptr::null_mut(),
-            std::ptr::null_mut(), std::ptr::null_mut(), 0, std::ptr::null_mut(), 871, 871) };
+        let rc = unsafe {
+            env_nls(
+                &mut env1,
+                2,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                871,
+                871,
+            )
+        };
         let mut err1: *mut c_void = std::ptr::null_mut();
         let mut svc1: *mut c_void = std::ptr::null_mut();
         let mut srv1: *mut c_void = std::ptr::null_mut();
@@ -94,13 +140,28 @@ fn run(aci_dir: Option<String>) {
             let cs = b"localhost:2003/osrdb";
             let rc2 = unsafe { attach(srv1, err1, cs.as_ptr(), cs.len() as i32, 0) };
             println!("  localhost attach: rc={}", rc2);
-            if rc2 != 0 { let (c, m) = get_error(err1); println!("  Prime error: code={} '{}'", c, m); }
+            if rc2 != 0 {
+                let (c, m) = get_error(err1);
+                println!("  Prime error: code={} '{}'", c, m);
+            }
         }
 
         // Now 192.168.3.34 with a NEW env — but env1/err1/svc1/srv1 still ALIVE here!
         let mut env2: *mut c_void = std::ptr::null_mut();
-        let rc = unsafe { env_nls(&mut env2, 2, std::ptr::null_mut(), std::ptr::null_mut(),
-            std::ptr::null_mut(), std::ptr::null_mut(), 0, std::ptr::null_mut(), 871, 871) };
+        let rc = unsafe {
+            env_nls(
+                &mut env2,
+                2,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                871,
+                871,
+            )
+        };
         println!("  EnvNlsCreate(192): rc={}", rc);
         if rc == 0 && !env2.is_null() {
             let mut err2: *mut c_void = std::ptr::null_mut();
@@ -121,7 +182,8 @@ fn run(aci_dir: Option<String>) {
                 unsafe {
                     attr_set(svc2, 3, srv2, 0, 6, err2);
                     alloc(env2, &mut ses, 9, 0, std::ptr::null_mut());
-                    let u = b"sysdba"; let p = b"szoscar55";
+                    let u = b"sysdba";
+                    let p = b"szoscar55";
                     attr_set(ses, 9, u.as_ptr() as *mut c_void, u.len() as u32, 22, err2);
                     attr_set(ses, 9, p.as_ptr() as *mut c_void, p.len() as u32, 23, err2);
                     attr_set(svc2, 3, ses, 0, 7, err2);
@@ -141,4 +203,6 @@ fn run(aci_dir: Option<String>) {
 }
 
 #[cfg(not(windows))]
-fn run(_: Option<String>) { println!("Windows only"); }
+fn run(_: Option<String>) {
+    println!("Windows only");
+}

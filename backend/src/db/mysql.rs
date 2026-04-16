@@ -129,7 +129,11 @@ pub async fn get_tables(config: &ConnectionConfig) -> Result<Vec<Table>> {
     Ok(tables)
 }
 
-pub async fn get_table_details(config: &ConnectionConfig, schema: &str, table: &str) -> Result<TableDetails> {
+pub async fn get_table_details(
+    config: &ConnectionConfig,
+    schema: &str,
+    table: &str,
+) -> Result<TableDetails> {
     let table_name = table.trim();
     let schema_name = schema.trim();
     let pool = create_pool(config, 2).await?;
@@ -234,22 +238,20 @@ pub async fn get_table_details(config: &ConnectionConfig, schema: &str, table: &
         .collect::<Vec<_>>();
 
     let indexes = fetch_indexes(&pool, schema_name, table_name).await?;
-    let unique_constraints =
-        fetch_unique_constraints(&pool, schema_name, table_name).await?;
+    let unique_constraints = fetch_unique_constraints(&pool, schema_name, table_name).await?;
     let foreign_keys = fetch_foreign_keys(&pool, schema_name, table_name).await?;
-    let check_constraints =
-        match fetch_check_constraints(&pool, schema_name, table_name).await {
-            Ok(value) => value,
-            Err(err) => {
-                warn!(
-                    error = ?err,
-                    schema = %schema_name,
-                    table = %table_name,
-                    "Failed to query MySQL check constraints; continuing with empty list"
-                );
-                Vec::new()
-            }
-        };
+    let check_constraints = match fetch_check_constraints(&pool, schema_name, table_name).await {
+        Ok(value) => value,
+        Err(err) => {
+            warn!(
+                error = ?err,
+                schema = %schema_name,
+                table = %table_name,
+                "Failed to query MySQL check constraints; continuing with empty list"
+            );
+            Vec::new()
+        }
+    };
     let triggers = match fetch_triggers(&pool, schema_name, table_name).await {
         Ok(value) => value,
         Err(err) => {

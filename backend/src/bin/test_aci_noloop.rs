@@ -15,7 +15,11 @@ extern "system" {
 fn get_fn(module: *mut c_void, name: &str) -> Option<*mut c_void> {
     let cname = CString::new(name).unwrap();
     let ptr = unsafe { GetProcAddress(module, cname.as_ptr() as *const u8) };
-    if ptr.is_null() { None } else { Some(ptr) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
 }
 
 fn main() {
@@ -51,24 +55,45 @@ fn test(aci_dir: Option<String>) {
     };
 
     let module = unsafe { LoadLibraryA(dll_path.as_ptr()) };
-    if module.is_null() { eprintln!("LoadLibraryA failed!"); return; }
+    if module.is_null() {
+        eprintln!("LoadLibraryA failed!");
+        return;
+    }
     println!("DLL: {:p}", module);
 
-    type EnvNlsCreate = unsafe extern "C" fn(*mut *mut c_void, u32, *mut c_void, *mut c_void,
-        *mut c_void, *mut c_void, usize, *mut *mut c_void, u16, u16) -> i32;
-    type HandleAlloc = unsafe extern "C" fn(*mut c_void, *mut *mut c_void, u32, usize,
-        *mut *mut c_void) -> i32;
+    type EnvNlsCreate = unsafe extern "C" fn(
+        *mut *mut c_void,
+        u32,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        usize,
+        *mut *mut c_void,
+        u16,
+        u16,
+    ) -> i32;
+    type HandleAlloc =
+        unsafe extern "C" fn(*mut c_void, *mut *mut c_void, u32, usize, *mut *mut c_void) -> i32;
     type ServerAttach = unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, i32, u32) -> i32;
-    type AttrSet = unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32, u32, *mut c_void) -> i32;
-    type SessionBegin = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u32) -> i32;
-    type ErrorGet = unsafe extern "C" fn(*mut c_void, u32, *const u8, *mut i32, *mut u8, u32, u32) -> i32;
+    type AttrSet =
+        unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32, u32, *mut c_void) -> i32;
+    type SessionBegin =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u32) -> i32;
+    type ErrorGet =
+        unsafe extern "C" fn(*mut c_void, u32, *const u8, *mut i32, *mut u8, u32, u32) -> i32;
 
-    let env_nls: EnvNlsCreate = unsafe { std::mem::transmute(get_fn(module, "ACIEnvNlsCreate").unwrap()) };
-    let handle_alloc: HandleAlloc = unsafe { std::mem::transmute(get_fn(module, "ACIHandleAlloc").unwrap()) };
-    let server_attach: ServerAttach = unsafe { std::mem::transmute(get_fn(module, "ACIServerAttach").unwrap()) };
+    let env_nls: EnvNlsCreate =
+        unsafe { std::mem::transmute(get_fn(module, "ACIEnvNlsCreate").unwrap()) };
+    let handle_alloc: HandleAlloc =
+        unsafe { std::mem::transmute(get_fn(module, "ACIHandleAlloc").unwrap()) };
+    let server_attach: ServerAttach =
+        unsafe { std::mem::transmute(get_fn(module, "ACIServerAttach").unwrap()) };
     let attr_set: AttrSet = unsafe { std::mem::transmute(get_fn(module, "ACIAttrSet").unwrap()) };
-    let session_begin: SessionBegin = unsafe { std::mem::transmute(get_fn(module, "ACISessionBegin").unwrap()) };
-    let error_get: ErrorGet = unsafe { std::mem::transmute(get_fn(module, "ACIErrorGet").unwrap()) };
+    let session_begin: SessionBegin =
+        unsafe { std::mem::transmute(get_fn(module, "ACISessionBegin").unwrap()) };
+    let error_get: ErrorGet =
+        unsafe { std::mem::transmute(get_fn(module, "ACIErrorGet").unwrap()) };
 
     const ACI_HTYPE_ERROR: u32 = 2;
     const ACI_HTYPE_SVCCTX: u32 = 3;
@@ -86,7 +111,17 @@ fn test(aci_dir: Option<String>) {
     let get_error = |err_h: *mut c_void| {
         let mut buf = vec![0u8; 512];
         let mut code: i32 = 0;
-        unsafe { error_get(err_h, 1, std::ptr::null(), &mut code, buf.as_mut_ptr(), 512, ACI_HTYPE_ERROR); }
+        unsafe {
+            error_get(
+                err_h,
+                1,
+                std::ptr::null(),
+                &mut code,
+                buf.as_mut_ptr(),
+                512,
+                ACI_HTYPE_ERROR,
+            );
+        }
         let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         (code, String::from_utf8_lossy(&buf[..end]).to_string())
     };
@@ -96,22 +131,51 @@ fn test(aci_dir: Option<String>) {
     println!("\nTrying: 192.168.3.34:2003/osrdb (INLINE, no loop)");
     {
         let mut env_h: *mut c_void = std::ptr::null_mut();
-        let rc = unsafe { env_nls(&mut env_h, ACI_OBJECT, std::ptr::null_mut(), std::ptr::null_mut(),
-            std::ptr::null_mut(), std::ptr::null_mut(), 0, std::ptr::null_mut(), ACI_CHARSET_UTF8, ACI_CHARSET_UTF8) };
+        let rc = unsafe {
+            env_nls(
+                &mut env_h,
+                ACI_OBJECT,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                ACI_CHARSET_UTF8,
+                ACI_CHARSET_UTF8,
+            )
+        };
         println!("  EnvNlsCreate: rc={} env={:p}", rc, env_h);
-        if rc != 0 || env_h.is_null() { println!("  EnvNlsCreate FAILED"); return; }
+        if rc != 0 || env_h.is_null() {
+            println!("  EnvNlsCreate FAILED");
+            return;
+        }
 
         let mut err_h: *mut c_void = std::ptr::null_mut();
-        unsafe { handle_alloc(env_h, &mut err_h, ACI_HTYPE_ERROR, 0, std::ptr::null_mut()); }
+        unsafe {
+            handle_alloc(env_h, &mut err_h, ACI_HTYPE_ERROR, 0, std::ptr::null_mut());
+        }
 
         let mut svc_h: *mut c_void = std::ptr::null_mut();
-        unsafe { handle_alloc(env_h, &mut svc_h, ACI_HTYPE_SVCCTX, 0, std::ptr::null_mut()); }
+        unsafe {
+            handle_alloc(env_h, &mut svc_h, ACI_HTYPE_SVCCTX, 0, std::ptr::null_mut());
+        }
 
         let mut srv_h: *mut c_void = std::ptr::null_mut();
-        unsafe { handle_alloc(env_h, &mut srv_h, ACI_HTYPE_SERVER, 0, std::ptr::null_mut()); }
+        unsafe {
+            handle_alloc(env_h, &mut srv_h, ACI_HTYPE_SERVER, 0, std::ptr::null_mut());
+        }
 
         let cs_bytes = b"192.168.3.34:2003/osrdb";
-        let rc = unsafe { server_attach(srv_h, err_h, cs_bytes.as_ptr(), cs_bytes.len() as i32, ACI_DEFAULT) };
+        let rc = unsafe {
+            server_attach(
+                srv_h,
+                err_h,
+                cs_bytes.as_ptr(),
+                cs_bytes.len() as i32,
+                ACI_DEFAULT,
+            )
+        };
         println!("  ACIServerAttach: rc={}", rc);
         if rc != 0 {
             let (code, msg) = get_error(err_h);
@@ -119,15 +183,40 @@ fn test(aci_dir: Option<String>) {
             return;
         }
 
-        unsafe { attr_set(svc_h, ACI_HTYPE_SVCCTX, srv_h, 0, ACI_ATTR_SERVER, err_h); }
+        unsafe {
+            attr_set(svc_h, ACI_HTYPE_SVCCTX, srv_h, 0, ACI_ATTR_SERVER, err_h);
+        }
 
         let mut ses_h: *mut c_void = std::ptr::null_mut();
-        unsafe { handle_alloc(env_h, &mut ses_h, ACI_HTYPE_SESSION, 0, std::ptr::null_mut()); }
-
-        let user = b"sysdba"; let pwd = b"szoscar55";
         unsafe {
-            attr_set(ses_h, ACI_HTYPE_SESSION, user.as_ptr() as *mut c_void, user.len() as u32, ACI_ATTR_USERNAME, err_h);
-            attr_set(ses_h, ACI_HTYPE_SESSION, pwd.as_ptr() as *mut c_void, pwd.len() as u32, ACI_ATTR_PASSWORD, err_h);
+            handle_alloc(
+                env_h,
+                &mut ses_h,
+                ACI_HTYPE_SESSION,
+                0,
+                std::ptr::null_mut(),
+            );
+        }
+
+        let user = b"sysdba";
+        let pwd = b"szoscar55";
+        unsafe {
+            attr_set(
+                ses_h,
+                ACI_HTYPE_SESSION,
+                user.as_ptr() as *mut c_void,
+                user.len() as u32,
+                ACI_ATTR_USERNAME,
+                err_h,
+            );
+            attr_set(
+                ses_h,
+                ACI_HTYPE_SESSION,
+                pwd.as_ptr() as *mut c_void,
+                pwd.len() as u32,
+                ACI_ATTR_PASSWORD,
+                err_h,
+            );
             attr_set(svc_h, ACI_HTYPE_SVCCTX, ses_h, 0, ACI_ATTR_SESSION, err_h);
         }
 
@@ -143,4 +232,6 @@ fn test(aci_dir: Option<String>) {
 }
 
 #[cfg(not(windows))]
-fn test(_: Option<String>) { println!("Windows only"); }
+fn test(_: Option<String>) {
+    println!("Windows only");
+}

@@ -10,6 +10,7 @@ export interface ConnectionConfig {
   password: string;
   schema: string;
   export_schema?: string;
+  database?: string;
   source?: ConfigSource;
   updated_at?: string;
 }
@@ -110,6 +111,7 @@ export interface ExportRequest {
   drop_existing?: boolean;
   include_row_counts?: boolean;
   strict_mode?: boolean;
+  identifier_case?: string;
 }
 
 export type CapabilityLevel = 'none' | 'partial' | 'full';

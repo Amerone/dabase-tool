@@ -75,7 +75,11 @@ pub async fn list_tables(config: &ConnectionConfig) -> Result<Vec<Table>> {
     }
 }
 
-pub async fn get_table_details(config: &ConnectionConfig, schema: &str, table: &str) -> Result<TableDetails> {
+pub async fn get_table_details(
+    config: &ConnectionConfig,
+    schema: &str,
+    table: &str,
+) -> Result<TableDetails> {
     match config.db_type {
         DbType::Dm8 => {
             let cfg = config.clone();

@@ -24,6 +24,8 @@ export default function ConnectionForm() {
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false)
   const [connectionStatus, setConnectionStatus] = useState<'success' | 'error' | null>(null)
 
+  const watchedDbType = Form.useWatch('db_type', form)
+
   const setConnectionConfig = useExportStore((state) => state.setConnectionConfig)
   const nextStep = useExportStore((state) => state.nextStep)
   const loadedFrom = useExportStore((state) => state.loadedFrom)
@@ -58,6 +60,7 @@ export default function ConnectionForm() {
         password: values.password,
         schema: values.schema,
         export_schema: normalizeExportSchema(values.export_schema),
+        database: values.database || undefined,
       }
 
       const result = await testConnection(config)
@@ -156,6 +159,7 @@ export default function ConnectionForm() {
         password: values.password,
         schema: values.schema,
         export_schema: normalizeExportSchema(values.export_schema),
+        database: values.database || undefined,
       }
 
       const result = await saveConnection(payload)
@@ -237,6 +241,7 @@ export default function ConnectionForm() {
           password: '',
           schema: '',
           export_schema: '',
+          database: '',
         }}
         onValuesChange={(changedValues) => {
           // Auto-populate schema from username when schema is empty
@@ -299,6 +304,15 @@ export default function ConnectionForm() {
             </Form.Item>
           </Col>
         </Row>
+
+        {watchedDbType === 'shentong' && (
+          <Form.Item
+            label={<span style={{ fontFamily: 'JetBrains Mono' }}>实例名</span>}
+            name="database"
+          >
+            <Input placeholder="OSRDB（默认实例名）" style={{ fontFamily: 'JetBrains Mono' }} />
+          </Form.Item>
+        )}
 
         <Row gutter={24}>
           <Col span={12}>

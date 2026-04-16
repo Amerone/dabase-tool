@@ -39,6 +39,7 @@ pub enum ExportExecutionPath {
     MysqlToDm8Poc,
     MysqlToKingbasePoc,
     ShentongPoc,
+    Dm8ToShentongPoc,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +87,7 @@ impl LegacyExportOrchestrator {
             (DbType::Mysql, DbType::Dm8) => Ok(ExportExecutionPath::MysqlToDm8Poc),
             (DbType::Mysql, DbType::Kingbase) => Ok(ExportExecutionPath::MysqlToKingbasePoc),
             (DbType::Shentong, DbType::Shentong) => Ok(ExportExecutionPath::ShentongPoc),
+            (DbType::Dm8, DbType::Shentong) => Ok(ExportExecutionPath::Dm8ToShentongPoc),
             _ => Err(format!(
                 "源 {:?} → 目标 {:?} 的导出路径尚未实现",
                 source_db_type, target_dialect
@@ -251,5 +253,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(data, ExportExecutionPath::ShentongPoc);
+    }
+
+    #[test]
+    fn dm8_to_shentong_resolves_to_poc_path() {
+        let ddl = LegacyExportOrchestrator::resolve_execution_path(
+            &DbType::Dm8,
+            &DbType::Shentong,
+            ExportWorkload::Ddl,
+        )
+        .unwrap();
+        assert_eq!(ddl, ExportExecutionPath::Dm8ToShentongPoc);
+
+        let data = LegacyExportOrchestrator::resolve_execution_path(
+            &DbType::Dm8,
+            &DbType::Shentong,
+            ExportWorkload::Data,
+        )
+        .unwrap();
+        assert_eq!(data, ExportExecutionPath::Dm8ToShentongPoc);
     }
 }

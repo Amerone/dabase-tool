@@ -100,7 +100,11 @@ pub fn get_tables(config: &ConnectionConfig) -> Result<Vec<Table>> {
     Ok(tables)
 }
 
-pub fn get_table_details(config: &ConnectionConfig, schema: &str, table: &str) -> Result<TableDetails> {
+pub fn get_table_details(
+    config: &ConnectionConfig,
+    schema: &str,
+    table: &str,
+) -> Result<TableDetails> {
     ensure_kingbase(config)?;
     let pool = ConnectionPool::new(config.clone())?;
     let connection = pool.get_connection()?;
@@ -186,8 +190,8 @@ fn fetch_columns(connection: &Connection<'_>, schema: &str, table: &str) -> Resu
     let mut columns = Vec::new();
     while let Some(batch) = row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
-            let name = decode_cell(batch, 0, row_index)?
-                .ok_or_else(|| anyhow!("Column without name"))?;
+            let name =
+                decode_cell(batch, 0, row_index)?.ok_or_else(|| anyhow!("Column without name"))?;
             let data_type = decode_cell(batch, 1, row_index)?.unwrap_or_default();
             let length = decode_cell(batch, 2, row_index)?.and_then(|s| s.parse::<i32>().ok());
             let precision = decode_cell(batch, 3, row_index)?.and_then(|s| s.parse::<i32>().ok());
