@@ -1,188 +1,236 @@
-import { useCallback, useEffect, useState } from 'react'
-import type { Key } from 'react'
-import { Table, Input, Space, message, Tag } from 'antd'
-import {
-  SearchOutlined,
-  DatabaseOutlined,
-  ReloadOutlined,
-  CheckSquareOutlined,
-  DeleteOutlined,
-} from '@ant-design/icons'
-import type { Table as TableType } from '@/types'
-import { listTables } from '@/services/api'
-import { useExportStore } from '@/store/useExportStore'
-import { TechCard } from './common/TechCard'
-import { TechButton } from './common/TechButton'
-import { SectionHeader } from './common/SectionHeader'
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import type { Key } from 'react';
+import { DatabaseOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons';
+import { Input, Space, Table, Tag, message } from 'antd';
+import type { ColumnsType } from 'antd/es/table';
+
+import type { Table as TableType } from '@/types';
+import { listTables } from '@/services/api';
+import { useExportStore } from '@/store/useExportStore';
+import { buildConnectionKey } from '@/utils/connectionKey';
+import { SectionHeader } from './common/SectionHeader';
+import { TechButton } from './common/TechButton';
+import { TechCard } from './common/TechCard';
+
+function isSameSelection(left: string[], right: string[]) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
 
 export default function SchemaExplorer() {
-  const config = useExportStore((state) => state.connectionConfig)
-  const selectedTables = useExportStore((state) => state.selectedTables)
-  const setSelectedTables = useExportStore((state) => state.setSelectedTables)
-  const setStoreTables = useExportStore((state) => state.setTables)
+  const config = useExportStore((state) => state.connectionConfig);
+  const tables = useExportStore((state) => state.tables);
+  const tablesConfigKey = useExportStore((state) => state.tablesConfigKey);
+  const selectedTables = useExportStore((state) => state.selectedTables);
+  const setSelectedTables = useExportStore((state) => state.setSelectedTables);
+  const setStoreTables = useExportStore((state) => state.setTables);
 
-  const [tables, setTables] = useState<TableType[]>([])
-  const [filteredTables, setFilteredTables] = useState<TableType[]>([])
-  const [loading, setLoading] = useState(false)
-  const [searchText, setSearchText] = useState('')
-  const [pagination, setPagination] = useState({ current: 1, pageSize: 10 })
+  const [loading, setLoading] = useState(false);
+  const [searchText, setSearchText] = useState('');
+  const [pagination, setPagination] = useState({ current: 1, pageSize: 20 });
+  const deferredSearch = useDeferredValue(searchText.trim().toLowerCase());
+  const lastRequestIdRef = useRef(0);
 
-  const loadTables = useCallback(async () => {
+  const configKey = useMemo(() => {
     if (!config) {
-      return
+      return null;
     }
+    return buildConnectionKey(config);
+  }, [config]);
 
-    setLoading(true)
-    try {
-      const result = await listTables(config)
-      if (result.success && result.data) {
-        setTables(result.data)
-        setFilteredTables(result.data)
-        setStoreTables(result.data)
-        setPagination((prev) => ({ ...prev, current: 1 }))
-      } else {
-        message.error(result.error || '扫描失败')
+  const loadTables = useCallback(
+    async (force = false) => {
+      if (!config || !configKey) {
+        return;
       }
-    } catch {
-      message.error('扫描失败')
-    } finally {
-      setLoading(false)
-    }
-  }, [config, setStoreTables])
+
+      if (!force && tables.length > 0 && tablesConfigKey === configKey) {
+        return;
+      }
+
+      const requestId = ++lastRequestIdRef.current;
+      setLoading(true);
+      try {
+        const result = await listTables(config, { forceRefresh: force });
+        if (requestId !== lastRequestIdRef.current) {
+          return;
+        }
+
+        const liveConfig = useExportStore.getState().connectionConfig;
+        const liveConfigKey = liveConfig ? buildConnectionKey(liveConfig) : null;
+        if (liveConfigKey !== configKey) {
+          return;
+        }
+
+        if (result.success && result.data) {
+          const nextTables = result.data;
+          setStoreTables(nextTables, configKey);
+
+          const tableNames = new Set(nextTables.map((table) => table.name));
+          const currentSelected = useExportStore.getState().selectedTables;
+          const nextSelected = currentSelected.filter((name) => tableNames.has(name));
+          if (nextSelected.length !== currentSelected.length) {
+            setSelectedTables(nextSelected);
+          }
+
+          setPagination((prev) => ({ ...prev, current: 1 }));
+          return;
+        }
+        message.error(result.error || '加载数据表失败');
+      } catch {
+        if (requestId !== lastRequestIdRef.current) {
+          return;
+        }
+        message.error('加载数据表失败');
+      } finally {
+        if (requestId === lastRequestIdRef.current) {
+          setLoading(false);
+        }
+      }
+    },
+    [config, configKey, setSelectedTables, setStoreTables, tables.length, tablesConfigKey]
+  );
 
   useEffect(() => {
-    if (config) {
-      loadTables()
-    }
-  }, [config, loadTables])
+    setSearchText('');
+    setPagination({ current: 1, pageSize: 20 });
+    lastRequestIdRef.current += 1;
+    setLoading(false);
+  }, [configKey]);
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      if (searchText) {
-        const filtered = tables.filter((table) =>
-          table.name.toLowerCase().includes(searchText.toLowerCase())
-        )
-        setFilteredTables(filtered)
-        setPagination((prev) => ({ ...prev, current: 1 }))
-      } else {
-        setFilteredTables(tables)
-        setPagination((prev) => ({ ...prev, current: 1 }))
-      }
-    }, 300)
+    if (!config || !configKey) {
+      return;
+    }
+    if (tables.length === 0 || tablesConfigKey !== configKey) {
+      void loadTables();
+    }
+  }, [config, configKey, loadTables, tables.length, tablesConfigKey]);
 
-    return () => clearTimeout(timer)
-  }, [searchText, tables])
+  const filteredTables = useMemo(() => {
+    if (!deferredSearch) {
+      return tables;
+    }
+    return tables.filter((table) => table.name.toLowerCase().includes(deferredSearch));
+  }, [deferredSearch, tables]);
 
-  const handleSelectAll = () => {
-    const existing = new Set(selectedTables)
-    const merged = [...selectedTables, ...filteredTables.map((t) => t.name).filter((n) => !existing.has(n))]
-    setSelectedTables(merged)
-  }
+  const visibleTableNames = useMemo(() => {
+    return new Set(filteredTables.map((item) => item.name));
+  }, [filteredTables]);
 
-  const handleClearAll = () => {
-    const filteredNames = new Set(filteredTables.map((t) => t.name))
-    setSelectedTables(selectedTables.filter((name) => !filteredNames.has(name)))
-  }
+  const columns: ColumnsType<TableType> = useMemo(
+    () => [
+      {
+        title: '表名',
+        dataIndex: 'name',
+        key: 'name',
+        width: '38%',
+        sorter: (a, b) => a.name.localeCompare(b.name),
+        render: (text: string) => <span className="schema-table-name">{text}</span>,
+      },
+      {
+        title: '注释',
+        dataIndex: 'comment',
+        key: 'comment',
+        ellipsis: true,
+        render: (text?: string) => <span className="schema-table-comment">{text || '-'}</span>,
+      },
+      {
+        title: '估算行数',
+        dataIndex: 'row_count',
+        key: 'row_count',
+        width: 140,
+        align: 'right',
+        render: (count?: number) => (
+          <Tag className="schema-table-count">{(count ?? 0).toLocaleString()}</Tag>
+        ),
+      },
+    ],
+    []
+  );
 
-  const handleRowSelection = (selectedRowKeys: Key[]) => {
-    const filteredNames = new Set(filteredTables.map((t) => t.name))
-    const kept = selectedTables.filter((name) => !filteredNames.has(name))
-    setSelectedTables([...kept, ...(selectedRowKeys as string[])])
-  }
+  const handleSelectAllVisible = () => {
+    const current = new Set(selectedTables);
+    const originalSize = current.size;
+    for (const item of filteredTables) {
+      current.add(item.name);
+    }
+    if (current.size === originalSize) {
+      return;
+    }
+    setSelectedTables([...current]);
+  };
 
-  const columns = [
-    {
-      title: '表名',
-      dataIndex: 'name',
-      key: 'name',
-      sorter: (a: TableType, b: TableType) => a.name.localeCompare(b.name),
-      render: (text: string) => (
-        <span style={{ fontFamily: 'JetBrains Mono', color: '#00b96b' }}>{text}</span>
-      ),
-    },
-    {
-      title: '注释',
-      dataIndex: 'comment',
-      key: 'comment',
-      ellipsis: true,
-      render: (text: string) => <span style={{ color: '#aaa' }}>{text || '-'}</span>,
-    },
-    {
-      title: '行数',
-      dataIndex: 'row_count',
-      key: 'row_count',
-      align: 'right' as const,
-      render: (count: number | undefined) => (
-        <Tag
-          color="default"
-          style={{
-            background: 'transparent',
-            border: '1px solid #333',
-            fontFamily: 'JetBrains Mono',
-          }}
-        >
-          {(count ?? 0).toLocaleString()}
-        </Tag>
-      ),
-    },
-  ]
+  const handleClearVisible = () => {
+    const next = selectedTables.filter((name) => !visibleTableNames.has(name));
+    if (isSameSelection(next, selectedTables)) {
+      return;
+    }
+    setSelectedTables(next);
+  };
+
+  const handleSelectionChange = (selectedRowKeys: Key[]) => {
+    const keepHidden = selectedTables.filter((name) => !visibleTableNames.has(name));
+    const next = Array.from(new Set([...keepHidden, ...(selectedRowKeys as string[])]));
+    if (isSameSelection(next, selectedTables)) {
+      return;
+    }
+    setSelectedTables(next);
+  };
 
   if (!config) {
     return (
       <TechCard>
-        <div style={{ textAlign: 'center', padding: 40, color: '#666' }}>
-          <DatabaseOutlined style={{ fontSize: 48, marginBottom: 16, opacity: 0.5 }} />
-          <p style={{ fontFamily: 'Orbitron' }}>尚未连接数据库</p>
+        <div className="panel-empty-state">
+          <DatabaseOutlined className="panel-empty-icon" />
+          <p>请先完成数据库连接，再加载数据表。</p>
         </div>
       </TechCard>
-    )
+    );
   }
 
   return (
-    <TechCard delay={100}>
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'flex-start',
-          marginBottom: 16,
-        }}
-      >
-        <SectionHeader title="数据表浏览" subtitle={`已发现 ${tables.length} 个对象`} />
-        <Space>
-          <TechButton size="small" onClick={loadTables} icon={<ReloadOutlined />} loading={loading}>
-            刷新
-          </TechButton>
-        </Space>
+    <TechCard delay={80}>
+      <div className="schema-toolbar">
+        <SectionHeader title="数据表浏览器" subtitle={`发现 ${tables.length} 张表`} />
+        <TechButton
+          size="small"
+          onClick={() => void loadTables(true)}
+          icon={<ReloadOutlined />}
+          loading={loading}
+        >
+          刷新
+        </TechButton>
       </div>
 
       <Space direction="vertical" style={{ width: '100%', marginBottom: 16 }}>
-        <div style={{ display: 'flex', gap: 12 }}>
+        <div className="schema-actions">
           <Input
             placeholder="搜索表名..."
-            prefix={<SearchOutlined style={{ color: '#00b96b' }} />}
+            prefix={<SearchOutlined />}
             value={searchText}
-            onChange={(e) => setSearchText(e.target.value)}
+            onChange={(event) => setSearchText(event.target.value)}
             allowClear
-            style={{ fontFamily: 'JetBrains Mono' }}
+            size="large"
           />
-          <TechButton size="small" onClick={handleSelectAll} icon={<CheckSquareOutlined />}>
-            全选
+          <TechButton size="small" onClick={handleSelectAllVisible}>
+            全选当前结果
           </TechButton>
-          <TechButton size="small" onClick={handleClearAll} icon={<DeleteOutlined />} danger>
-            清除
+          <TechButton size="small" danger onClick={handleClearVisible}>
+            清空当前结果
           </TechButton>
         </div>
       </Space>
 
-      <Table
+      <Table<TableType>
         rowKey="name"
         columns={columns}
         dataSource={filteredTables}
         loading={loading}
+        virtual
         rowSelection={{
           selectedRowKeys: selectedTables,
-          onChange: handleRowSelection,
+          onChange: handleSelectionChange,
+          preserveSelectedRowKeys: true,
         }}
         pagination={{
           current: pagination.current,
@@ -190,17 +238,11 @@ export default function SchemaExplorer() {
           showSizeChanger: true,
           showQuickJumper: true,
           onChange: (current, pageSize) => setPagination({ current, pageSize }),
-          showTotal: (total) => <span style={{ fontFamily: 'JetBrains Mono' }}>共 {total} 项</span>,
+          showTotal: (total) => `共 ${total} 条`,
         }}
-        scroll={{ y: 400 }}
-        onChange={(pager) => {
-          setPagination({
-            current: pager.current || 1,
-            pageSize: pager.pageSize || 10,
-          })
-        }}
-        size="small"
+        scroll={{ y: 460 }}
+        size="middle"
       />
     </TechCard>
-  )
+  );
 }

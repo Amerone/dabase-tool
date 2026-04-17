@@ -75,37 +75,54 @@ if (Test-Path $rcDir) {
 } else {
     Write-Warning "rc.exe dir not found at $rcDir — resource compilation may fail"
 }
-$driverDir = Join-Path $ProjectRoot "drivers\dm8\windows"
-if (Test-Path $driverDir) {
-    $env:PATH = "$driverDir;$env:PATH"
-    Write-Host "DM8 driver dir added: $driverDir"
+$driverDirs = @(
+    "drivers\dm8\windows",
+    "drivers\kingbase\X64_Windows\odbc\x64_ANSI_Release",
+    "drivers\postgresql\windows",
+    "drivers\shentong\windows"
+)
+foreach ($relativeDriverDir in $driverDirs) {
+    $driverDir = Join-Path $ProjectRoot $relativeDriverDir
+    if (Test-Path $driverDir) {
+        $env:PATH = "$driverDir;$env:PATH"
+        Write-Host "Driver dir added: $driverDir"
+    }
 }
 
 # ── 5. Remove ReadOnly attribute from driver DLLs (source + any cached copies) ──
 # DLL files copied from DM8 install have ReadOnly set, causing os error 5 in build.
 Write-Host "Clearing ReadOnly from driver DLLs..."
-Get-ChildItem (Join-Path $ProjectRoot "drivers\dm8") -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-    if ($_.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
-        $_.Attributes = $_.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)
+$driverRoots = @(
+    "drivers\dm8",
+    "drivers\kingbase\X64_Windows",
+    "drivers\postgresql\windows",
+    "drivers\shentong\windows"
+)
+foreach ($relativeDriverRoot in $driverRoots) {
+    $driverRoot = Join-Path $ProjectRoot $relativeDriverRoot
+    Get-ChildItem $driverRoot -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
+            $_.Attributes = $_.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)
+        }
     }
 }
-$targetDm8 = Join-Path $ProjectRoot "src-tauri\target\release\drivers\dm8"
-if (Test-Path $targetDm8) {
-    Remove-Item $targetDm8 -Recurse -Force
-    Write-Host "Removed stale cached driver copy from target dir"
+$targetDrivers = Join-Path $ProjectRoot "src-tauri\target\release\drivers"
+if (Test-Path $targetDrivers) {
+    Remove-Item $targetDrivers -Recurse -Force
+    Write-Host "Removed stale cached driver copies from target dir"
 }
 
 # ── 6. Install frontend dependencies ─────────────────────────────────────
 Write-Host "Installing frontend dependencies..."
 Push-Location (Join-Path $ProjectRoot "frontend")
-npm install
+& npm.cmd install
 if ($LASTEXITCODE -ne 0) { Write-Error "npm install failed"; exit 1 }
 Pop-Location
 
 # ── 7. Build frontend ────────────────────────────────────────────────────
 Write-Host "Building frontend..."
 Push-Location (Join-Path $ProjectRoot "frontend")
-npm run build
+& npm.cmd run build
 if ($LASTEXITCODE -ne 0) { Write-Error "Frontend build failed"; exit 1 }
 Pop-Location
 

@@ -1,28 +1,47 @@
-; hooks.nsh — Tauri NSIS installer hooks for DM8 Export Tool
-; 文件由 Tauri 在 NSIS 安装脚本中自动引用（bundle.nsis.installerHooks）
-; 安装器以管理员身份运行（installMode = perMachine），可安全写入 HKLM
+; Tauri NSIS installer hooks for packaged database drivers.
+; installMode = perMachine, so HKLM ODBC driver registration is available.
 
-; 安装完成后注册 DM8 ODBC 驱动
-; 此时文件已复制到 $INSTDIR，可安全引用驱动 DLL 路径
-!macro NSIS_HOOK_POSTINSTALL
-  WriteRegStr HKLM "SOFTWARE\ODBC\ODBCINST.INI\ODBC Drivers" \
-      "DM8 ODBC Driver" "Installed"
+!include LogicLib.nsh
 
-  WriteRegStr HKLM "SOFTWARE\ODBC\ODBCINST.INI\DM8 ODBC Driver" \
-      "Driver" "$INSTDIR\drivers\dm8\windows\dodbc.dll"
-  WriteRegStr HKLM "SOFTWARE\ODBC\ODBCINST.INI\DM8 ODBC Driver" \
-      "Setup" "$INSTDIR\drivers\dm8\windows\dodbc.dll"
-  WriteRegStr HKLM "SOFTWARE\ODBC\ODBCINST.INI\DM8 ODBC Driver" \
-      "APILevel" "1"
-  WriteRegStr HKLM "SOFTWARE\ODBC\ODBCINST.INI\DM8 ODBC Driver" \
-      "DriverODBCVer" "03.00"
-  WriteRegStr HKLM "SOFTWARE\ODBC\ODBCINST.INI\DM8 ODBC Driver" \
-      "FileUsage" "0"
+!macro REGISTER_ODBC_DRIVER DRIVER_NAME DRIVER_DLL
+  ${If} ${FileExists} "${DRIVER_DLL}"
+    WriteRegStr HKLM "SOFTWARE\ODBC\ODBCINST.INI\ODBC Drivers" \
+        "${DRIVER_NAME}" "Installed"
+    WriteRegStr HKLM "SOFTWARE\ODBC\ODBCINST.INI\${DRIVER_NAME}" \
+        "Driver" "${DRIVER_DLL}"
+    WriteRegStr HKLM "SOFTWARE\ODBC\ODBCINST.INI\${DRIVER_NAME}" \
+        "Setup" "${DRIVER_DLL}"
+    WriteRegStr HKLM "SOFTWARE\ODBC\ODBCINST.INI\${DRIVER_NAME}" \
+        "APILevel" "1"
+    WriteRegStr HKLM "SOFTWARE\ODBC\ODBCINST.INI\${DRIVER_NAME}" \
+        "DriverODBCVer" "03.00"
+    WriteRegStr HKLM "SOFTWARE\ODBC\ODBCINST.INI\${DRIVER_NAME}" \
+        "FileUsage" "0"
+  ${EndIf}
 !macroend
 
-; 卸载时删除 ODBC 驱动注册信息
-!macro NSIS_HOOK_POSTUNINSTALL
+!macro UNREGISTER_ODBC_DRIVER DRIVER_NAME
   DeleteRegValue HKLM "SOFTWARE\ODBC\ODBCINST.INI\ODBC Drivers" \
-      "DM8 ODBC Driver"
-  DeleteRegKey   HKLM "SOFTWARE\ODBC\ODBCINST.INI\DM8 ODBC Driver"
+      "${DRIVER_NAME}"
+  DeleteRegKey HKLM "SOFTWARE\ODBC\ODBCINST.INI\${DRIVER_NAME}"
+!macroend
+
+!macro NSIS_HOOK_POSTINSTALL
+  !insertmacro REGISTER_ODBC_DRIVER \
+      "Amarone DM8 ODBC Driver" \
+      "$INSTDIR\drivers\dm8\windows\dodbc.dll"
+
+  !insertmacro REGISTER_ODBC_DRIVER \
+      "Amarone KingbaseES 9 ODBC Driver ANSI" \
+      "$INSTDIR\drivers\kingbase\X64_Windows\odbc\x64_ANSI_Release\kdbodbc30a.dll"
+
+  !insertmacro REGISTER_ODBC_DRIVER \
+      "Amarone PostgreSQL Unicode" \
+      "$INSTDIR\drivers\postgresql\windows\psqlodbc35w.dll"
+!macroend
+
+!macro NSIS_HOOK_POSTUNINSTALL
+  !insertmacro UNREGISTER_ODBC_DRIVER "Amarone DM8 ODBC Driver"
+  !insertmacro UNREGISTER_ODBC_DRIVER "Amarone KingbaseES 9 ODBC Driver ANSI"
+  !insertmacro UNREGISTER_ODBC_DRIVER "Amarone PostgreSQL Unicode"
 !macroend

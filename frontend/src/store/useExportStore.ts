@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 import type { ConnectionConfig, DriverInfo, Table } from '@/types';
+import { buildConnectionKey } from '@/utils/connectionKey';
+import { clearApiCaches } from '@/services/api';
 
 interface ExportState {
   // Connection
@@ -18,7 +20,8 @@ interface ExportState {
   driverInfo: DriverInfo | null;
   setDriverInfo: (info: DriverInfo | null) => void;
   tables: Table[];
-  setTables: (tables: Table[]) => void;
+  tablesConfigKey: string | null;
+  setTables: (tables: Table[], configKey?: string | null) => void;
 
   // Selection
   selectedTables: string[];
@@ -38,14 +41,32 @@ export const useExportStore = create<ExportState>((set) => ({
   connectionConfig: null,
   isConnected: false,
   setConnectionConfig: (config, loadedFrom = 'manual', lastUpdatedAt = null, isConnected = true) =>
-    set({
-      connectionConfig: {
+    set((state) => {
+      const normalizedConfig = {
         ...config,
         db_type: config.db_type ?? 'dm8',
-      },
-      isConnected,
-      loadedFrom,
-      lastUpdatedAt: lastUpdatedAt ?? config.updated_at ?? null,
+      };
+      const previousKey = state.connectionConfig ? buildConnectionKey(state.connectionConfig) : null;
+      const nextKey = buildConnectionKey(normalizedConfig);
+      const connectionChanged = previousKey !== null && previousKey !== nextKey;
+      if (connectionChanged) {
+        clearApiCaches();
+      }
+
+      return {
+        connectionConfig: normalizedConfig,
+        isConnected,
+        loadedFrom,
+        lastUpdatedAt: lastUpdatedAt ?? config.updated_at ?? null,
+        ...(connectionChanged
+          ? {
+              selectedTables: [],
+              tables: [],
+              tablesConfigKey: null,
+              currentStep: 0,
+            }
+          : {}),
+      };
     }),
   loadedFrom: null,
   lastUpdatedAt: null,
@@ -55,19 +76,24 @@ export const useExportStore = create<ExportState>((set) => ({
       lastUpdatedAt,
     }),
   disconnect: () =>
-    set({
-      connectionConfig: null,
-      isConnected: false,
-      currentStep: 0,
-      selectedTables: [],
-      loadedFrom: null,
-      lastUpdatedAt: null,
-      tables: [],
-    }),
+    {
+      clearApiCaches();
+      set({
+        connectionConfig: null,
+        isConnected: false,
+        currentStep: 0,
+        selectedTables: [],
+        loadedFrom: null,
+        lastUpdatedAt: null,
+        tables: [],
+        tablesConfigKey: null,
+      });
+    },
   driverInfo: null,
   setDriverInfo: (info) => set({ driverInfo: info }),
   tables: [],
-  setTables: (tables) => set({ tables }),
+  tablesConfigKey: null,
+  setTables: (tables, configKey = null) => set({ tables, tablesConfigKey: configKey }),
 
   // Selection
   selectedTables: [],

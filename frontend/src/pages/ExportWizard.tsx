@@ -1,191 +1,119 @@
-import { Suspense, lazy, useEffect, useRef, useLayoutEffect } from 'react'
-import { Steps, Space, Row, Col } from 'antd'
+import { Suspense, lazy, useMemo } from 'react';
+import { Col, Row, Space, Steps } from 'antd';
 import {
   DatabaseOutlined,
-  TableOutlined,
   ExportOutlined,
   LeftOutlined,
   RightOutlined,
-} from '@ant-design/icons'
-import { createLayout } from 'animejs'
-import { useExportStore } from '@/store/useExportStore'
-import { TechButton } from '@/components/common/TechButton'
+  TableOutlined,
+} from '@ant-design/icons';
 
-type LayoutController = ReturnType<typeof createLayout>
+import { useExportStore } from '@/store/useExportStore';
+import { TechButton } from '@/components/common/TechButton';
 
-const ConnectionForm = lazy(() => import('@/components/ConnectionForm'))
-const SchemaExplorer = lazy(() => import('@/components/SchemaExplorer'))
-const TableSelector = lazy(() => import('@/components/TableSelector'))
-const ExportConfig = lazy(() => import('@/components/ExportConfig'))
+const ConnectionForm = lazy(() => import('@/components/ConnectionForm'));
+const SchemaExplorer = lazy(() => import('@/components/SchemaExplorer'));
+const TableSelector = lazy(() => import('@/components/TableSelector'));
+const ExportConfig = lazy(() => import('@/components/ExportConfig'));
 
 export default function ExportWizard() {
-  const currentStep = useExportStore((state) => state.currentStep)
-  const nextStep = useExportStore((state) => state.nextStep)
-  const prevStep = useExportStore((state) => state.prevStep)
-  const isConnected = useExportStore((state) => state.isConnected)
-  const selectedTables = useExportStore((state) => state.selectedTables)
-  const tables = useExportStore((state) => state.tables)
+  const currentStep = useExportStore((state) => state.currentStep);
+  const nextStep = useExportStore((state) => state.nextStep);
+  const prevStep = useExportStore((state) => state.prevStep);
+  const isConnected = useExportStore((state) => state.isConnected);
+  const selectedTables = useExportStore((state) => state.selectedTables);
+  const tables = useExportStore((state) => state.tables);
 
-  const contentRef = useRef<HTMLDivElement>(null)
-  const layoutRef = useRef<LayoutController | null>(null)
+  const rowCountMap = useMemo(() => {
+    return new Map(tables.map((table) => [table.name, table.row_count ?? 0]));
+  }, [tables]);
 
-  const totalRows = selectedTables.reduce((acc, tableName) => {
-    const table = tables.find((t) => t.name === tableName)
-    return acc + (table?.row_count ?? 0)
-  }, 0)
+  const totalRows = useMemo(() => {
+    return selectedTables.reduce((acc, tableName) => acc + (rowCountMap.get(tableName) ?? 0), 0);
+  }, [rowCountMap, selectedTables]);
 
-  useEffect(() => {
-    if (contentRef.current && !layoutRef.current) {
-      layoutRef.current = createLayout(contentRef.current)
-    }
-  }, [])
+  const steps = useMemo(
+    () => [
+      {
+        title: '连接',
+        icon: <DatabaseOutlined />,
+        content: <ConnectionForm />,
+      },
+      {
+        title: '选表',
+        icon: <TableOutlined />,
+        content: (
+          <Row gutter={[24, 24]}>
+            <Col xs={24} lg={16}>
+              <SchemaExplorer />
+            </Col>
+            <Col xs={24} lg={8}>
+              <TableSelector />
+            </Col>
+          </Row>
+        ),
+      },
+      {
+        title: '导出',
+        icon: <ExportOutlined />,
+        content: <ExportConfig />,
+      },
+    ],
+    []
+  );
 
-  useLayoutEffect(() => {
-    layoutRef.current?.animate()
-  }, [currentStep])
-
-  const steps = [
-    {
-      title: '连接',
-      icon: <DatabaseOutlined />,
-      content: <ConnectionForm />,
-    },
-    {
-      title: '选择',
-      icon: <TableOutlined />,
-      content: (
-        <Row gutter={[24, 24]}>
-          <Col xs={24} lg={16}>
-            <SchemaExplorer />
-          </Col>
-          <Col xs={24} lg={8}>
-            <TableSelector />
-          </Col>
-        </Row>
-      ),
-    },
-    {
-      title: '导出',
-      icon: <ExportOutlined />,
-      content: <ExportConfig />,
-    },
-  ]
-
-  const loadingFallback = (
-    <div
-      style={{
-        minHeight: 280,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        color: 'rgba(255,255,255,0.65)',
-        fontFamily: 'JetBrains Mono',
-        letterSpacing: 1,
-      }}
-    >
-      正在加载模块...
-    </div>
-  )
-
-  const handleNext = () => {
-    layoutRef.current?.record()
-    nextStep()
-  }
-
-  const handlePrev = () => {
-    layoutRef.current?.record()
-    prevStep()
-  }
+  const loadingFallback = <div className="wizard-loading">模块加载中...</div>;
 
   return (
-    <div>
-      <div style={{ marginBottom: 20, padding: '0 16px' }}>
+    <div className="wizard-shell">
+      <div className="wizard-steps-panel">
         <Steps
           current={currentStep}
           items={steps.map((step) => ({ title: step.title, icon: step.icon }))}
-          className="tech-steps"
+          className="wizard-steps"
         />
-        <style>{`
-          .tech-steps .ant-steps-item-title {
-            font-family: 'Orbitron', sans-serif !important;
-            letter-spacing: 1px;
-          }
-          .tech-steps .ant-steps-item-process .ant-steps-item-icon {
-            background: #00b96b;
-            border-color: #00b96b;
-          }
-        `}</style>
       </div>
 
-      <div ref={contentRef} style={{ minHeight: '300px', marginBottom: '70px' }}>
+      <div className="wizard-stage">
         <Suspense fallback={loadingFallback}>{steps[currentStep].content}</Suspense>
       </div>
 
-      <div
-        style={{
-          padding: '12px 24px',
-          background: 'rgba(5, 10, 15, 0.85)',
-          backdropFilter: 'blur(20px)',
-          borderTop: '1px solid rgba(0, 185, 107, 0.3)',
-          boxShadow: '0 -10px 30px rgba(0,0,0,0.5)',
-          position: 'fixed',
-          bottom: 0,
-          left: 0,
-          right: 0,
-          zIndex: 100,
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-        }}
-      >
-        <div
-          style={{
-            fontFamily: 'JetBrains Mono',
-            fontSize: '12px',
-            color: 'rgba(255,255,255,0.6)',
-          }}
-        >
+      <div className="wizard-footer">
+        <div className="wizard-footer-state">
+          {currentStep === 0 && <span>状态: 请完成连接测试</span>}
           {currentStep === 1 && (
             <Space size="large">
               <span>
-                已选表数:{' '}
-                <span style={{ color: '#00b96b', fontWeight: 'bold', fontSize: '14px' }}>
-                  {selectedTables.length}
-                </span>
+                已选表数 <strong>{selectedTables.length}</strong>
               </span>
               <span>
-                预估行数:{' '}
-                <span style={{ color: '#00b96b', fontWeight: 'bold', fontSize: '14px' }}>
-                  {totalRows.toLocaleString()}
-                </span>
+                预估总行数 <strong>{totalRows.toLocaleString()}</strong>
               </span>
             </Space>
           )}
-          {currentStep === 0 && <span>状态：等待连接...</span>}
-          {currentStep === 2 && <span>状态：准备就绪</span>}
+          {currentStep === 2 && <span>状态: 已可执行导出</span>}
         </div>
+
         <Space>
           {currentStep > 0 && (
-            <TechButton onClick={handlePrev} size="large" icon={<LeftOutlined />} type="default">
+            <TechButton onClick={prevStep} size="large" icon={<LeftOutlined />}>
               上一步
             </TechButton>
           )}
           {currentStep < steps.length - 1 && (
             <TechButton
               type="primary"
-              onClick={handleNext}
+              onClick={nextStep}
               size="large"
-              disabled={
-                (currentStep === 0 && !isConnected) ||
-                (currentStep === 1 && selectedTables.length === 0)
-              }
+              disabled={(currentStep === 0 && !isConnected) || (currentStep === 1 && selectedTables.length === 0)}
               style={{ minWidth: 140 }}
             >
-              下一步 <RightOutlined />
+              下一步
+              <RightOutlined />
             </TechButton>
           )}
         </Space>
       </div>
     </div>
-  )
+  );
 }

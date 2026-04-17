@@ -1,76 +1,213 @@
-import { useEffect, useState } from 'react'
-import { Collapse, Button, Space, Spin, Tag } from 'antd'
-import { DeleteOutlined, ReloadOutlined, CodeOutlined } from '@ant-design/icons'
-import { useExportStore } from '@/store/useExportStore'
-import { getTableDetails } from '@/services/api'
-import type { TableDetails } from '@/types'
-import { TechCard } from './common/TechCard'
-import { SectionHeader } from './common/SectionHeader'
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { CodeOutlined, DeleteOutlined, ReloadOutlined } from '@ant-design/icons';
+import { Button, Collapse, Space, Spin, Tag } from 'antd';
 
-const { Panel } = Collapse
+import type { TableDetails } from '@/types';
+import { getTableDetailsBatch } from '@/services/api';
+import { useExportStore } from '@/store/useExportStore';
+import { buildConnectionKey } from '@/utils/connectionKey';
+import { SectionHeader } from './common/SectionHeader';
+import { TechCard } from './common/TechCard';
 
-export default function TableSelector() {
-  const selectedTables = useExportStore((state) => state.selectedTables)
-  const toggleTable = useExportStore((state) => state.toggleTable)
-  const tables = useExportStore((state) => state.tables)
+const { Panel } = Collapse;
 
-  const [detailsMap, setDetailsMap] = useState<Record<string, TableDetails | null>>({})
-  const [loadingMap, setLoadingMap] = useState<Record<string, boolean>>({})
-
-  const fetchDetails = async (tableName: string) => {
-    const config = useExportStore.getState().connectionConfig
-    if (!config) return
-    setLoadingMap((prev) => ({ ...prev, [tableName]: true }))
-    try {
-      const res = await getTableDetails(config, tableName)
-      if (res.success && res.data) {
-        setDetailsMap((prev) => ({ ...prev, [tableName]: res.data as TableDetails | null }))
-      } else {
-        setDetailsMap((prev) => ({ ...prev, [tableName]: null }))
-      }
-    } catch {
-      setDetailsMap((prev) => ({ ...prev, [tableName]: null }))
-    } finally {
-      setLoadingMap((prev) => ({ ...prev, [tableName]: false }))
+function pruneRecordBySelected<T>(
+  prev: Record<string, T>,
+  selected: Set<string>
+): Record<string, T> {
+  let changed = false;
+  const next: Record<string, T> = {};
+  for (const [tableName, value] of Object.entries(prev)) {
+    if (selected.has(tableName)) {
+      next[tableName] = value;
+    } else {
+      changed = true;
     }
   }
+  return changed ? next : prev;
+}
+
+export default function TableSelector() {
+  const config = useExportStore((state) => state.connectionConfig);
+  const selectedTables = useExportStore((state) => state.selectedTables);
+  const toggleTable = useExportStore((state) => state.toggleTable);
+  const tables = useExportStore((state) => state.tables);
+
+  const [detailsMap, setDetailsMap] = useState<Record<string, TableDetails | null>>({});
+  const [loadingMap, setLoadingMap] = useState<Record<string, boolean>>({});
+  const [activeKeys, setActiveKeys] = useState<string[]>([]);
+  const inFlightRef = useRef<Set<string>>(new Set());
+  const configKeyRef = useRef<string | null>(null);
+  const previousSelectedCountRef = useRef(0);
+  const nextRequestTokenRef = useRef(0);
+  const requestTokenRef = useRef<Record<string, number>>({});
+
+  const configKey = useMemo(() => {
+    if (!config) {
+      return null;
+    }
+    return buildConnectionKey(config);
+  }, [config]);
+
+  const summaryMap = useMemo(() => {
+    return new Map(tables.map((table) => [table.name, table]));
+  }, [tables]);
+
+  const fetchDetailsBatch = async (tableNames: string[], force = false) => {
+    if (!config) {
+      return;
+    }
+
+    const pendingNames = Array.from(new Set(tableNames))
+      .map((name) => name.trim())
+      .filter((name) => Boolean(name))
+      .filter((name) => force || !inFlightRef.current.has(name))
+      .filter((name) => force || detailsMap[name] === undefined);
+
+    if (pendingNames.length === 0) {
+      return;
+    }
+
+    const requestTokens: Record<string, number> = {};
+    for (const tableName of pendingNames) {
+      const token = ++nextRequestTokenRef.current;
+      requestTokens[tableName] = token;
+      requestTokenRef.current[tableName] = token;
+      inFlightRef.current.add(tableName);
+    }
+    setLoadingMap((prev) => {
+      const next = { ...prev };
+      for (const tableName of pendingNames) {
+        next[tableName] = true;
+      }
+      return next;
+    });
+    const requestConfigKey = configKey;
+
+    try {
+      const response = await getTableDetailsBatch(config, pendingNames, { forceRefresh: force });
+      if (configKeyRef.current !== requestConfigKey) {
+        return;
+      }
+      const byRequestedName = new Map<string, TableDetails>();
+      if (response.success && response.data) {
+        response.data.forEach((details, index) => {
+          const tableName = pendingNames[index];
+          if (tableName) {
+            byRequestedName.set(tableName, details);
+          }
+        });
+      }
+
+      setDetailsMap((prev) => {
+        const next = { ...prev };
+        for (const tableName of pendingNames) {
+          if (requestTokenRef.current[tableName] !== requestTokens[tableName]) {
+            continue;
+          }
+          const detail = byRequestedName.get(tableName);
+          next[tableName] = detail ?? null;
+        }
+        return next;
+      });
+    } catch {
+      if (configKeyRef.current !== requestConfigKey) {
+        return;
+      }
+      setDetailsMap((prev) => {
+        const next = { ...prev };
+        for (const tableName of pendingNames) {
+          if (requestTokenRef.current[tableName] !== requestTokens[tableName]) {
+            continue;
+          }
+          next[tableName] = null;
+        }
+        return next;
+      });
+    } finally {
+      if (configKeyRef.current === requestConfigKey) {
+        setLoadingMap((prev) => {
+          const next = { ...prev };
+          for (const tableName of pendingNames) {
+            if (requestTokenRef.current[tableName] !== requestTokens[tableName]) {
+              continue;
+            }
+            next[tableName] = false;
+          }
+          return next;
+        });
+      }
+      for (const tableName of pendingNames) {
+        if (requestTokenRef.current[tableName] === requestTokens[tableName]) {
+          delete requestTokenRef.current[tableName];
+          inFlightRef.current.delete(tableName);
+        }
+      }
+    }
+  };
 
   useEffect(() => {
-    selectedTables.forEach((name) => {
-      if (!detailsMap[name]) {
-        fetchDetails(name)
-      }
-    })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTables])
+    configKeyRef.current = configKey;
+    setDetailsMap({});
+    setLoadingMap({});
+    setActiveKeys([]);
+    inFlightRef.current.clear();
+    requestTokenRef.current = {};
+  }, [configKey]);
+
+  useEffect(() => {
+    const selected = new Set(selectedTables);
+    const wasShrinking = selectedTables.length < previousSelectedCountRef.current;
+    previousSelectedCountRef.current = selectedTables.length;
+
+    if (wasShrinking) {
+      setDetailsMap((prev) => pruneRecordBySelected(prev, selected));
+      setLoadingMap((prev) => pruneRecordBySelected(prev, selected));
+    }
+
+    setActiveKeys((prev) => {
+      const next = prev.filter((tableName) => selected.has(tableName));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [selectedTables]);
+
+  const handleCollapseChange = (keys: string[] | string) => {
+    const nextKeys = Array.isArray(keys) ? keys : [keys];
+    setActiveKeys(nextKeys);
+    void fetchDetailsBatch(nextKeys);
+  };
 
   if (selectedTables.length === 0) {
-    return null
+    return null;
   }
 
   return (
-    <TechCard delay={300} style={{ marginTop: 24 }}>
-      <SectionHeader title="载荷清单" subtitle={`项目数: ${selectedTables.length}`} />
-      <Collapse 
-        ghost 
-        expandIcon={({ isActive }) => <CodeOutlined rotate={isActive ? 90 : 0} style={{ color: '#00b96b' }} />}
+    <TechCard delay={180} style={{ marginTop: 24 }}>
+      <SectionHeader title="已选清单" subtitle={`共 ${selectedTables.length} 张表`} />
+
+      <Collapse
+        ghost
+        destroyInactivePanel
+        activeKey={activeKeys}
+        onChange={handleCollapseChange}
+        expandIcon={({ isActive }) => (
+          <CodeOutlined rotate={isActive ? 90 : 0} style={{ color: '#13c2c2' }} />
+        )}
       >
-        {selectedTables.map(tableName => {
-          const summary = tables.find(t => t.name === tableName)
-          const details = detailsMap[tableName]
-          const loading = loadingMap[tableName]
-          const colCount = details?.columns?.length
-          const pkCount = details?.primary_keys?.length
+        {selectedTables.map((tableName) => {
+          const summary = summaryMap.get(tableName);
+          const details = detailsMap[tableName];
+          const loading = loadingMap[tableName];
 
           return (
             <Panel
               header={
                 <Space style={{ width: '100%', justifyContent: 'space-between' }}>
-                  <span style={{ fontFamily: 'JetBrains Mono', color: '#e0e0e0' }}>{tableName}</span>
+                  <span className="selected-table-name">{tableName}</span>
                   <Space>
                     {summary && (
-                      <Tag color="rgba(255,255,255,0.1)" style={{ border: 'none', color: '#888' }}>
-                        {(summary.row_count ?? 0).toLocaleString()} 行
+                      <Tag className="selected-table-tag">
+                        {(summary.row_count ?? 0).toLocaleString()} rows
                       </Tag>
                     )}
                     <Button
@@ -78,9 +215,9 @@ export default function TableSelector() {
                       size="small"
                       danger
                       icon={<DeleteOutlined />}
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        toggleTable(tableName)
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        toggleTable(tableName);
                       }}
                     />
                   </Space>
@@ -92,35 +229,47 @@ export default function TableSelector() {
                   type="link"
                   size="small"
                   icon={<ReloadOutlined />}
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    fetchDetails(tableName)
-                  }}
-                >
-                </Button>
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void fetchDetailsBatch([tableName], true);
+                    }}
+                  />
               }
-              style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}
+              className="selected-table-panel"
             >
               {loading && (
-                <div style={{ textAlign: 'center', padding: 10 }}>
-                  <Spin size="small" /> <span style={{ marginLeft: 8, fontFamily: 'JetBrains Mono', fontSize: 12 }}>分析中...</span>
+                <div className="selected-table-loading">
+                  <Spin size="small" />
+                  <span>加载结构详情中...</span>
                 </div>
               )}
-              {!loading && (
-                <div style={{ fontFamily: 'JetBrains Mono', fontSize: '12px', color: '#aaa', paddingLeft: 24 }}>
-                  <p>名称: <span style={{ color: '#fff' }}>{tableName}</span></p>
-                  <p>行数: <span style={{ color: '#fff' }}>{(summary?.row_count ?? 0).toLocaleString()}</span></p>
-                  <p>列数: <span style={{ color: '#fff' }}>{colCount ?? 'N/A'}</span></p>
-                  <p>主键: <span style={{ color: '#fff' }}>{pkCount ?? 'N/A'}</span></p>
-                  <div style={{ marginTop: 8, padding: 8, background: 'rgba(0,0,0,0.3)', borderLeft: '2px solid #00b96b' }}>
-                    // 元数据就绪
-                  </div>
+
+              {!loading && !details && (
+                <div className="selected-table-metadata">
+                  <p>详情暂不可用，可点击右上角刷新重试。</p>
+                </div>
+              )}
+
+              {!loading && details && (
+                <div className="selected-table-metadata">
+                  <p>
+                    列数: <span>{details.columns.length}</span>
+                  </p>
+                  <p>
+                    主键列: <span>{details.primary_keys.length}</span>
+                  </p>
+                  <p>
+                    索引数: <span>{details.indexes.length}</span>
+                  </p>
+                  <p>
+                    外键数: <span>{details.foreign_keys.length}</span>
+                  </p>
                 </div>
               )}
             </Panel>
-          )
+          );
         })}
       </Collapse>
     </TechCard>
-  )
+  );
 }

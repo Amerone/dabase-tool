@@ -2,7 +2,7 @@
 
 mod driver;
 
-use driver::{discover_and_apply, DriverSource, ResolvedDriver};
+use driver::{discover_and_apply, DriverSetup, DriverSource};
 use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
@@ -10,11 +10,20 @@ use tauri_plugin_dialog::DialogExt;
 struct DriverInfo {
     path: String,
     source: DriverSource,
+    drivers: Vec<PackagedDriverInfo>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct PackagedDriverInfo {
+    database: String,
+    path: String,
+    source: DriverSource,
+    required: bool,
 }
 
 #[derive(Clone)]
 struct AppState {
-    driver: ResolvedDriver,
+    driver_setup: DriverSetup,
     backend_url: String,
 }
 
@@ -25,9 +34,22 @@ fn backend_base_url(state: State<'_, AppState>) -> String {
 
 #[tauri::command]
 fn driver_info(state: State<'_, AppState>) -> DriverInfo {
+    let drivers = state
+        .driver_setup
+        .drivers
+        .iter()
+        .map(|driver| PackagedDriverInfo {
+            database: driver.database.to_string(),
+            path: driver.driver_path.display().to_string(),
+            source: driver.source.clone(),
+            required: driver.required,
+        })
+        .collect();
+
     DriverInfo {
-        path: state.driver.driver_path.display().to_string(),
-        source: state.driver.source.clone(),
+        path: state.driver_setup.primary.driver_path.display().to_string(),
+        source: state.driver_setup.primary.source.clone(),
+        drivers,
     }
 }
 
@@ -38,11 +60,11 @@ fn main() {
         .invoke_handler(tauri::generate_handler![backend_base_url, driver_info])
         .setup(|app| {
             let resolved = match discover_and_apply(app.handle()) {
-                Ok(driver) => driver,
+                Ok(setup) => setup,
                 Err(err) => {
                     app.dialog()
-                        .message(format!("Failed to locate DM8 ODBC driver: {err}"))
-                        .title("DM8 driver missing")
+                        .message(format!("Failed to locate required database driver: {err}"))
+                        .title("Database driver missing")
                         .blocking_show();
                     return Err(err.into());
                 }
@@ -53,7 +75,7 @@ fn main() {
             let backend_url = format!("http://127.0.0.1:{}", bound.port());
 
             app.manage(AppState {
-                driver: resolved,
+                driver_setup: resolved,
                 backend_url,
             });
             Ok(())

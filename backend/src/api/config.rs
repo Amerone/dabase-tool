@@ -424,7 +424,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1 .0.success, false);
+        assert!(!err.1 .0.success);
         assert!(err
             .1
              .0
@@ -460,7 +460,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1 .0.success, false);
+        assert!(!err.1 .0.success);
         assert!(err
             .1
              .0

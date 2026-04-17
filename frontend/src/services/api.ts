@@ -14,8 +14,99 @@ import type {
   TableDetails,
   TestConnectionResponse,
 } from '../types';
+import { buildConnectionKey } from '@/utils/connectionKey';
 
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
+type CachedResponse<T> = {
+  expiresAt: number;
+  value: ApiResponse<T>;
+};
+
+type FetchOptions = {
+  forceRefresh?: boolean;
+};
+
+const TABLE_LIST_TTL_MS = 30_000;
+const TABLE_DETAILS_TTL_MS = 120_000;
+const EXPORT_CAPABILITY_TTL_MS = 300_000;
+const MAX_CACHE_ENTRIES = 300;
+const TABLE_DETAILS_BATCH_SIZE = 200;
+const SINGLE_DETAIL_FALLBACK_CONCURRENCY = 6;
+
+const tableListCache = new Map<string, CachedResponse<Table[]>>();
+const tableListInflight = new Map<string, Promise<ApiResponse<Table[]>>>();
+
+const tableDetailsCache = new Map<string, CachedResponse<TableDetails>>();
+const tableDetailsInflight = new Map<string, Promise<ApiResponse<TableDetails>>>();
+const tableDetailsBatchInflight = new Map<string, Promise<ApiResponse<TableDetails[]>>>();
+
+const exportCapabilityCache = new Map<string, CachedResponse<ExportCapabilityReport>>();
+const exportCapabilityInflight = new Map<string, Promise<ApiResponse<ExportCapabilityReport>>>();
+
+function enforceCacheLimit<T>(cache: Map<string, CachedResponse<T>>) {
+  while (cache.size > MAX_CACHE_ENTRIES) {
+    const oldestKey = cache.keys().next().value as string | undefined;
+    if (oldestKey === undefined) {
+      break;
+    }
+    cache.delete(oldestKey);
+  }
+}
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function normalizeTableName(tableName: string): string {
+  return tableName.trim();
+}
+
+function makeTableDetailsCacheKey(configKey: string, tableName: string): string {
+  return `${configKey}|${normalizeTableName(tableName)}`;
+}
+
+function rememberTableDetails(
+  configKey: string,
+  tableName: string,
+  details: TableDetails,
+  combined?: Map<string, TableDetails>
+) {
+  const normalizedName = normalizeTableName(tableName);
+  if (!normalizedName) {
+    return;
+  }
+
+  tableDetailsCache.set(makeTableDetailsCacheKey(configKey, normalizedName), {
+    expiresAt: Date.now() + TABLE_DETAILS_TTL_MS,
+    value: { success: true, data: details },
+  });
+  combined?.set(normalizedName, details);
+}
+
+function makeTableDetailsBatchInflightKey(configKey: string, tableNames: string[]): string {
+  const normalized = tableNames.map(normalizeTableName);
+  return `${configKey}|${normalized.join(',')}`;
+}
+
+function buildOrderedTableDetails(
+  requestedNames: string[],
+  byName: Map<string, TableDetails>
+): TableDetails[] | null {
+  const ordered: TableDetails[] = [];
+  for (const tableName of requestedNames) {
+    const details = byName.get(normalizeTableName(tableName));
+    if (!details) {
+      return null;
+    }
+    ordered.push(details);
+  }
+  return ordered;
+}
 
 async function resolveBaseUrl() {
   if (isTauri()) {
@@ -148,30 +239,350 @@ export const saveConnection = async (
   }
 };
 
-export const listTables = async (config: ConnectionConfig): Promise<ApiResponse<Table[]>> => {
-  try {
-    const api = await getApi();
-    const response = await api.post<ApiResponse<Table[]>>('/tables', normalizeConfig(config));
-    return response.data;
-  } catch (error) {
-    return { success: false, error: extractApiError(error, 'Failed to load tables') };
+export const listTables = async (
+  config: ConnectionConfig,
+  options: FetchOptions = {}
+): Promise<ApiResponse<Table[]>> => {
+  const normalizedConfig = normalizeConfig(config);
+  const cacheKey = buildConnectionKey(normalizedConfig);
+  const now = Date.now();
+  const inflightKey = `${cacheKey}|refresh:${Boolean(options.forceRefresh)}`;
+  const inflight = tableListInflight.get(inflightKey);
+  if (inflight) {
+    return inflight;
   }
+
+  if (!options.forceRefresh) {
+    const cached = tableListCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return cached.value;
+    }
+  }
+
+  const request = (async () => {
+    try {
+      const api = await getApi();
+      const requestPayload = {
+        ...normalizedConfig,
+        force_refresh: Boolean(options.forceRefresh),
+      };
+      const response = await api.post<ApiResponse<Table[]>>('/tables', requestPayload);
+      const responsePayload = response.data;
+      if (responsePayload.success) {
+        tableListCache.set(cacheKey, {
+          expiresAt: Date.now() + TABLE_LIST_TTL_MS,
+          value: responsePayload,
+        });
+        enforceCacheLimit(tableListCache);
+      }
+      return responsePayload;
+    } catch (error) {
+      return { success: false, error: extractApiError(error, 'Failed to load tables') };
+    } finally {
+      tableListInflight.delete(inflightKey);
+    }
+  })();
+
+  tableListInflight.set(inflightKey, request);
+  return request;
 };
 
 export const getTableDetails = async (
   config: ConnectionConfig,
-  tableName: string
+  tableName: string,
+  options: FetchOptions = {}
 ): Promise<ApiResponse<TableDetails>> => {
-  try {
-    const api = await getApi();
-    const response = await api.post<ApiResponse<TableDetails>>(
-      `/tables/${encodeURIComponent(tableName)}/details`,
-      normalizeConfig(config)
-    );
-    return response.data;
-  } catch (error) {
-    return { success: false, error: extractApiError(error, 'Failed to load table details') };
+  const normalizedConfig = normalizeConfig(config);
+  const normalizedTableName = tableName.trim();
+  if (!normalizedTableName) {
+    return { success: false, error: 'Table name is required' };
   }
+
+  const configKey = buildConnectionKey(normalizedConfig);
+  const cacheKey = makeTableDetailsCacheKey(configKey, normalizedTableName);
+  const now = Date.now();
+  const inflightKey = `${cacheKey}|refresh:${Boolean(options.forceRefresh)}`;
+  const inflight = tableDetailsInflight.get(inflightKey);
+  if (inflight) {
+    return inflight;
+  }
+
+  if (!options.forceRefresh) {
+    const cached = tableDetailsCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return cached.value;
+    }
+  }
+
+  const request = (async () => {
+    try {
+      const api = await getApi();
+      const payload = {
+        ...normalizedConfig,
+        table_schema: normalizedConfig.schema,
+        force_refresh: Boolean(options.forceRefresh),
+      };
+      const response = await api.post<ApiResponse<TableDetails>>(
+        `/tables/${encodeURIComponent(normalizedTableName)}/details`,
+        payload
+      );
+      const result = response.data;
+      if (result.success && result.data) {
+        tableDetailsCache.set(cacheKey, {
+          expiresAt: Date.now() + TABLE_DETAILS_TTL_MS,
+          value: result,
+        });
+        enforceCacheLimit(tableDetailsCache);
+      }
+      return result;
+    } catch (error) {
+      return { success: false, error: extractApiError(error, 'Failed to load table details') };
+    } finally {
+      tableDetailsInflight.delete(inflightKey);
+    }
+  })();
+
+  tableDetailsInflight.set(inflightKey, request);
+  return request;
+};
+
+function normalizeTableNames(tableNames: string[]): string[] {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const name of tableNames) {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      continue;
+    }
+    if (seen.has(trimmed)) {
+      continue;
+    }
+    seen.add(trimmed);
+    normalized.push(trimmed);
+  }
+  return normalized;
+}
+
+export const getTableDetailsBatch = async (
+  config: ConnectionConfig,
+  tableNames: string[],
+  options: FetchOptions = {}
+): Promise<ApiResponse<TableDetails[]>> => {
+  const normalizedConfig = normalizeConfig(config);
+  const requestedNames = normalizeTableNames(tableNames);
+  if (requestedNames.length === 0) {
+    return { success: true, data: [] };
+  }
+
+  const configKey = buildConnectionKey(normalizedConfig);
+  const now = Date.now();
+  const fromCache = new Map<string, TableDetails>();
+  const missingNames: string[] = [];
+
+  if (!options.forceRefresh) {
+    for (const tableName of requestedNames) {
+      const detailKey = makeTableDetailsCacheKey(configKey, tableName);
+      const cached = tableDetailsCache.get(detailKey);
+      if (cached && cached.expiresAt > now && cached.value.success && cached.value.data) {
+        fromCache.set(normalizeTableName(tableName), cached.value.data);
+      } else {
+        missingNames.push(tableName);
+      }
+    }
+  } else {
+    missingNames.push(...requestedNames);
+  }
+
+  if (missingNames.length === 0) {
+    const ordered = buildOrderedTableDetails(requestedNames, fromCache);
+    if (ordered) {
+      return { success: true, data: ordered };
+    }
+    return {
+      success: false,
+      error: 'Cached table details are incomplete',
+    };
+  }
+
+  const batchKey = `${makeTableDetailsBatchInflightKey(configKey, requestedNames)}|refresh:${Boolean(options.forceRefresh)}`;
+  const inflight = tableDetailsBatchInflight.get(batchKey);
+  if (inflight) {
+    return inflight;
+  }
+
+  const request = (async () => {
+    const fetchSingleDetails = async (names: string[], forceRefresh: boolean) => {
+      const byRequestedName = new Map<string, TableDetails>();
+      let hasFailure = false;
+      let nextIndex = 0;
+      const workerCount = Math.min(SINGLE_DETAIL_FALLBACK_CONCURRENCY, names.length);
+
+      await Promise.all(
+        Array.from({ length: workerCount }, async () => {
+          while (nextIndex < names.length && !hasFailure) {
+            const tableName = names[nextIndex++];
+            const result = await getTableDetails(normalizedConfig, tableName, { forceRefresh });
+            if (!result.success || !result.data) {
+              hasFailure = true;
+              return;
+            }
+            byRequestedName.set(normalizeTableName(tableName), result.data);
+          }
+        })
+      );
+
+      return hasFailure ? null : byRequestedName;
+    };
+
+    try {
+      const api = await getApi();
+      const combined = new Map<string, TableDetails>(fromCache);
+      let batchError: string | undefined;
+
+      for (const chunk of chunkArray(missingNames, TABLE_DETAILS_BATCH_SIZE)) {
+        const payload = {
+          ...normalizedConfig,
+          table_schema: normalizedConfig.schema,
+          tables: chunk,
+          force_refresh: Boolean(options.forceRefresh),
+        };
+        const response = await api.post<ApiResponse<TableDetails[]>>(
+          '/tables/details/batch',
+          payload
+        );
+
+        if (response.data.success && response.data.data) {
+          const canAliasByOrder = response.data.data.length === chunk.length;
+          response.data.data.forEach((detail, index) => {
+            rememberTableDetails(configKey, detail.name, detail, combined);
+
+            const requestedName = canAliasByOrder ? chunk[index] : undefined;
+            if (
+              requestedName &&
+              normalizeTableName(requestedName) !== normalizeTableName(detail.name)
+            ) {
+              rememberTableDetails(configKey, requestedName, detail, combined);
+            }
+          });
+        } else {
+          batchError = response.data.error || batchError;
+        }
+      }
+      enforceCacheLimit(tableDetailsCache);
+
+      const unresolved = requestedNames.filter((name) => !combined.has(normalizeTableName(name)));
+      if (unresolved.length > 0) {
+        // Preserve old behavior by falling back to per-table API when batch data is incomplete.
+        const fallbackDetails = await fetchSingleDetails(unresolved, true);
+        if (!fallbackDetails) {
+          return {
+            success: false,
+            error: batchError || 'Failed to load table details batch',
+          };
+        }
+        for (const [requestedName, detail] of fallbackDetails) {
+          combined.set(requestedName, detail);
+        }
+      }
+
+      const ordered = buildOrderedTableDetails(requestedNames, combined);
+      if (!ordered) {
+        return {
+          success: false,
+          error: batchError || 'Failed to load table details batch',
+        };
+      }
+
+      return {
+        success: true,
+        data: ordered,
+      };
+    } catch (error) {
+      const fallbackDetails = await fetchSingleDetails(missingNames, Boolean(options.forceRefresh));
+      if (fallbackDetails) {
+        const combined = new Map<string, TableDetails>(fromCache);
+        for (const [requestedName, detail] of fallbackDetails) {
+          combined.set(requestedName, detail);
+        }
+        const ordered = buildOrderedTableDetails(requestedNames, combined);
+        if (ordered) {
+          return {
+            success: true,
+            data: ordered,
+          };
+        }
+      }
+
+      return {
+        success: false,
+        error: extractApiError(error, 'Failed to load table details batch'),
+      };
+    } finally {
+      tableDetailsBatchInflight.delete(batchKey);
+    }
+  })();
+
+  tableDetailsBatchInflight.set(batchKey, request);
+  return request;
+};
+
+export const getExportCapabilities = async (
+  sourceDbType: DbType,
+  targetDialect?: DbType,
+  options: FetchOptions = {}
+): Promise<ApiResponse<ExportCapabilityReport>> => {
+  const key = `${sourceDbType}|${targetDialect ?? sourceDbType}`;
+  const now = Date.now();
+  const inflightKey = `${key}|refresh:${Boolean(options.forceRefresh)}`;
+  const inflight = exportCapabilityInflight.get(inflightKey);
+  if (inflight) {
+    return inflight;
+  }
+
+  if (!options.forceRefresh) {
+    const cached = exportCapabilityCache.get(key);
+    if (cached && cached.expiresAt > now) {
+      return cached.value;
+    }
+  }
+
+  const request = (async () => {
+    try {
+      const api = await getApi();
+      const response = await api.get<ApiResponse<ExportCapabilityReport>>('/export/capabilities', {
+        params: {
+          source_db_type: sourceDbType,
+          target_dialect: targetDialect ?? sourceDbType,
+        },
+      });
+      const payload = response.data;
+      if (payload.success && payload.data) {
+        exportCapabilityCache.set(key, {
+          expiresAt: Date.now() + EXPORT_CAPABILITY_TTL_MS,
+          value: payload,
+        });
+        enforceCacheLimit(exportCapabilityCache);
+      }
+      return payload;
+    } catch (error) {
+      return { success: false, error: extractApiError(error, 'Failed to load export capabilities') };
+    } finally {
+      exportCapabilityInflight.delete(inflightKey);
+    }
+  })();
+
+  exportCapabilityInflight.set(inflightKey, request);
+  return request;
+};
+
+export const clearApiCaches = () => {
+  tableListCache.clear();
+  tableListInflight.clear();
+  tableDetailsCache.clear();
+  tableDetailsInflight.clear();
+  tableDetailsBatchInflight.clear();
+  exportCapabilityCache.clear();
+  exportCapabilityInflight.clear();
 };
 
 export const exportDDL = async (
@@ -229,23 +640,5 @@ export const getExportDirectory = async (): Promise<ApiResponse<string>> => {
     return response.data;
   } catch (error) {
     return { success: false, error: extractApiError(error, 'Failed to load export directory') };
-  }
-};
-
-export const getExportCapabilities = async (
-  sourceDbType: DbType,
-  targetDialect?: DbType
-): Promise<ApiResponse<ExportCapabilityReport>> => {
-  try {
-    const api = await getApi();
-    const response = await api.get<ApiResponse<ExportCapabilityReport>>('/export/capabilities', {
-      params: {
-        source_db_type: sourceDbType,
-        target_dialect: targetDialect ?? sourceDbType,
-      },
-    });
-    return response.data;
-  } catch (error) {
-    return { success: false, error: extractApiError(error, 'Failed to load export capabilities') };
   }
 };

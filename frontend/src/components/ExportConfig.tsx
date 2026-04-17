@@ -1,327 +1,367 @@
-﻿import { useState, useEffect, useRef } from 'react'
-import {
-  Form,
-  Checkbox,
-  Input,
-  InputNumber,
-  Space,
-  message,
-  Progress,
-  Typography,
-  Row,
-  Col,
-  Select,
-} from 'antd'
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ClockCircleOutlined,
-  FileTextOutlined,
-  DatabaseOutlined,
-  RocketOutlined,
-  FolderOpenOutlined,
   CopyOutlined,
-} from '@ant-design/icons'
-import { animate } from 'animejs'
-import type { CapabilityLevel, ExportRequest } from '@/types'
-import { exportDDL, exportData, getExportCapabilities, getExportDirectory } from '@/services/api'
-import { calcProgress } from '@/utils/exportProgress'
-import { useExportStore } from '@/store/useExportStore'
-import { TechCard } from './common/TechCard'
-import { TechButton } from './common/TechButton'
-import { SectionHeader } from './common/SectionHeader'
+  DatabaseOutlined,
+  FileTextOutlined,
+  FolderOpenOutlined,
+  RocketOutlined,
+} from '@ant-design/icons';
+import {
+  Checkbox,
+  Col,
+  Form,
+  Input,
+  InputNumber,
+  Progress,
+  Row,
+  Select,
+  Space,
+  Typography,
+  message,
+} from 'antd';
+import { animate } from 'animejs';
 
-const { Text } = Typography
+import type { CapabilityLevel, ExportCapabilityReport, ExportRequest } from '@/types';
+import { calcProgress } from '@/utils/exportProgress';
+import {
+  exportData,
+  exportDDL,
+  getExportCapabilities,
+  getExportDirectory,
+} from '@/services/api';
+import { useExportStore } from '@/store/useExportStore';
+import { SectionHeader } from './common/SectionHeader';
+import { TechButton } from './common/TechButton';
+import { TechCard } from './common/TechCard';
+
+const { Text } = Typography;
 
 const capabilityRank: Record<CapabilityLevel, number> = {
   none: 0,
   partial: 1,
   full: 2,
+};
+
+const isSupportedLevel = (level?: CapabilityLevel) => {
+  return (level ? capabilityRank[level] : 0) > capabilityRank.none;
+};
+
+type ExportOutcome = 'success' | 'partial' | 'failed' | null;
+
+function isTauri() {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
-const isSupportedLevel = (level?: CapabilityLevel) =>
-  (level ? capabilityRank[level] : 0) > capabilityRank.none
-
-type ExportOutcome = 'success' | 'partial' | 'failed' | null
+function formatTime(durationMs: number) {
+  const totalSeconds = Math.floor(durationMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+}
 
 export default function ExportConfig() {
-  const config = useExportStore((state) => state.connectionConfig)
-  const selectedTables = useExportStore((state) => state.selectedTables)
+  const config = useExportStore((state) => state.connectionConfig);
+  const selectedTables = useExportStore((state) => state.selectedTables);
 
-  const [form] = Form.useForm()
-  const watchedTargetDialect = Form.useWatch('target_dialect', form)
-  const [loading, setLoading] = useState(false)
-  const [progress, setProgress] = useState(0)
-  const [animatedProgress, setAnimatedProgress] = useState(0)
+  const [form] = Form.useForm();
+  const watchedTargetDialect = Form.useWatch('target_dialect', form);
+  const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [animatedProgress, setAnimatedProgress] = useState(0);
   const [progressStatus, setProgressStatus] = useState<'normal' | 'active' | 'success' | 'exception'>(
     'normal'
-  )
-  const [elapsedTime, setElapsedTime] = useState(0)
-  const [exportResult, setExportResult] = useState<{ ddl?: string; data?: string } | null>(null)
-  const [exportOutcome, setExportOutcome] = useState<ExportOutcome>(null)
-  const [includeRowCountsSupported, setIncludeRowCountsSupported] = useState(true)
-  const [includeRowCountsNote, setIncludeRowCountsNote] = useState<string | null>(null)
-  const resultRef = useRef<HTMLDivElement>(null)
+  );
+  const [elapsedTime, setElapsedTime] = useState(0);
+  const [exportResult, setExportResult] = useState<{ ddl?: string; data?: string } | null>(null);
+  const [exportOutcome, setExportOutcome] = useState<ExportOutcome>(null);
+  const [includeRowCountsSupported, setIncludeRowCountsSupported] = useState(true);
+  const [includeRowCountsNote, setIncludeRowCountsNote] = useState<string | null>(null);
+  const [capabilityReport, setCapabilityReport] = useState<ExportCapabilityReport | null>(null);
+  const animatedProgressRef = useRef(0);
+  const animatedProgressWholeRef = useRef(-1);
+  const resultRef = useRef<HTMLDivElement>(null);
+
+  const sourceDbType = config?.db_type ?? 'dm8';
+  const targetDialect = watchedTargetDialect ?? sourceDbType;
 
   useEffect(() => {
-    const progressObj = { value: animatedProgress }
-
-    animate(progressObj, {
+    const animationObject = { value: animatedProgressRef.current };
+    animate(animationObject, {
       value: progress,
       easing: 'easeOutExpo',
-      duration: 1000,
+      duration: 600,
       round: 1,
       onUpdate: () => {
-        setAnimatedProgress(progressObj.value)
+        const whole = Math.round(animationObject.value);
+        animatedProgressRef.current = whole;
+        if (whole !== animatedProgressWholeRef.current) {
+          animatedProgressWholeRef.current = whole;
+          setAnimatedProgress(whole);
+        }
       },
-    })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [progress])
+    });
+  }, [progress]);
 
   useEffect(() => {
-    let interval: ReturnType<typeof setInterval> | undefined
+    let timer: ReturnType<typeof setInterval> | undefined;
     if (loading) {
-      const startTime = Date.now() - elapsedTime
-      interval = setInterval(() => {
-        setElapsedTime(Date.now() - startTime)
-      }, 100)
+      const startTime = Date.now();
+      timer = setInterval(() => {
+        setElapsedTime(Date.now() - startTime);
+      }, 500);
     }
-    return () => clearInterval(interval)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loading])
+    return () => clearInterval(timer);
+  }, [loading]);
 
   useEffect(() => {
     if (config) {
       form.setFieldsValue({
         export_schema: config.export_schema ?? config.schema,
         target_dialect: config.db_type ?? 'dm8',
-      })
+      });
     }
-  }, [config, form])
+  }, [config, form]);
 
-  // Auto-scroll to result when export finishes
   useEffect(() => {
     if (exportResult && resultRef.current) {
-      resultRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      resultRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
-  }, [exportResult])
+  }, [exportResult]);
+
+  const loadCapability = useCallback(
+    async (source: typeof sourceDbType, target: typeof targetDialect) => {
+      const response = await getExportCapabilities(source, target);
+      if (!response.success || !response.data) {
+        return { ok: false as const, error: response.error || '加载导出能力失败' };
+      }
+      setCapabilityReport(response.data);
+      return { ok: true as const, data: response.data };
+    },
+    []
+  );
 
   useEffect(() => {
     if (!config) {
-      setIncludeRowCountsSupported(false)
-      setIncludeRowCountsNote(null)
-      return
+      setCapabilityReport(null);
+      setIncludeRowCountsSupported(false);
+      setIncludeRowCountsNote(null);
+      return;
     }
 
-    const sourceDbType = config.db_type ?? 'dm8'
-    const targetDialect = watchedTargetDialect ?? sourceDbType
-    let cancelled = false
-
-    const loadCapability = async () => {
-      const capabilityResp = await getExportCapabilities(sourceDbType, targetDialect)
-      if (cancelled) {
-        return
-      }
-
-      if (capabilityResp.success && capabilityResp.data) {
-        const supported = capabilityResp.data.data_options?.include_row_counts_supported ?? false
-        const note = capabilityResp.data.data_options?.include_row_counts_note ?? null
-        setIncludeRowCountsSupported(supported)
-        setIncludeRowCountsNote(note)
-        if (!supported) {
-          form.setFieldValue('include_row_counts', false)
+    let cancelled = false;
+    void loadCapability(sourceDbType, targetDialect)
+      .then((result) => {
+        if (cancelled) {
+          return;
         }
-      } else {
-        setIncludeRowCountsSupported(false)
-        setIncludeRowCountsNote(
-          capabilityResp.error || '当前源/目标组合不支持行数预扫描'
-        )
-        form.setFieldValue('include_row_counts', false)
-      }
-    }
+        if (!result.ok) {
+          setIncludeRowCountsSupported(false);
+          setIncludeRowCountsNote(result.error);
+          form.setFieldValue('include_row_counts', false);
+          return;
+        }
 
-    loadCapability().catch(() => {
-      if (!cancelled) {
-        setIncludeRowCountsSupported(false)
-        setIncludeRowCountsNote('行数预扫描能力检查失败')
-        form.setFieldValue('include_row_counts', false)
-      }
-    })
+        const supported = result.data.data_options?.include_row_counts_supported ?? false;
+        const note = result.data.data_options?.include_row_counts_note ?? null;
+        setIncludeRowCountsSupported(supported);
+        setIncludeRowCountsNote(note);
+        if (!supported) {
+          form.setFieldValue('include_row_counts', false);
+        }
+      })
+      .catch(() => {
+        if (cancelled) {
+          return;
+        }
+        setIncludeRowCountsSupported(false);
+        setIncludeRowCountsNote('行数预扫描能力检查失败');
+        form.setFieldValue('include_row_counts', false);
+      });
 
     return () => {
-      cancelled = true
-    }
-  }, [config, watchedTargetDialect, form])
-
-  const formatTime = (ms: number) => {
-    const totalSeconds = Math.floor(ms / 1000)
-    const m = Math.floor(totalSeconds / 60)
-    const s = totalSeconds % 60
-    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
-  }
-
-  const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+      cancelled = true;
+    };
+  }, [config, form, loadCapability, sourceDbType, targetDialect]);
 
   const handleOpenFolder = async () => {
-    const res = await getExportDirectory()
-    if (!res.success || !res.data) {
-      message.error(res.error || '获取导出目录失败')
-      return
+    const response = await getExportDirectory();
+    if (!response.success || !response.data) {
+      message.error(response.error || '获取导出目录失败');
+      return;
     }
-    const dir = res.data
+
+    const directory = response.data;
     if (isTauri()) {
       try {
-        const { openPath } = await import('@tauri-apps/plugin-opener')
-        await openPath(dir)
+        const { openPath } = await import('@tauri-apps/plugin-opener');
+        await openPath(directory);
       } catch {
-        message.error('无法打开目录')
+        message.error('无法打开导出目录');
       }
-    } else {
-      try {
-        await navigator.clipboard.writeText(dir)
-        message.success(`路径已复制: ${dir}`)
-      } catch {
-        message.info(`导出目录: ${dir}`)
-      }
+      return;
     }
-  }
+
+    try {
+      await navigator.clipboard.writeText(directory);
+      message.success(`路径已复制: ${directory}`);
+    } catch {
+      message.info(`导出目录: ${directory}`);
+    }
+  };
+
+  const copyText = async (value: string, successMessage: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      message.success(successMessage);
+    } catch {
+      message.error('复制失败');
+    }
+  };
 
   const handleExport = async () => {
     if (!config || selectedTables.length === 0) {
-      message.warning('导出中止：前置条件未满足')
-      return
+      message.warning('请先完成连接并选择要导出的表');
+      return;
     }
+
     try {
-      const values = await form.validateFields()
-      const sourceDbType = config.db_type ?? 'dm8'
-      const targetDialect = values.target_dialect ?? sourceDbType
-      const capabilityResp = await getExportCapabilities(sourceDbType, targetDialect)
-      if (!capabilityResp.success || !capabilityResp.data) {
-        message.error(capabilityResp.error || '加载导出能力失败')
-        return
+      const values = await form.validateFields();
+      const source = config.db_type ?? 'dm8';
+      const target = values.target_dialect ?? source;
+
+      let capability: ExportCapabilityReport | null = null;
+      if (
+        capabilityReport &&
+        capabilityReport.source_db_type === source &&
+        capabilityReport.target_dialect === target
+      ) {
+        capability = capabilityReport;
+      } else {
+        const capabilityResult = await loadCapability(source, target);
+        capability = capabilityResult.ok ? capabilityResult.data : null;
       }
 
-      const ddlCapability = capabilityResp.data.entries.find((entry) => entry.object === 'ddl')
-      const dataCapability = capabilityResp.data.entries.find((entry) => entry.object === 'data')
+      if (!capability) {
+        message.error('加载导出能力失败');
+        return;
+      }
+
+      const ddlCapability = capability.entries.find((entry) => entry.object === 'ddl');
+      const dataCapability = capability.entries.find((entry) => entry.object === 'data');
 
       if (values.include_ddl && !isSupportedLevel(ddlCapability?.effective_level)) {
-        const reason = ddlCapability?.reason_code ? ` [${ddlCapability.reason_code}]` : ''
-        message.warning(`${ddlCapability?.note || '当前组合不支持 DDL 导出'}${reason}`)
-        return
-      }
-      if (values.include_data && !isSupportedLevel(dataCapability?.effective_level)) {
-        const reason = dataCapability?.reason_code ? ` [${dataCapability.reason_code}]` : ''
-        message.warning(`${dataCapability?.note || '当前组合不支持数据导出'}${reason}`)
-        return
+        const reason = ddlCapability?.reason_code ? ` [${ddlCapability.reason_code}]` : '';
+        message.warning(`${ddlCapability?.note || '当前组合不支持 DDL 导出'}${reason}`);
+        return;
       }
 
-      setLoading(true)
-      setProgress(0)
-      setProgressStatus('active')
-      setElapsedTime(0)
-      setExportResult(null)
-      setExportOutcome(null)
+      if (values.include_data && !isSupportedLevel(dataCapability?.effective_level)) {
+        const reason = dataCapability?.reason_code ? ` [${dataCapability.reason_code}]` : '';
+        message.warning(`${dataCapability?.note || '当前组合不支持数据导出'}${reason}`);
+        return;
+      }
+
+      setLoading(true);
+      setProgress(0);
+      setProgressStatus('active');
+      setElapsedTime(0);
+      setExportResult(null);
+      setExportOutcome(null);
 
       const request: ExportRequest = {
         config,
-        target_dialect: targetDialect,
+        target_dialect: target,
         export_schema: values.export_schema?.trim() || undefined,
         export_compat: values.export_compat,
-        tables: selectedTables.map(name => ({
-          schema: config.schema,
-          name,
-        })),
+        tables: selectedTables.map((name) => ({ schema: config.schema, name })),
         include_ddl: values.include_ddl,
         include_data: values.include_data,
         batch_size: values.batch_size || 1000,
         drop_existing: values.drop_existing,
         include_row_counts: includeRowCountsSupported ? Boolean(values.include_row_counts) : false,
         strict_mode: Boolean(values.strict_mode),
-        identifier_case: (targetDialect === 'kingbase' || targetDialect === 'shentong') ? (values.identifier_case || 'lower') : undefined,
-      }
+        identifier_case:
+          target === 'kingbase' || target === 'shentong' ? values.identifier_case || 'lower' : undefined,
+      };
 
-      const results: { ddl?: string; data?: string } = {}
-      let completedSteps = 0
-      let failedSteps = 0
-      const totalSteps = (values.include_ddl ? 1 : 0) + (values.include_data ? 1 : 0)
+      const results: { ddl?: string; data?: string } = {};
+      let completedSteps = 0;
+      let failedSteps = 0;
+      const totalSteps = (values.include_ddl ? 1 : 0) + (values.include_data ? 1 : 0);
 
       const updateStepProgress = () => {
-        const hasAnyError = failedSteps > 0
-        const nextProgress = calcProgress({
+        const next = calcProgress({
           includeDdl: values.include_ddl,
           includeData: values.include_data,
           completedSteps,
-          hasError: hasAnyError,
-        })
-        setProgress(nextProgress.percent)
-        setProgressStatus(hasAnyError ? 'exception' : nextProgress.status)
-      }
+          hasError: failedSteps > 0,
+        });
+        setProgress(next.percent);
+        setProgressStatus(failedSteps > 0 ? 'exception' : next.status);
+      };
 
       if (values.include_ddl) {
-        const ddlResult = await exportDDL(request)
+        const ddlResult = await exportDDL(request);
         if (ddlResult.success && ddlResult.data) {
-          results.ddl = ddlResult.data.file_path
-          message.success('DDL 导出成功')
-          completedSteps += 1
+          results.ddl = ddlResult.data.file_path;
+          completedSteps += 1;
+          message.success('DDL 导出成功');
         } else {
-          message.error(ddlResult.error || 'DDL 导出失败')
-          failedSteps += 1
+          failedSteps += 1;
+          message.error(ddlResult.error || 'DDL 导出失败');
         }
-        updateStepProgress()
+        updateStepProgress();
       }
 
       if (values.include_data) {
-        const dataResult = await exportData(request)
+        const dataResult = await exportData(request);
         if (dataResult.success && dataResult.data) {
-          results.data = dataResult.data.file_path
-          message.success('数据导出成功')
-          completedSteps += 1
+          results.data = dataResult.data.file_path;
+          completedSteps += 1;
+          message.success('数据导出成功');
         } else {
-          message.error(dataResult.error || '数据导出失败')
-          failedSteps += 1
+          failedSteps += 1;
+          message.error(dataResult.error || '数据导出失败');
         }
-        updateStepProgress()
+        updateStepProgress();
       }
 
       if (!values.include_ddl && !values.include_data) {
-        message.warning('请至少选择一个导出模块')
-        setProgress(0)
-        setProgressStatus('normal')
+        setProgress(0);
+        setProgressStatus('normal');
+        message.warning('请至少选择一个导出模块');
+      } else if (failedSteps === 0) {
+        setExportOutcome('success');
+        setExportResult(results.ddl || results.data ? results : null);
+      } else if (failedSteps < totalSteps) {
+        setExportOutcome('partial');
+        setProgressStatus('exception');
+        message.warning('导出部分成功，请根据报错信息重试失败步骤');
+        setExportResult(results.ddl || results.data ? results : null);
       } else {
-        if (failedSteps === 0) {
-          setExportOutcome('success')
-          if (results.ddl || results.data) {
-            setExportResult(results)
-          }
-        } else if (failedSteps < totalSteps) {
-          setExportOutcome('partial')
-          setProgressStatus('exception')
-          message.warning('导出部分成功，请检查失败步骤后重试')
-          if (results.ddl || results.data) {
-            setExportResult(results)
-          }
-        } else {
-          setExportOutcome('failed')
-          setProgressStatus('exception')
-        }
+        setExportOutcome('failed');
+        setProgressStatus('exception');
       }
     } catch {
-      message.error('导出时发生意外错误')
+      message.error('导出过程中发生异常');
       const errorProgress = calcProgress({
         includeDdl: true,
         includeData: true,
         completedSteps: 0,
         hasError: true,
-      })
-      setProgress(errorProgress.percent)
-      setProgressStatus(errorProgress.status)
-      setExportOutcome('failed')
+      });
+      setProgress(errorProgress.percent);
+      setProgressStatus(errorProgress.status);
+      setExportOutcome('failed');
     } finally {
-      setLoading(false)
+      setLoading(false);
     }
-  }
+  };
 
   return (
     <TechCard>
-      <SectionHeader title="导出控制面板" subtitle="配置并执行导出任务" />
+      <SectionHeader title="导出控制台" subtitle="设置导出策略并执行任务" />
 
       <Form
         form={form}
@@ -336,38 +376,32 @@ export default function ExportConfig() {
           strict_mode: false,
         }}
       >
-        <Row gutter={24}>
-          <Col span={12}>
+        <Row gutter={16}>
+          <Col xs={24} md={12}>
             <Form.Item name="include_ddl" valuePropName="checked">
-              <Checkbox style={{ fontFamily: 'Orbitron', color: '#fff' }}>
-                <FileTextOutlined style={{ marginRight: 8, color: '#00b96b' }} />
-                导出 DDL（表结构）
+              <Checkbox>
+                <FileTextOutlined /> 导出 DDL（表结构）
               </Checkbox>
             </Form.Item>
           </Col>
-          <Col span={12}>
+          <Col xs={24} md={12}>
             <Form.Item name="include_data" valuePropName="checked">
-              <Checkbox style={{ fontFamily: 'Orbitron', color: '#fff' }}>
-                <DatabaseOutlined style={{ marginRight: 8, color: '#00b96b' }} />
-                导出数据（INSERT）
+              <Checkbox>
+                <DatabaseOutlined /> 导出数据（INSERT）
               </Checkbox>
             </Form.Item>
           </Col>
         </Row>
 
-        <Row gutter={24}>
-          <Col span={12}>
+        <Row gutter={16}>
+          <Col xs={24} md={12}>
             <Form.Item name="drop_existing" valuePropName="checked">
-              <Checkbox style={{ fontFamily: 'Orbitron', color: '#fff' }}>
-                生成 DROP TABLE IF EXISTS
-              </Checkbox>
+              <Checkbox>生成 DROP TABLE IF EXISTS</Checkbox>
             </Form.Item>
           </Col>
-          <Col span={12}>
+          <Col xs={24} md={12}>
             <Form.Item name="include_row_counts" valuePropName="checked">
-              <Checkbox style={{ fontFamily: 'Orbitron', color: '#fff' }} disabled={!includeRowCountsSupported}>
-                写入行数预扫描注释
-              </Checkbox>
+              <Checkbox disabled={!includeRowCountsSupported}>写入行数预扫描注释</Checkbox>
             </Form.Item>
             {!includeRowCountsSupported && includeRowCountsNote && (
               <Text type="secondary" style={{ fontSize: 12 }}>
@@ -377,30 +411,20 @@ export default function ExportConfig() {
           </Col>
         </Row>
 
-        <Row gutter={24}>
-          <Col span={12}>
-            <Form.Item name="strict_mode" valuePropName="checked">
-              <Checkbox style={{ fontFamily: 'Orbitron', color: '#fff' }}>
-                严格模式（部分支持时快速失败）
-              </Checkbox>
-            </Form.Item>
-          </Col>
-        </Row>
+        <Form.Item name="strict_mode" valuePropName="checked">
+          <Checkbox>严格模式（部分支持时快速失败）</Checkbox>
+        </Form.Item>
 
-        <Form.Item
-          label={<span style={{ fontFamily: 'JetBrains Mono' }}>批次大小（每次插入行数）</span>}
-          name="batch_size"
-        >
-          <InputNumber min={100} max={10000} step={100} style={{ width: '100%', fontFamily: 'JetBrains Mono' }} />
+        <Form.Item label="批次大小（每次插入行数）" name="batch_size">
+          <InputNumber min={100} max={10000} step={100} style={{ width: '100%' }} />
         </Form.Item>
 
         <Form.Item
-          label={<span style={{ fontFamily: 'JetBrains Mono' }}>目标方言</span>}
+          label="目标方言"
           name="target_dialect"
           rules={[{ required: true, message: '请选择目标方言' }]}
         >
           <Select
-            style={{ width: '100%', fontFamily: 'JetBrains Mono' }}
             options={[
               { value: 'dm8', label: 'DM8' },
               { value: 'mysql', label: 'MySQL' },
@@ -411,34 +435,25 @@ export default function ExportConfig() {
         </Form.Item>
 
         <Form.Item
-          label={<span style={{ fontFamily: 'JetBrains Mono' }}>导出兼容模式</span>}
+          label="导出兼容模式"
           name="export_compat"
           rules={[{ required: true, message: '请选择兼容模式' }]}
         >
           <Select
             placeholder="选择兼容模式"
-            style={{ width: '100%', fontFamily: 'JetBrains Mono' }}
             options={[
               { value: 'datagrip', label: 'DataGrip 逐语句模式（END; 无 /）' },
-              {
-                value: 'datagrip-script',
-                label: 'DataGrip 脚本模式（触发器单独输出）',
-              },
+              { value: 'datagrip-script', label: 'DataGrip 脚本模式（触发器单独输出）' },
               { value: 'script', label: 'DBeaver/SQLark/DIsql 模式（END; + /）' },
             ]}
           />
         </Form.Item>
 
-        {(watchedTargetDialect === 'kingbase' || watchedTargetDialect === 'shentong') && (
-          <Form.Item
-            label={<span style={{ fontFamily: 'JetBrains Mono' }}>标识符大小写</span>}
-            name="identifier_case"
-            initialValue="lower"
-          >
+        {(targetDialect === 'kingbase' || targetDialect === 'shentong') && (
+          <Form.Item label="标识符大小写" name="identifier_case" initialValue="lower">
             <Select
-              style={{ width: '100%', fontFamily: 'JetBrains Mono' }}
               options={[
-                { value: 'lower', label: watchedTargetDialect === 'kingbase' ? '小写（Kingbase 推荐）' : '小写' },
+                { value: 'lower', label: targetDialect === 'kingbase' ? '小写（Kingbase 推荐）' : '小写' },
                 { value: 'upper', label: '大写' },
                 { value: 'preserve', label: '保持原样' },
               ]}
@@ -446,152 +461,73 @@ export default function ExportConfig() {
           </Form.Item>
         )}
 
-        <Form.Item
-          label={<span style={{ fontFamily: 'JetBrains Mono' }}>导出模式名</span>}
-          name="export_schema"
-        >
-          <Input
-            placeholder="可选，默认使用源模式名"
-            style={{ width: '100%', fontFamily: 'JetBrains Mono' }}
-          />
+        <Form.Item label="导出 Schema（可选）" name="export_schema">
+          <Input placeholder="为空时使用源 Schema" />
         </Form.Item>
 
-        <Form.Item>
-          <Space direction="vertical" style={{ width: '100%', marginTop: 24 }}>
-            <TechButton
-              type="primary"
-              icon={<RocketOutlined />}
-              onClick={handleExport}
-              loading={loading}
-              disabled={!config || selectedTables.length === 0}
-              block
-              style={{ height: '50px', fontSize: '16px', letterSpacing: '2px' }}
+        <Space direction="vertical" style={{ width: '100%', marginTop: 20 }}>
+          <TechButton
+            type="primary"
+            icon={<RocketOutlined />}
+            onClick={handleExport}
+            loading={loading}
+            disabled={!config || selectedTables.length === 0}
+            block
+            style={{ height: 48, fontWeight: 700 }}
+          >
+            {loading ? '导出中...' : '开始导出'}
+          </TechButton>
+
+          {(loading || progress > 0) && (
+            <div className="export-progress-panel">
+              <div className="export-progress-header">
+                <Text type="secondary">进度</Text>
+                <Text type="secondary">
+                  <ClockCircleOutlined /> {formatTime(elapsedTime)}
+                </Text>
+              </div>
+              <Progress
+                percent={animatedProgress}
+                status={loading ? 'active' : progressStatus}
+                strokeColor={{ '0%': '#4aa8ff', '100%': '#14c8be' }}
+                trailColor="rgba(255,255,255,0.1)"
+              />
+            </div>
+          )}
+
+          {exportResult && (
+            <div
+              ref={resultRef}
+              className={`export-result-panel ${
+                exportOutcome === 'partial' ? 'export-result-partial' : 'export-result-success'
+              }`}
             >
-              {loading ? '导出中...' : '开始导出'}
-            </TechButton>
-
-            {(loading || progress > 0) && (
-              <div
-                style={{
-                  marginTop: 24,
-                  padding: 16,
-                  background: 'rgba(0,0,0,0.3)',
-                  border: '1px solid rgba(255,255,255,0.1)',
-                }}
-              >
-                <div
-                  style={{
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    marginBottom: 8,
-                    fontFamily: 'JetBrains Mono',
-                    fontSize: 12,
-                  }}
-                >
-                  <Text type="secondary">进度</Text>
-                  <Text type="secondary" style={{ color: '#00b96b' }}>
-                    <ClockCircleOutlined style={{ marginRight: 4 }} />
-                    {formatTime(elapsedTime)}
-                  </Text>
-                </div>
-                <Progress
-                  percent={animatedProgress}
-                  status={loading ? 'active' : progressStatus}
-                  strokeColor={{ '0%': '#108ee9', '100%': '#87d068' }}
-                  trailColor="rgba(255,255,255,0.1)"
-                />
-              </div>
-            )}
-
-            {exportResult && (
-              <div
-                ref={resultRef}
-                style={{
-                  marginTop: 24,
-                  borderLeft: exportOutcome === 'partial' ? '4px solid #faad14' : '4px solid #52c41a',
-                  paddingLeft: 16,
-                  background:
-                    exportOutcome === 'partial'
-                      ? 'rgba(250, 173, 20, 0.12)'
-                      : 'rgba(82, 196, 26, 0.1)',
-                  padding: 16,
-                }}
-              >
-                <div
-                  style={{
-                    fontFamily: 'Orbitron',
-                    color: exportOutcome === 'partial' ? '#faad14' : '#52c41a',
-                    marginBottom: 12,
-                    fontWeight: 'bold',
-                  }}
-                >
-                  {exportOutcome === 'partial' ? '导出部分成功' : '导出完成'}
-                </div>
-                <Space
-                  direction="vertical"
-                  style={{ width: '100%', fontFamily: 'JetBrains Mono', fontSize: 12 }}
-                >
-                  {exportOutcome === 'partial' && (
-                    <div style={{ color: '#faad14' }}>存在失败步骤，请查看上方错误提示后重试。</div>
-                  )}
-                  {exportResult.ddl && (
-                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
-                      <span style={{ color: '#aaa', whiteSpace: 'nowrap' }}>&gt; DDL 文件:</span>
-                      <span
-                        style={{
-                          color: '#fff',
-                          wordBreak: 'break-all',
-                          flex: 1,
-                          lineHeight: 1.6,
-                        }}
-                      >
-                        {exportResult.ddl}
-                      </span>
-                      <CopyOutlined
-                        style={{ color: '#00b96b', cursor: 'pointer', flexShrink: 0, marginTop: 2 }}
-                        title="复制路径"
-                        onClick={() => {
-                          navigator.clipboard.writeText(exportResult.ddl!).then(() =>
-                            message.success('DDL 路径已复制')
-                          )
-                        }}
-                      />
-                    </div>
-                  )}
-                  {exportResult.data && (
-                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
-                      <span style={{ color: '#aaa', whiteSpace: 'nowrap' }}>&gt; 数据文件:</span>
-                      <span
-                        style={{
-                          color: '#fff',
-                          wordBreak: 'break-all',
-                          flex: 1,
-                          lineHeight: 1.6,
-                        }}
-                      >
-                        {exportResult.data}
-                      </span>
-                      <CopyOutlined
-                        style={{ color: '#00b96b', cursor: 'pointer', flexShrink: 0, marginTop: 2 }}
-                        title="复制路径"
-                        onClick={() => {
-                          navigator.clipboard.writeText(exportResult.data!).then(() =>
-                            message.success('数据路径已复制')
-                          )
-                        }}
-                      />
-                    </div>
-                  )}
-                  <div style={{ marginTop: 8, color: '#aaa' }}>// 耗时: {formatTime(elapsedTime)}</div>
-                  <TechButton icon={<FolderOpenOutlined />} onClick={handleOpenFolder} style={{ marginTop: 12 }}>
-                    打开导出目录
-                  </TechButton>
-                </Space>
-              </div>
-            )}
-          </Space>
-        </Form.Item>
+              <h4>{exportOutcome === 'partial' ? '导出部分成功' : '导出完成'}</h4>
+              <Space direction="vertical" style={{ width: '100%' }}>
+                {exportOutcome === 'partial' && <p>存在失败步骤，请按错误提示重试。</p>}
+                {exportResult.ddl && (
+                  <div className="export-result-item">
+                    <span>DDL 文件:</span>
+                    <code>{exportResult.ddl}</code>
+                    <CopyOutlined onClick={() => void copyText(exportResult.ddl!, 'DDL 路径已复制')} />
+                  </div>
+                )}
+                {exportResult.data && (
+                  <div className="export-result-item">
+                    <span>数据文件:</span>
+                    <code>{exportResult.data}</code>
+                    <CopyOutlined onClick={() => void copyText(exportResult.data!, '数据路径已复制')} />
+                  </div>
+                )}
+                <p className="export-result-duration">总耗时: {formatTime(elapsedTime)}</p>
+                <TechButton icon={<FolderOpenOutlined />} onClick={handleOpenFolder}>
+                  打开导出目录
+                </TechButton>
+              </Space>
+            </div>
+          )}
+        </Space>
       </Form>
     </TechCard>
-  )
+  );
 }

@@ -378,7 +378,7 @@ fn parse_hex_bytes(raw: &str) -> Option<Vec<u8>> {
     if normalized.is_empty() {
         return Some(Vec::new());
     }
-    if normalized.len() % 2 != 0 {
+    if !normalized.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(normalized.len() / 2);

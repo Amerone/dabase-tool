@@ -1149,11 +1149,7 @@ fn has_timezone(expr: &str) -> bool {
         // Make sure it's not a date separator (position should be after time part)
         if expr[..pos].contains(':') {
             let rest = &expr[pos..];
-            return rest.len() >= 5
-                && rest[1..]
-                    .chars()
-                    .next()
-                    .map_or(false, |c| c.is_ascii_digit());
+            return rest.len() >= 5 && rest[1..].chars().next().is_some_and(|c| c.is_ascii_digit());
         }
     }
     false
@@ -1252,9 +1248,7 @@ fn is_numeric_literal(expr: &str) -> bool {
 
 /// Check if expression looks like a date literal (YYYY-MM-DD format)
 fn is_date_literal(expr: &str) -> bool {
-    let parts: Vec<&str> = expr
-        .split(|c| c == '-' || c == ' ' || c == ':' || c == '.' || c == 'T')
-        .collect();
+    let parts: Vec<&str> = expr.split(['-', ' ', ':', '.', 'T']).collect();
 
     if parts.len() < 3 {
         return false;

@@ -5,14 +5,27 @@
   "identifier": "com.dm8.export",
   "build": {
     "beforeDevCommand": "",
-    "beforeBuildCommand": "cd ../frontend && npm run build",
+    "beforeBuildCommand": "cd frontend && npm run build",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../frontend/dist"
   },
   "bundle": {
     "targets": ["appimage", "deb", "nsis"],
     "resources": {
-      "../drivers/dm8": "drivers/dm8"
+      "../drivers/dm8": "drivers/dm8",
+      "../drivers/kingbase/X64_Linux/odbc": "drivers/kingbase/X64_Linux/odbc",
+      "../drivers/kingbase/X64_Windows/odbc/x64_ANSI_Release": "drivers/kingbase/X64_Windows/odbc/x64_ANSI_Release",
+      "../drivers/postgresql/windows/libcrypto-3-x64.dll": "drivers/postgresql/windows/libcrypto-3-x64.dll",
+      "../drivers/postgresql/windows/libpq.dll": "drivers/postgresql/windows/libpq.dll",
+      "../drivers/postgresql/windows/libssl-3-x64.dll": "drivers/postgresql/windows/libssl-3-x64.dll",
+      "../drivers/postgresql/windows/msvcp140.dll": "drivers/postgresql/windows/msvcp140.dll",
+      "../drivers/postgresql/windows/pgenlist.dll": "drivers/postgresql/windows/pgenlist.dll",
+      "../drivers/postgresql/windows/pgenlista.dll": "drivers/postgresql/windows/pgenlista.dll",
+      "../drivers/postgresql/windows/pgxalib.dll": "drivers/postgresql/windows/pgxalib.dll",
+      "../drivers/postgresql/windows/psqlodbc30a.dll": "drivers/postgresql/windows/psqlodbc30a.dll",
+      "../drivers/postgresql/windows/psqlodbc35w.dll": "drivers/postgresql/windows/psqlodbc35w.dll",
+      "../drivers/postgresql/windows/vcruntime140.dll": "drivers/postgresql/windows/vcruntime140.dll",
+      "../drivers/shentong/windows": "drivers/shentong/windows"
     },
     "windows": {
       "nsis": {

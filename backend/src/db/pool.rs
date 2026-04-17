@@ -2,9 +2,28 @@ use anyhow::{anyhow, Context, Result};
 use odbc_api::{Connection, ConnectionOptions, Environment};
 use parking_lot::Mutex;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::models::{ConnectionConfig, DbType};
+
+static SHARED_ODBC_ENV: OnceLock<Arc<Environment>> = OnceLock::new();
+
+fn shared_environment() -> Result<Arc<Environment>> {
+    if let Some(env) = SHARED_ODBC_ENV.get() {
+        return Ok(Arc::clone(env));
+    }
+
+    let env = Arc::new(Environment::new().context("Failed to initialize ODBC environment")?);
+
+    if SHARED_ODBC_ENV.set(Arc::clone(&env)).is_err() {
+        if let Some(existing) = SHARED_ODBC_ENV.get() {
+            return Ok(Arc::clone(existing));
+        }
+        return Err(anyhow!("Failed to initialize shared ODBC environment"));
+    }
+
+    Ok(env)
+}
 
 /// Simplified connection pool that reuses Environment but creates connections on demand.
 /// This is a significant improvement over creating a new Environment each time.
@@ -41,8 +60,7 @@ impl ConnectionPool {
             return Err(anyhow!("ShenTong uses native ACI connector, not ODBC"));
         }
 
-        let environment =
-            Arc::new(Environment::new().context("Failed to initialize ODBC environment")?);
+        let environment = shared_environment()?;
         let connection_string = config
             .odbc_connection_string()
             .context("Failed to build ODBC connection string")?;
@@ -79,8 +97,7 @@ impl ConnectionPool {
             return Err(anyhow!("ShenTong uses native ACI connector, not ODBC"));
         }
 
-        let environment =
-            Arc::new(Environment::new().context("Failed to initialize ODBC environment")?);
+        let environment = shared_environment()?;
         let connection_string = config
             .odbc_connection_string()
             .context("Failed to build ODBC connection string")?;

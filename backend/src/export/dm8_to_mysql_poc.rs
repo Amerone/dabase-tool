@@ -290,11 +290,10 @@ fn extract_datetime_fsp(mysql_type: &str) -> i32 {
     let upper = mysql_type.trim().to_uppercase();
     for prefix in &["DATETIME(", "TIMESTAMP("] {
         if upper.starts_with(prefix) {
-            if let Some(n) = upper
+            if let Ok(n) = upper
                 .trim_start_matches(prefix)
                 .trim_end_matches(')')
                 .parse::<i32>()
-                .ok()
             {
                 return n;
             }
@@ -311,21 +310,19 @@ const MYSQL_MAX_ROW_SIZE: i64 = 65535;
 fn mysql_type_index_bytes(mysql_type: &str) -> i64 {
     let upper = mysql_type.to_uppercase();
     if upper.starts_with("VARCHAR(") {
-        if let Some(n) = upper
+        if let Ok(n) = upper
             .trim_start_matches("VARCHAR(")
             .trim_end_matches(')')
             .parse::<i64>()
-            .ok()
         {
             return n * 4 + 2; // utf8mb4: n*4 bytes + 2 length prefix
         }
     }
     if upper.starts_with("CHAR(") {
-        if let Some(n) = upper
+        if let Ok(n) = upper
             .trim_start_matches("CHAR(")
             .trim_end_matches(')')
             .parse::<i64>()
-            .ok()
         {
             return n * 4;
         }
@@ -362,33 +359,30 @@ fn mysql_type_row_bytes(mysql_type: &str) -> i64 {
     }
     // VARCHAR(n) with utf8mb4: n*4 + 2 bytes length prefix
     if upper.starts_with("VARCHAR(") {
-        if let Some(n) = upper
+        if let Ok(n) = upper
             .trim_start_matches("VARCHAR(")
             .trim_end_matches(')')
             .parse::<i64>()
-            .ok()
         {
             return n * 4 + 2;
         }
     }
     // CHAR(n) with utf8mb4: n*4
     if upper.starts_with("CHAR(") {
-        if let Some(n) = upper
+        if let Ok(n) = upper
             .trim_start_matches("CHAR(")
             .trim_end_matches(')')
             .parse::<i64>()
-            .ok()
         {
             return n * 4;
         }
     }
     // VARBINARY(n): n + 2
     if upper.starts_with("VARBINARY(") {
-        if let Some(n) = upper
+        if let Ok(n) = upper
             .trim_start_matches("VARBINARY(")
             .trim_end_matches(')')
             .parse::<i64>()
-            .ok()
         {
             return n + 2;
         }
@@ -424,11 +418,7 @@ fn generate_mysql_create_table(table: &TableDetails) -> String {
     let table_ident = mysql_quote(&table.name);
 
     // Phase 1: Map all column types and calculate row size
-    let mut col_types: Vec<String> = table
-        .columns
-        .iter()
-        .map(|col| dm8_type_to_mysql(col))
-        .collect();
+    let mut col_types: Vec<String> = table.columns.iter().map(dm8_type_to_mysql).collect();
 
     // Phase 2: Check row size, demote largest VARCHAR→TEXT until under limit.
     // Columns used in PK, indexes, unique constraints, or FK cannot be demoted to TEXT

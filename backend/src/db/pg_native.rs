@@ -3,7 +3,7 @@
 /// Uses `tokio-postgres` directly so we bypass the Windows ODBC Driver Manager entirely.
 /// KingBase V8R6 speaks the PostgreSQL wire protocol, so this works reliably.
 use anyhow::{Context, Result};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{Client, Config, NoTls};
 
 use crate::models::{
     CheckConstraint, Column, ConnectionConfig, ForeignKey, Index, Sequence, Table, TableDetails,
@@ -16,22 +16,9 @@ pub async fn connect(config: &ConnectionConfig) -> Result<Client> {
     let host = config.host.trim();
     let port = config.port;
     let user = config.username.trim();
-    let password = &config.password;
-    let dbname = config.schema.trim();
 
-    let conn_str = if dbname.is_empty() {
-        format!(
-            "host={} port={} user={} password={}",
-            host, port, user, password
-        )
-    } else {
-        format!(
-            "host={} port={} user={} password={} dbname={}",
-            host, port, user, password, dbname
-        )
-    };
-
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+    let (client, connection) = build_pg_config(config, true)
+        .connect(NoTls)
         .await
         .with_context(|| {
             format!(
@@ -53,14 +40,9 @@ async fn connect_without_db(config: &ConnectionConfig) -> Result<Client> {
     let host = config.host.trim();
     let port = config.port;
     let user = config.username.trim();
-    let password = &config.password;
 
-    let conn_str = format!(
-        "host={} port={} user={} password={}",
-        host, port, user, password
-    );
-
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+    let (client, connection) = build_pg_config(config, false)
+        .connect(NoTls)
         .await
         .with_context(|| {
             format!(
@@ -79,6 +61,23 @@ async fn connect_without_db(config: &ConnectionConfig) -> Result<Client> {
 }
 
 // ── public API ────────────────────────────────────────────────────────────────
+
+fn build_pg_config(config: &ConnectionConfig, include_db: bool) -> Config {
+    let mut pg_config = Config::new();
+    pg_config.host(config.host.trim());
+    pg_config.port(config.port);
+    pg_config.user(config.username.trim());
+    pg_config.password(&config.password);
+
+    if include_db {
+        let dbname = config.schema.trim();
+        if !dbname.is_empty() {
+            pg_config.dbname(dbname);
+        }
+    }
+
+    pg_config
+}
 
 pub async fn test_connection(config: &ConnectionConfig) -> Result<()> {
     let client = connect(config).await?;

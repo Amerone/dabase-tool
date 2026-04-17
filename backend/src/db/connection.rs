@@ -98,11 +98,18 @@ impl ConnectionConfig {
     fn dm8_driver_value() -> String {
         #[cfg(windows)]
         {
-            // Windows ODBC Driver Manager ONLY resolves DRIVER={name} via HKLM.
-            // Absolute DLL paths and HKCU registrations are both ignored (→ IM002).
-            // odbc_register::ensure_odbc_driver_registered() registers in HKLM (with
-            // UAC elevation if needed), so using the registered name here is correct.
-            wrap_driver(odbc_register::DM8_DRIVER_NAME)
+            let configured = env_nonempty("DM8_ODBC_DRIVER").unwrap_or_else(|| {
+                if odbc_register::is_registered_in_hklm(odbc_register::DM8_DRIVER_NAME) {
+                    odbc_register::DM8_DRIVER_NAME.to_string()
+                } else if odbc_register::is_registered_in_hklm(
+                    odbc_register::DM8_SYSTEM_DRIVER_NAME,
+                ) {
+                    odbc_register::DM8_SYSTEM_DRIVER_NAME.to_string()
+                } else {
+                    odbc_register::DM8_DRIVER_NAME.to_string()
+                }
+            });
+            wrap_driver(&configured)
         }
 
         #[cfg(not(windows))]

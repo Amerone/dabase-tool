@@ -1,139 +1,35 @@
-import React, { useEffect, useRef } from 'react'
-import { Card } from 'antd'
-import type { CardProps } from 'antd'
-import { animate } from 'animejs'
-
-const setDashoffset = (el: SVGGeometryElement | null) => {
-  if (!el) return 0
-  const dashoffset = el.getTotalLength()
-  el.setAttribute('stroke-dasharray', dashoffset.toString())
-  return dashoffset
-}
+import { useEffect, useRef } from 'react';
+import { Card } from 'antd';
+import type { CardProps } from 'antd';
+import { animate } from 'animejs';
 
 interface TechCardProps extends CardProps {
-  children: React.ReactNode
-  delay?: number
+  children: React.ReactNode;
+  delay?: number;
 }
 
-export const TechCard: React.FC<TechCardProps> = ({ children, delay = 0, style, ...props }) => {
-  const cardRef = useRef<HTMLDivElement>(null)
-  const borderRef = useRef<SVGRectElement>(null)
+export function TechCard({ children, delay = 0, className, ...props }: TechCardProps) {
+  const shellRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (cardRef.current) {
-      animate(cardRef.current, {
-        opacity: [0, 1],
-        translateY: [20, 0],
-        duration: 800,
-        delay,
-        easing: 'easeOutExpo',
-      })
+    if (!shellRef.current) {
+      return;
     }
 
-    if (borderRef.current) {
-      const offset = setDashoffset(borderRef.current)
-      animate(borderRef.current, {
-        strokeDashoffset: [offset, 0],
-        easing: 'easeInOutSine',
-        duration: 1500,
-        delay: delay + 200,
-        direction: 'alternate',
-        loop: false,
-      })
-    }
-  }, [delay])
+    animate(shellRef.current, {
+      opacity: [0, 1],
+      translateY: [12, 0],
+      duration: 520,
+      delay,
+      easing: 'easeOutQuad',
+    });
+  }, [delay]);
 
   return (
-    <div style={{ position: 'relative', padding: '2px' }}>
-      <svg
-        style={{
-          position: 'absolute',
-          top: 0,
-          left: 0,
-          width: '100%',
-          height: '100%',
-          pointerEvents: 'none',
-          zIndex: 0,
-        }}
-      >
-        <rect
-          ref={borderRef}
-          x="1"
-          y="1"
-          width="99%"
-          height="99%"
-          fill="none"
-          stroke="#00b96b"
-          strokeWidth="1"
-          strokeOpacity="0.3"
-          rx="2"
-        />
-      </svg>
-
-      <div
-        style={{
-          position: 'absolute',
-          top: -1,
-          left: -1,
-          width: 10,
-          height: 10,
-          borderTop: '2px solid #00b96b',
-          borderLeft: '2px solid #00b96b',
-          zIndex: 2,
-        }}
-      />
-      <div
-        style={{
-          position: 'absolute',
-          top: -1,
-          right: -1,
-          width: 10,
-          height: 10,
-          borderTop: '2px solid #00b96b',
-          borderRight: '2px solid #00b96b',
-          zIndex: 2,
-        }}
-      />
-      <div
-        style={{
-          position: 'absolute',
-          bottom: -1,
-          left: -1,
-          width: 10,
-          height: 10,
-          borderBottom: '2px solid #00b96b',
-          borderLeft: '2px solid #00b96b',
-          zIndex: 2,
-        }}
-      />
-      <div
-        style={{
-          position: 'absolute',
-          bottom: -1,
-          right: -1,
-          width: 10,
-          height: 10,
-          borderBottom: '2px solid #00b96b',
-          borderRight: '2px solid #00b96b',
-          zIndex: 2,
-        }}
-      />
-
-      <Card
-        ref={cardRef as unknown as React.Ref<HTMLDivElement>}
-        bordered={false}
-        style={{
-          background: 'rgba(5, 10, 15, 0.7)',
-          backdropFilter: 'blur(10px)',
-          opacity: 0,
-          position: 'relative',
-          zIndex: 1,
-          ...style,
-        }}
-        {...props}
-      >
+    <div ref={shellRef} className="tech-card-shell">
+      <Card className={['tech-card', className].filter(Boolean).join(' ')} bordered={false} {...props}>
         {children}
       </Card>
     </div>
-  )
+  );
 }

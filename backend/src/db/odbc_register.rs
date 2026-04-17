@@ -1,8 +1,9 @@
 /// ODBC driver names used in connection strings and Windows registry.
-pub const DM8_DRIVER_NAME: &str = "DM8 ODBC Driver";
-pub const KINGBASE_DRIVER_NAME: &str = "KingbaseES 9 ODBC Driver ANSI";
+pub const DM8_DRIVER_NAME: &str = "Amarone DM8 ODBC Driver";
+pub const DM8_SYSTEM_DRIVER_NAME: &str = "DM8 ODBC Driver";
+pub const KINGBASE_DRIVER_NAME: &str = "Amarone KingbaseES 9 ODBC Driver ANSI";
 pub const SHENTONG_DRIVER_NAME: &str = "OSCAR ODBC DRIVER";
-pub const POSTGRESQL_DRIVER_NAME: &str = "PostgreSQL Unicode";
+pub const POSTGRESQL_DRIVER_NAME: &str = "Amarone PostgreSQL Unicode";
 
 /// Bundled driver candidate paths for Windows.
 /// Bundled drivers are preferred (self-contained app); local DM8 installation
@@ -130,7 +131,7 @@ pub fn ensure_odbc_driver_registered(driver_name: &str, driver_dll: &str) -> any
 
 /// Returns true if the driver is registered in HKLM with an absolute Driver path.
 #[cfg(windows)]
-fn is_registered_in_hklm(driver_name: &str) -> bool {
+pub(crate) fn is_registered_in_hklm(driver_name: &str) -> bool {
     use winreg::enums::*;
     use winreg::RegKey;
 

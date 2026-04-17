@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, ensure, Context, Result};
 use odbc_api::{buffers::TextRowSet, Connection, Cursor};
@@ -465,6 +465,7 @@ pub fn fetch_row_count(connection: &Connection<'_>, schema: &str, table: &str) -
     Err(anyhow!("Failed to read row count for {}", table))
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use crate::models::Column;
@@ -672,22 +673,36 @@ fn fetch_foreign_keys(
     schema: &str,
     table: &str,
 ) -> Result<Vec<ForeignKey>> {
+    #[derive(Default)]
+    struct FkInfo {
+        columns: Vec<String>,
+        referenced_constraint: String,
+        referenced_owner: Option<String>,
+        delete_rule: Option<String>,
+        update_rule: Option<String>,
+    }
+
+    let make_ref_key =
+        |owner: &str, constraint: &str| format!("{}|{}", owner.trim(), constraint.trim());
+
     // Try with UPDATE_RULE first, fallback without it if not supported
     // DM8 may not have UPDATE_RULE column in ALL_CONSTRAINTS
     let sql_with_update = format!(
-        "SELECT ac.CONSTRAINT_NAME, ac.R_CONSTRAINT_NAME, ac.R_OWNER, ac.DELETE_RULE, ac.UPDATE_RULE \
+        "SELECT ac.CONSTRAINT_NAME, ac.R_CONSTRAINT_NAME, ac.R_OWNER, ac.DELETE_RULE, ac.UPDATE_RULE, acc.COLUMN_NAME \
          FROM ALL_CONSTRAINTS ac \
+         JOIN ALL_CONS_COLUMNS acc ON ac.OWNER = acc.OWNER AND ac.CONSTRAINT_NAME = acc.CONSTRAINT_NAME \
          WHERE ac.CONSTRAINT_TYPE = 'R' AND ac.OWNER = '{}' AND ac.TABLE_NAME = '{}' \
-         ORDER BY ac.CONSTRAINT_NAME",
+         ORDER BY ac.CONSTRAINT_NAME, acc.POSITION",
         schema.replace("'", "''"),
         table.replace("'", "''")
     );
 
     let sql_without_update = format!(
-        "SELECT ac.CONSTRAINT_NAME, ac.R_CONSTRAINT_NAME, ac.R_OWNER, ac.DELETE_RULE, NULL AS UPDATE_RULE \
+        "SELECT ac.CONSTRAINT_NAME, ac.R_CONSTRAINT_NAME, ac.R_OWNER, ac.DELETE_RULE, NULL AS UPDATE_RULE, acc.COLUMN_NAME \
          FROM ALL_CONSTRAINTS ac \
+         JOIN ALL_CONS_COLUMNS acc ON ac.OWNER = acc.OWNER AND ac.CONSTRAINT_NAME = acc.CONSTRAINT_NAME \
          WHERE ac.CONSTRAINT_TYPE = 'R' AND ac.OWNER = '{}' AND ac.TABLE_NAME = '{}' \
-         ORDER BY ac.CONSTRAINT_NAME",
+         ORDER BY ac.CONSTRAINT_NAME, acc.POSITION",
         schema.replace("'", "''"),
         table.replace("'", "''")
     );
@@ -716,38 +731,129 @@ fn fetch_foreign_keys(
         );
     }
 
-    let mut buffers = TextRowSet::for_cursor(200, &mut cursor, Some(8192))?;
+    let mut buffers = TextRowSet::for_cursor(1000, &mut cursor, Some(8192))?;
     let mut row_set_cursor = cursor.bind_buffer(&mut buffers)?;
 
-    let mut fks = Vec::new();
+    let mut fk_map: HashMap<String, FkInfo> = HashMap::new();
 
     while let Some(batch) = row_set_cursor.fetch()? {
         for row_index in 0..batch.num_rows() {
             let name = decode_cell(batch, 0, row_index)
                 .ok_or_else(|| anyhow!("Foreign key name missing"))?;
-            let ref_constraint = decode_cell(batch, 1, row_index)
+            let referenced_constraint = decode_cell(batch, 1, row_index)
                 .ok_or_else(|| anyhow!("Referenced constraint name missing"))?;
-            let ref_owner = decode_cell(batch, 2, row_index);
+            let referenced_owner = decode_cell(batch, 2, row_index);
             let delete_rule = decode_cell(batch, 3, row_index);
             let update_rule = decode_cell(batch, 4, row_index);
+            let column = decode_cell(batch, 5, row_index)
+                .ok_or_else(|| anyhow!("Foreign key column missing"))?;
 
-            // Columns in FK
-            let fk_cols = fetch_constraint_columns(connection, schema, &name)?;
-
-            // Referenced table & columns
-            let (ref_table, ref_cols) =
-                fetch_referenced_columns(connection, ref_owner.as_deref(), &ref_constraint)?;
-
-            fks.push(ForeignKey {
-                name,
-                columns: fk_cols,
-                referenced_table: ref_table,
-                referenced_columns: ref_cols,
+            let entry = fk_map.entry(name).or_insert_with(|| FkInfo {
+                referenced_constraint,
+                referenced_owner,
                 delete_rule,
                 update_rule,
+                ..Default::default()
             });
+            entry.columns.push(column);
         }
     }
+
+    let mut referenced_conditions = Vec::new();
+    let mut seen_references = HashSet::new();
+    for fk in fk_map.values() {
+        let Some(owner) = fk
+            .referenced_owner
+            .as_deref()
+            .map(str::trim)
+            .filter(|owner| !owner.is_empty())
+        else {
+            continue;
+        };
+
+        let constraint = fk.referenced_constraint.trim();
+        if constraint.is_empty() {
+            continue;
+        }
+
+        if seen_references.insert(make_ref_key(owner, constraint)) {
+            referenced_conditions.push(format!(
+                "(acc.OWNER = '{}' AND acc.CONSTRAINT_NAME = '{}')",
+                owner.replace("'", "''"),
+                constraint.replace("'", "''")
+            ));
+        }
+    }
+
+    let mut referenced_map: HashMap<String, (String, Vec<String>)> = HashMap::new();
+    if !referenced_conditions.is_empty() {
+        let sql = format!(
+            "SELECT acc.OWNER, acc.CONSTRAINT_NAME, ac.TABLE_NAME, acc.COLUMN_NAME \
+             FROM ALL_CONS_COLUMNS acc \
+             JOIN ALL_CONSTRAINTS ac ON acc.OWNER = ac.OWNER AND acc.CONSTRAINT_NAME = ac.CONSTRAINT_NAME \
+             WHERE {} \
+             ORDER BY acc.OWNER, acc.CONSTRAINT_NAME, acc.POSITION",
+            referenced_conditions.join(" OR ")
+        );
+
+        let mut cursor = connection
+            .execute(&sql, ())
+            .context("Failed to query referenced foreign key columns")?
+            .ok_or_else(|| {
+                anyhow!("DM8 returned no cursor for referenced foreign key columns query")
+            })?;
+
+        let mut buffers = TextRowSet::for_cursor(1000, &mut cursor, Some(8192))?;
+        let mut row_set_cursor = cursor.bind_buffer(&mut buffers)?;
+
+        while let Some(batch) = row_set_cursor.fetch()? {
+            for row_index in 0..batch.num_rows() {
+                let owner = decode_cell(batch, 0, row_index)
+                    .ok_or_else(|| anyhow!("Referenced owner missing"))?;
+                let constraint = decode_cell(batch, 1, row_index)
+                    .ok_or_else(|| anyhow!("Referenced constraint name missing"))?;
+                let table = decode_cell(batch, 2, row_index)
+                    .ok_or_else(|| anyhow!("Referenced table missing"))?;
+                let column = decode_cell(batch, 3, row_index)
+                    .ok_or_else(|| anyhow!("Referenced column missing"))?;
+
+                let entry = referenced_map
+                    .entry(make_ref_key(&owner, &constraint))
+                    .or_insert_with(|| (format!("{}.{}", owner, table), Vec::new()));
+                entry.1.push(column);
+            }
+        }
+    }
+
+    let mut fks = Vec::with_capacity(fk_map.len());
+    for (name, fk) in fk_map {
+        let referenced = fk
+            .referenced_owner
+            .as_deref()
+            .map(str::trim)
+            .filter(|owner| !owner.is_empty())
+            .map(|owner| make_ref_key(owner, &fk.referenced_constraint))
+            .and_then(|key| referenced_map.get(&key).cloned());
+
+        let (ref_table, ref_cols) = match referenced {
+            Some(referenced) => referenced,
+            None => fetch_referenced_columns(
+                connection,
+                fk.referenced_owner.as_deref(),
+                &fk.referenced_constraint,
+            )?,
+        };
+
+        fks.push(ForeignKey {
+            name,
+            columns: fk.columns,
+            referenced_table: ref_table,
+            referenced_columns: ref_cols,
+            delete_rule: fk.delete_rule,
+            update_rule: fk.update_rule,
+        });
+    }
+    fks.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(fks)
 }
@@ -1492,14 +1598,18 @@ pub fn get_tables_details_batch(
         struct FkInfo {
             columns: Vec<String>,
             r_constraint: String,
+            r_owner: Option<String>,
             delete_rule: Option<String>,
+            update_rule: Option<String>,
         }
+        let make_ref_key =
+            |owner: &str, constraint: &str| format!("{}|{}", owner.trim(), constraint.trim());
         // table → constraint_name → FkInfo
         let mut fk_map: HashMap<String, HashMap<String, FkInfo>> = HashMap::new();
 
-        let sql = format!(
+        let sql_with_update = format!(
             "SELECT ac.TABLE_NAME, ac.CONSTRAINT_NAME, acc.COLUMN_NAME, \
-                    ac.R_CONSTRAINT_NAME, ac.R_OWNER, ac.DELETE_RULE \
+                    ac.R_CONSTRAINT_NAME, ac.R_OWNER, ac.DELETE_RULE, ac.UPDATE_RULE \
              FROM ALL_CONSTRAINTS ac \
              JOIN ALL_CONS_COLUMNS acc ON ac.OWNER=acc.OWNER AND ac.CONSTRAINT_NAME=acc.CONSTRAINT_NAME \
              WHERE ac.CONSTRAINT_TYPE='R' AND ac.OWNER='{}' AND ac.TABLE_NAME IN ({}) \
@@ -1507,58 +1617,118 @@ pub fn get_tables_details_batch(
             owner.replace("'", "''"),
             in_clause
         );
-        if let Ok(Some(mut cursor)) = connection.execute(&sql, ()) {
-            let mut buffers = TextRowSet::for_cursor(1000, &mut cursor, Some(8192))?;
-            let mut rs = cursor.bind_buffer(&mut buffers)?;
-            while let Some(batch) = rs.fetch()? {
-                for row in 0..batch.num_rows() {
-                    let tname = match decode_cell(batch, 0, row) {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                    let cname = match decode_cell(batch, 1, row) {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                    let col = match decode_cell(batch, 2, row) {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                    let r_constraint = decode_cell(batch, 3, row).unwrap_or_default();
-                    let delete_rule = decode_cell(batch, 5, row);
 
-                    let fk = fk_map
-                        .entry(tname)
-                        .or_default()
-                        .entry(cname)
-                        .or_insert_with(|| FkInfo {
-                            r_constraint: r_constraint.clone(),
-                            delete_rule: delete_rule.clone(),
-                            ..Default::default()
-                        });
-                    fk.columns.push(col);
+        let sql_without_update = format!(
+            "SELECT ac.TABLE_NAME, ac.CONSTRAINT_NAME, acc.COLUMN_NAME, \
+                    ac.R_CONSTRAINT_NAME, ac.R_OWNER, ac.DELETE_RULE, NULL AS UPDATE_RULE \
+             FROM ALL_CONSTRAINTS ac \
+             JOIN ALL_CONS_COLUMNS acc ON ac.OWNER=acc.OWNER AND ac.CONSTRAINT_NAME=acc.CONSTRAINT_NAME \
+             WHERE ac.CONSTRAINT_TYPE='R' AND ac.OWNER='{}' AND ac.TABLE_NAME IN ({}) \
+             ORDER BY ac.TABLE_NAME, ac.CONSTRAINT_NAME, acc.POSITION",
+            owner.replace("'", "''"),
+            in_clause
+        );
+
+        let (cursor_result, has_update_rule) = match connection.execute(&sql_with_update, ()) {
+            Ok(cursor) => (Ok(cursor), true),
+            Err(err) => {
+                let message = err.to_string().to_uppercase();
+                if message.contains("UPDATE_RULE") || message.contains("-2207") {
+                    (connection.execute(&sql_without_update, ()), false)
+                } else {
+                    (Err(err), true)
                 }
+            }
+        };
+
+        if !has_update_rule {
+            tracing::debug!(
+                "DM8 ALL_CONSTRAINTS does not have UPDATE_RULE column, using batch FK fallback query"
+            );
+        }
+
+        match cursor_result {
+            Ok(Some(mut cursor)) => {
+                let mut buffers = TextRowSet::for_cursor(1000, &mut cursor, Some(8192))?;
+                let mut rs = cursor.bind_buffer(&mut buffers)?;
+                while let Some(batch) = rs.fetch()? {
+                    for row in 0..batch.num_rows() {
+                        let tname = match decode_cell(batch, 0, row) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let cname = match decode_cell(batch, 1, row) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let col = match decode_cell(batch, 2, row) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let r_constraint = decode_cell(batch, 3, row).unwrap_or_default();
+                        let r_owner = decode_cell(batch, 4, row);
+                        let delete_rule = decode_cell(batch, 5, row);
+                        let update_rule = decode_cell(batch, 6, row);
+
+                        let fk = fk_map
+                            .entry(tname)
+                            .or_default()
+                            .entry(cname)
+                            .or_insert_with(|| FkInfo {
+                                r_constraint: r_constraint.clone(),
+                                r_owner: r_owner.clone(),
+                                delete_rule: delete_rule.clone(),
+                                update_rule: update_rule.clone(),
+                                ..Default::default()
+                            });
+                        fk.columns.push(col);
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    "Batch foreign key query failed, skipping foreign keys: {}",
+                    err
+                );
             }
         }
 
         // Collect all unique referenced constraint names for batch lookup
-        let ref_constraints: Vec<String> = fk_map
-            .values()
-            .flat_map(|fks| fks.values().map(|f| f.r_constraint.clone()))
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
+        let mut ref_conditions = Vec::new();
+        let mut seen_refs = HashSet::new();
+        for fk in fk_map.values().flat_map(|fks| fks.values()) {
+            let Some(owner) = fk
+                .r_owner
+                .as_deref()
+                .map(str::trim)
+                .filter(|owner| !owner.is_empty())
+            else {
+                continue;
+            };
+            let constraint = fk.r_constraint.trim();
+            if constraint.is_empty() {
+                continue;
+            }
 
-        if !ref_constraints.is_empty() {
+            if seen_refs.insert(make_ref_key(owner, constraint)) {
+                ref_conditions.push(format!(
+                    "(acc.OWNER='{}' AND acc.CONSTRAINT_NAME='{}')",
+                    owner.replace("'", "''"),
+                    constraint.replace("'", "''")
+                ));
+            }
+        }
+
+        if !ref_conditions.is_empty() {
             // Query 2: referenced table + columns for all referenced constraints at once
-            let ref_in = make_in_clause(&ref_constraints);
             let sql = format!(
-                "SELECT acc.CONSTRAINT_NAME, ac.TABLE_NAME, ac.OWNER, acc.COLUMN_NAME \
+                "SELECT acc.OWNER, acc.CONSTRAINT_NAME, ac.TABLE_NAME, acc.COLUMN_NAME \
                  FROM ALL_CONS_COLUMNS acc \
                  JOIN ALL_CONSTRAINTS ac ON acc.OWNER=ac.OWNER AND acc.CONSTRAINT_NAME=ac.CONSTRAINT_NAME \
-                 WHERE acc.CONSTRAINT_NAME IN ({}) \
-                 ORDER BY acc.CONSTRAINT_NAME, acc.POSITION",
-                ref_in
+                 WHERE {} \
+                 ORDER BY acc.OWNER, acc.CONSTRAINT_NAME, acc.POSITION",
+                ref_conditions.join(" OR ")
             );
 
             // ref_constraint_name → (ref_owner.ref_table, Vec<col>)
@@ -1568,14 +1738,14 @@ pub fn get_tables_details_batch(
                 let mut rs = cursor.bind_buffer(&mut buffers)?;
                 while let Some(batch) = rs.fetch()? {
                     for row in 0..batch.num_rows() {
-                        if let (Some(cname), Some(tname), Some(rowner), Some(col)) = (
+                        if let (Some(rowner), Some(cname), Some(tname), Some(col)) = (
                             decode_cell(batch, 0, row),
                             decode_cell(batch, 1, row),
                             decode_cell(batch, 2, row),
                             decode_cell(batch, 3, row),
                         ) {
                             let entry = ref_map
-                                .entry(cname)
+                                .entry(make_ref_key(&rowner, &cname))
                                 .or_insert_with(|| (format!("{}.{}", rowner, tname), vec![]));
                             entry.1.push(col);
                         }
@@ -1589,14 +1759,28 @@ pub fn get_tables_details_batch(
                     let mut fk_list: Vec<ForeignKey> = fks
                         .into_iter()
                         .filter_map(|(cname, fk)| {
-                            let (ref_table, ref_cols) = ref_map.get(&fk.r_constraint)?.clone();
+                            let (ref_table, ref_cols) = fk
+                                .r_owner
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|owner| !owner.is_empty())
+                                .map(|owner| make_ref_key(owner, &fk.r_constraint))
+                                .and_then(|key| ref_map.get(&key).cloned())
+                                .or_else(|| {
+                                    fetch_referenced_columns(
+                                        connection,
+                                        fk.r_owner.as_deref(),
+                                        &fk.r_constraint,
+                                    )
+                                    .ok()
+                                })?;
                             Some(ForeignKey {
                                 name: cname,
                                 columns: fk.columns,
                                 referenced_table: ref_table,
                                 referenced_columns: ref_cols,
                                 delete_rule: fk.delete_rule,
-                                update_rule: None,
+                                update_rule: fk.update_rule,
                             })
                         })
                         .collect();

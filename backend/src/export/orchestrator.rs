@@ -6,7 +6,7 @@ use odbc_api::Connection;
 use crate::{
     export::{
         capability::build_export_capability_report,
-        data::export_schema_data,
+        data::{export_schema_data, SchemaDataExportSpec},
         ddl::{export_schema_ddl, TriggerTerminator},
     },
     models::{CapabilityLevel, DbType, ExportObjectKind, TableIdentifier},
@@ -121,13 +121,15 @@ impl LegacyExportOrchestrator {
     ) -> Result<usize> {
         export_schema_data(
             connection,
-            &plan.source_schema,
-            &plan.target_schema,
-            &plan.tables,
-            Path::new(&plan.output_path),
-            batch_size,
-            include_row_counts,
-            compat,
+            SchemaDataExportSpec {
+                source_schema: &plan.source_schema,
+                target_schema: &plan.target_schema,
+                tables: &plan.tables,
+                output_path: Path::new(&plan.output_path),
+                batch_size,
+                include_row_counts,
+                compat,
+            },
         )
     }
 

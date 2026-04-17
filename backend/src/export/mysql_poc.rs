@@ -478,7 +478,7 @@ fn parse_hex(raw: String) -> Option<Vec<u8>> {
     if normalized.is_empty() {
         return Some(Vec::new());
     }
-    if normalized.len() % 2 != 0 {
+    if !normalized.len().is_multiple_of(2) {
         return None;
     }
 

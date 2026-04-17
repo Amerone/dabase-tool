@@ -29,6 +29,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/schemas", post(schema::list_schemas))
         .route("/api/tables", post(schema::list_tables))
         .route(
+            "/api/tables/details/batch",
+            post(schema::get_table_details_batch_handler),
+        )
+        .route(
             "/api/tables/:table/details",
             post(schema::get_table_details_handler),
         )

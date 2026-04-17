@@ -10,9 +10,6 @@ Description = DM8 Driver
 Driver = /opt/dm/libdodbc.so
 "#;
         let parsed = parse_odbcinst_for_dm8(ini);
-        assert_eq!(
-            parsed.unwrap().display().to_string(),
-            "/opt/dm/libdodbc.so"
-        );
+        assert_eq!(parsed.unwrap().display().to_string(), "/opt/dm/libdodbc.so");
     }
 }

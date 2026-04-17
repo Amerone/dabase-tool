@@ -18,30 +18,46 @@ use crate::models::{TableDetails, TableIdentifier};
 
 const STREAM_FETCH_CHUNK_BYTES: usize = 16 * 1024;
 
+#[derive(Clone, Copy)]
+pub struct TableDataExportSpec<'a> {
+    pub source_schema: &'a str,
+    pub target_schema: &'a str,
+    pub table: &'a str,
+    pub table_details: &'a TableDetails,
+    pub batch_size: usize,
+    pub compat: TriggerTerminator,
+}
+
+#[derive(Clone, Copy)]
+pub struct SchemaDataExportSpec<'a> {
+    pub source_schema: &'a str,
+    pub target_schema: &'a str,
+    pub tables: &'a [TableIdentifier],
+    pub output_path: &'a Path,
+    pub batch_size: usize,
+    pub include_row_counts: bool,
+    pub compat: TriggerTerminator,
+}
+
 pub fn export_table_data(
     connection: &Connection<'_>,
-    source_schema: &str,
-    target_schema: &str,
-    table: &str,
-    table_details: &TableDetails,
     writer: &mut impl Write,
-    batch_size: usize,
-    compat: TriggerTerminator,
+    spec: TableDataExportSpec<'_>,
 ) -> Result<usize> {
     // Tables with LOB columns (BLOB/CLOB/TEXT etc.) use unbuffered row-by-row
     // fetching to avoid the 8KB TextRowSet truncation limit.
-    if has_lob_columns(table_details) {
-        return export_table_data_rowwise(
-            connection,
-            source_schema,
-            target_schema,
-            table,
-            table_details,
-            writer,
-            batch_size,
-            compat,
-        );
+    if has_lob_columns(spec.table_details) {
+        return export_table_data_rowwise(connection, writer, spec);
     }
+
+    let TableDataExportSpec {
+        source_schema,
+        target_schema,
+        table,
+        table_details,
+        batch_size,
+        ..
+    } = spec;
 
     let source_schema_upper = source_schema.to_uppercase();
     let target_schema_upper = target_schema.to_uppercase();
@@ -118,16 +134,20 @@ pub fn export_table_data(
 ///
 /// Uses `cursor.next_row()` + chunked `get_data()` to avoid `TextRowSet`
 /// truncation and to bypass buggy ODBC length indicators for large values.
-pub fn export_table_data_rowwise(
+fn export_table_data_rowwise(
     connection: &Connection<'_>,
-    source_schema: &str,
-    target_schema: &str,
-    table: &str,
-    table_details: &TableDetails,
     writer: &mut impl Write,
-    batch_size: usize,
-    compat: TriggerTerminator,
+    spec: TableDataExportSpec<'_>,
 ) -> Result<usize> {
+    let TableDataExportSpec {
+        source_schema,
+        target_schema,
+        table,
+        table_details,
+        batch_size,
+        compat,
+    } = spec;
+
     let source_schema_upper = source_schema.to_uppercase();
     let target_schema_upper = target_schema.to_uppercase();
     let table_upper = table.to_uppercase();
@@ -423,14 +443,18 @@ fn write_lob_insert_block(
 
 pub fn export_schema_data(
     connection: &Connection<'_>,
-    source_schema: &str,
-    target_schema: &str,
-    tables: &[TableIdentifier],
-    output_path: &Path,
-    batch_size: usize,
-    include_row_counts: bool,
-    compat: TriggerTerminator,
+    spec: SchemaDataExportSpec<'_>,
 ) -> Result<usize> {
+    let SchemaDataExportSpec {
+        source_schema,
+        target_schema,
+        tables,
+        output_path,
+        batch_size,
+        include_row_counts,
+        compat,
+    } = spec;
+
     let source_schema_upper = source_schema.to_uppercase();
     let target_schema_upper = target_schema.to_uppercase();
     let all_sequences = fetch_sequences(connection, &source_schema_upper).unwrap_or_default();
@@ -472,12 +496,9 @@ pub fn export_schema_data(
     let mut table_row_counts: Vec<Option<i64>> = vec![None; tables.len()];
     if include_row_counts {
         for (i, table_id) in tables.iter().enumerate() {
-            match fetch_row_count(connection, &source_schema_upper, &table_id.name) {
-                Ok(cnt) => {
-                    total_rows += cnt;
-                    table_row_counts[i] = Some(cnt);
-                }
-                Err(_) => {}
+            if let Ok(cnt) = fetch_row_count(connection, &source_schema_upper, &table_id.name) {
+                total_rows += cnt;
+                table_row_counts[i] = Some(cnt);
             }
         }
     }
@@ -604,13 +625,15 @@ pub fn export_schema_data(
 
         let count = export_table_data(
             connection,
-            &source_schema_upper,
-            &target_schema_upper,
-            &tables[idx].name,
-            table_details,
             &mut writer,
-            batch_size,
-            compat,
+            TableDataExportSpec {
+                source_schema: &source_schema_upper,
+                target_schema: &target_schema_upper,
+                table: &tables[idx].name,
+                table_details,
+                batch_size,
+                compat,
+            },
         )
         .with_context(|| format!("Failed to export data for table '{}'", tables[idx].name))?;
 
@@ -672,8 +695,8 @@ pub fn topological_sort_by_foreign_keys(
             // referenced_table is "SCHEMA.TABLE" format
             let ref_table_name = fk
                 .referenced_table
-                .split('.')
-                .last()
+                .rsplit('.')
+                .next()
                 .unwrap_or(&fk.referenced_table)
                 .to_uppercase();
 
@@ -701,8 +724,8 @@ pub fn topological_sort_by_foreign_keys(
 
     // Kahn's algorithm for topological sort
     let mut queue: VecDeque<usize> = VecDeque::new();
-    for i in 0..n {
-        if in_degree[i] == 0 {
+    for (i, degree) in in_degree.iter().enumerate() {
+        if *degree == 0 {
             queue.push_back(i);
         }
     }
@@ -722,9 +745,9 @@ pub fn topological_sort_by_foreign_keys(
     if sorted.len() < n {
         let in_sorted: HashSet<usize> = sorted.iter().copied().collect();
         let mut cyclic_names = Vec::new();
-        for i in 0..n {
+        for (i, table_name) in table_names.iter().enumerate() {
             if !in_sorted.contains(&i) {
-                cyclic_names.push(table_names[i].clone());
+                cyclic_names.push(table_name.clone());
                 sorted.push(i);
             }
         }
@@ -782,8 +805,8 @@ pub fn topological_sort_into_layers(
         for fk in fks {
             let ref_table_name = fk
                 .referenced_table
-                .split('.')
-                .last()
+                .rsplit('.')
+                .next()
                 .unwrap_or(&fk.referenced_table)
                 .to_uppercase();
             if let Some(&parent_idx) = name_to_idx.get(&ref_table_name) {

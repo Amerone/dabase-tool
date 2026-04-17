@@ -1,168 +1,181 @@
-import { useEffect, useRef } from 'react'
-import { animate } from 'animejs'
+import { useEffect, useRef } from 'react';
 
 type Particle = {
-  x: number
-  y: number
-  radius: number
-  vx: number
-  vy: number
-  alpha: number
-  baseAlpha: number
-  pulseSpeed: number
+  x: number;
+  y: number;
+  radius: number;
+  vx: number;
+  vy: number;
+  alpha: number;
+  phase: number;
+};
+
+function createParticles(width: number, height: number, count: number): Particle[] {
+  return Array.from({ length: count }, () => ({
+    x: Math.random() * width,
+    y: Math.random() * height,
+    radius: Math.random() * 1.6 + 0.6,
+    vx: (Math.random() - 0.5) * 0.2,
+    vy: (Math.random() - 0.5) * 0.2,
+    alpha: Math.random() * 0.4 + 0.2,
+    phase: Math.random() * Math.PI * 2,
+  }));
+}
+
+function createBackdropGradient(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number
+): CanvasGradient {
+  const gradient = context.createRadialGradient(
+    width * 0.7,
+    height * 0.12,
+    0,
+    width * 0.5,
+    height * 0.5,
+    Math.max(width, height)
+  );
+  gradient.addColorStop(0, 'rgba(34, 77, 95, 0.42)');
+  gradient.addColorStop(0.45, 'rgba(11, 21, 34, 0.82)');
+  gradient.addColorStop(1, 'rgba(4, 7, 14, 1)');
+  return gradient;
 }
 
 export default function TechBackground() {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const mouseRef = useRef({ x: -1000, y: -1000 })
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return;
+    }
 
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
+    const context = canvas.getContext('2d');
+    if (!context) {
+      return;
+    }
 
-    let width = (canvas.width = window.innerWidth)
-    let height = (canvas.height = window.innerHeight)
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let width = window.innerWidth;
+    let height = window.innerHeight;
+    let animationFrameId = 0;
+    let lastFrame = 0;
+    const targetFrameInterval = reduceMotion ? 64 : 33;
+    let running = false;
+    let backdropGradient = createBackdropGradient(context, width, height);
+
+    const resolveParticleCount = () => {
+      const base = Math.round((width * height) / 42000);
+      const capped = Math.max(18, Math.min(base, 70));
+      return reduceMotion ? Math.max(10, Math.floor(capped / 2)) : capped;
+    };
 
     const resize = () => {
-      width = canvas.width = window.innerWidth
-      height = canvas.height = window.innerHeight
-    }
-    window.addEventListener('resize', resize)
+      width = window.innerWidth;
+      height = window.innerHeight;
+      canvas.width = width;
+      canvas.height = height;
+      backdropGradient = createBackdropGradient(context, width, height);
+      particles = createParticles(width, height, resolveParticleCount());
+    };
 
-    const handleMouseMove = (e: MouseEvent) => {
-      mouseRef.current = { x: e.clientX, y: e.clientY }
-    }
-    window.addEventListener('mousemove', handleMouseMove)
+    canvas.width = width;
+    canvas.height = height;
+    let particles = createParticles(width, height, resolveParticleCount());
 
-    const particles: Particle[] = []
-    const particleCount = Math.min(width / 10, 150)
+    const drawBackdrop = () => {
+      context.fillStyle = backdropGradient;
+      context.fillRect(0, 0, width, height);
+    };
 
-    for (let i = 0; i < particleCount; i++) {
-      particles.push({
-        x: Math.random() * width,
-        y: Math.random() * height,
-        radius: Math.random() < 0.1 ? Math.random() * 2 + 1 : Math.random() * 1.5,
-        vx: (Math.random() - 0.5) * 0.3,
-        vy: (Math.random() - 0.5) * 0.3,
-        alpha: Math.random() * 0.5 + 0.1,
-        baseAlpha: Math.random() * 0.5 + 0.1,
-        pulseSpeed: Math.random() * 0.05 + 0.01,
-      })
-    }
+    const render = (timestamp: number) => {
+      if (!running) {
+        return;
+      }
+      if (timestamp - lastFrame < targetFrameInterval) {
+        animationFrameId = requestAnimationFrame(render);
+        return;
+      }
+      lastFrame = timestamp;
 
-    let time = 0
-    let animationFrameId: number | null = null
+      drawBackdrop();
 
-    const animateParticles = () => {
-      time += 1
-      ctx.clearRect(0, 0, width, height)
+      for (let i = 0; i < particles.length; i += 1) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.phase += 0.02;
 
-      ctx.strokeStyle = 'rgba(0, 185, 107, 0.03)'
-      ctx.lineWidth = 1
-      const gridSize = 60
-      const offsetX = (time * 0.2) % gridSize
+        if (p.x < -8) p.x = width + 8;
+        if (p.x > width + 8) p.x = -8;
+        if (p.y < -8) p.y = height + 8;
+        if (p.y > height + 8) p.y = -8;
 
-      for (let x = offsetX; x < width; x += gridSize) {
-        ctx.beginPath()
-        ctx.moveTo(x, 0)
-        ctx.lineTo(x, height)
-        ctx.stroke()
+        const alpha = p.alpha + Math.sin(p.phase) * 0.12;
+        context.beginPath();
+        context.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+        context.fillStyle = `rgba(118, 255, 229, ${Math.max(0.08, alpha)})`;
+        context.fill();
+
+        // Bound line checks to nearby indices to avoid O(n^2) work.
+        const maxNeighbor = Math.min(i + 8, particles.length - 1);
+        for (let j = i + 1; j <= maxNeighbor; j += 1) {
+          const p2 = particles[j];
+          const dx = p.x - p2.x;
+          const dy = p.y - p2.y;
+          const distance = Math.hypot(dx, dy);
+          if (distance > 120) {
+            continue;
+          }
+          context.beginPath();
+          context.moveTo(p.x, p.y);
+          context.lineTo(p2.x, p2.y);
+          context.strokeStyle = `rgba(91, 201, 255, ${0.12 * (1 - distance / 120)})`;
+          context.lineWidth = 0.6;
+          context.stroke();
+        }
       }
 
-      const scanY = (time * 2) % height
-      const scanHeight = 50
-      const gradient = ctx.createLinearGradient(0, scanY, 0, scanY + scanHeight)
-      gradient.addColorStop(0, 'rgba(0, 185, 107, 0)')
-      gradient.addColorStop(0.5, 'rgba(0, 185, 107, 0.05)')
-      gradient.addColorStop(1, 'rgba(0, 185, 107, 0)')
-      ctx.fillStyle = gradient
-      ctx.fillRect(0, scanY, width, scanHeight)
+      animationFrameId = requestAnimationFrame(render);
+    };
 
-      particles.forEach((p, i) => {
-        p.x += p.vx
-        p.y += p.vy
-        p.alpha = p.baseAlpha + Math.sin(time * p.pulseSpeed) * 0.2
+    const start = () => {
+      if (running) {
+        return;
+      }
+      running = true;
+      lastFrame = performance.now();
+      animationFrameId = requestAnimationFrame(render);
+    };
 
-        const dxMouse = p.x - mouseRef.current.x
-        const dyMouse = p.y - mouseRef.current.y
-        const distMouse = Math.sqrt(dxMouse * dxMouse + dyMouse * dyMouse)
+    const stop = () => {
+      if (!running) {
+        return;
+      }
+      running = false;
+      cancelAnimationFrame(animationFrameId);
+    };
 
-        if (distMouse < 200) {
-          p.vx -= dxMouse * 0.0001
-          p.vy -= dyMouse * 0.0001
-          p.alpha = Math.min(p.alpha + 0.3, 1)
-        }
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        stop();
+      } else {
+        start();
+      }
+    };
 
-        if (p.x < 0) p.x = width
-        if (p.x > width) p.x = 0
-        if (p.y < 0) p.y = height
-        if (p.y > height) p.y = 0
-
-        ctx.beginPath()
-        ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2)
-        ctx.fillStyle = `rgba(0, 185, 107, ${p.alpha})`
-        ctx.fill()
-
-        for (let j = i + 1; j < particles.length; j++) {
-          const p2 = particles[j]
-          const dx = p.x - p2.x
-          const dy = p.y - p2.y
-          const dist = Math.sqrt(dx * dx + dy * dy)
-
-          if (dist < 120) {
-            ctx.beginPath()
-            ctx.strokeStyle = `rgba(0, 185, 107, ${0.15 * (1 - dist / 120)})`
-            ctx.lineWidth = 0.5
-            ctx.moveTo(p.x, p.y)
-            ctx.lineTo(p2.x, p2.y)
-            ctx.stroke()
-          }
-        }
-
-        if (distMouse < 150) {
-          ctx.beginPath()
-          ctx.strokeStyle = `rgba(0, 185, 107, ${0.2 * (1 - distMouse / 150)})`
-          ctx.lineWidth = 0.8
-          ctx.moveTo(p.x, p.y)
-          ctx.lineTo(mouseRef.current.x, mouseRef.current.y)
-          ctx.stroke()
-        }
-      })
-
-      animationFrameId = requestAnimationFrame(animateParticles)
+    window.addEventListener('resize', resize);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    if (!document.hidden) {
+      start();
     }
-
-    animationFrameId = requestAnimationFrame(animateParticles)
-
-    animate(canvas, {
-      opacity: [0, 1],
-      duration: 1500,
-      easing: 'easeOutExpo',
-    })
 
     return () => {
-      window.removeEventListener('resize', resize)
-      window.removeEventListener('mousemove', handleMouseMove)
-      if (animationFrameId !== null) {
-        cancelAnimationFrame(animationFrameId)
-      }
-    }
-  }, [])
+      stop();
+      window.removeEventListener('resize', resize);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, []);
 
-  return (
-    <canvas
-      ref={canvasRef}
-      style={{
-        position: 'fixed',
-        top: 0,
-        left: 0,
-        zIndex: 0,
-        pointerEvents: 'none',
-        background: 'radial-gradient(circle at 50% 50%, #0a1929 0%, #000000 100%)',
-      }}
-    />
-  )
+  return <canvas ref={canvasRef} className="app-background-canvas" />;
 }

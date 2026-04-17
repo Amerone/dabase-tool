@@ -27,7 +27,9 @@ use odbc_api::{
 use crate::{
     db::schema::decode_cell,
     dialect::DialectRenderer,
-    domain::canonical::{canonical_table_from_details, CanonicalRow, CanonicalValue, LogicalType},
+    domain::canonical::{
+        canonical_table_from_details, CanonicalRow, CanonicalTable, CanonicalValue, LogicalType,
+    },
     export::{
         common::apply_identifier_case,
         data::{has_lob_columns, topological_sort_into_layers},
@@ -70,6 +72,25 @@ struct TableExportResult {
     row_count: usize,
     /// Path to the temp file containing the INSERT statements
     temp_path: PathBuf,
+}
+
+struct TableWriterExportRequest<'a> {
+    source_schema: &'a str,
+    source_table: &'a CanonicalTable,
+    target_table: &'a CanonicalTable,
+    details: &'a TableDetails,
+    renderer: &'a dyn DialectRenderer,
+    batch_size: usize,
+    unicode_safe_text: bool,
+}
+
+struct RowwiseTableExportRequest<'a> {
+    schema: &'a str,
+    source_table: &'a CanonicalTable,
+    target_table: &'a CanonicalTable,
+    renderer: &'a dyn DialectRenderer,
+    batch_size: usize,
+    unicode_safe_text: bool,
 }
 
 const STREAM_FETCH_CHUNK_BYTES: usize = 16 * 1024;
@@ -219,14 +240,16 @@ impl DataExportPipeline {
                     let target_table = canonical_table_from_details(&target_details[idx]);
                     let count = export_table_to_writer(
                         connection,
-                        &self.source_schema,
-                        &source_table,
-                        &target_table,
-                        &all_details[idx],
-                        renderer,
                         &mut writer,
-                        self.batch_size,
-                        self.unicode_safe_text,
+                        TableWriterExportRequest {
+                            source_schema: &self.source_schema,
+                            source_table: &source_table,
+                            target_table: &target_table,
+                            details: &all_details[idx],
+                            renderer,
+                            batch_size: self.batch_size,
+                            unicode_safe_text: self.unicode_safe_text,
+                        },
                     )?;
                     total_rows += count;
                 }
@@ -271,14 +294,16 @@ impl DataExportPipeline {
 
                                 let count = export_table_to_writer(
                                     &thread_conn,
-                                    source_schema,
-                                    &source_table,
-                                    &target_table,
-                                    details,
-                                    renderer,
                                     &mut tw,
-                                    batch_size,
-                                    unicode_safe_text,
+                                    TableWriterExportRequest {
+                                        source_schema,
+                                        source_table: &source_table,
+                                        target_table: &target_table,
+                                        details,
+                                        renderer,
+                                        batch_size,
+                                        unicode_safe_text,
+                                    },
                                 )?;
 
                                 tw.flush()?;
@@ -368,27 +393,33 @@ impl DataExportPipeline {
 
 /// Export a single table's data to a writer using the dialect renderer.
 /// Dispatches to batch or row-by-row mode based on LOB column presence.
-pub fn export_table_to_writer(
+fn export_table_to_writer(
     connection: &odbc_api::Connection<'_>,
-    source_schema: &str,
-    source_table: &crate::domain::canonical::CanonicalTable,
-    target_table: &crate::domain::canonical::CanonicalTable,
-    details: &TableDetails,
-    renderer: &dyn DialectRenderer,
     writer: &mut impl Write,
-    batch_size: usize,
-    unicode_safe_text: bool,
+    request: TableWriterExportRequest<'_>,
 ) -> Result<usize> {
+    let TableWriterExportRequest {
+        source_schema,
+        source_table,
+        target_table,
+        details,
+        renderer,
+        batch_size,
+        unicode_safe_text,
+    } = request;
+
     if should_use_rowwise_export(details, source_table, unicode_safe_text) {
         export_table_rows_rowwise(
             connection,
-            source_schema,
-            source_table,
-            target_table,
-            renderer,
             writer,
-            batch_size,
-            unicode_safe_text,
+            RowwiseTableExportRequest {
+                schema: source_schema,
+                source_table,
+                target_table,
+                renderer,
+                batch_size,
+                unicode_safe_text,
+            },
         )
     } else {
         export_table_rows(
@@ -405,13 +436,13 @@ pub fn export_table_to_writer(
 
 fn should_use_rowwise_export(
     details: &TableDetails,
-    source_table: &crate::domain::canonical::CanonicalTable,
+    source_table: &CanonicalTable,
     unicode_safe_text: bool,
 ) -> bool {
     has_lob_columns(details) || (unicode_safe_text && has_character_columns(source_table))
 }
 
-fn has_character_columns(table: &crate::domain::canonical::CanonicalTable) -> bool {
+fn has_character_columns(table: &CanonicalTable) -> bool {
     table
         .columns
         .iter()
@@ -429,8 +460,8 @@ fn is_character_logical_type(logical_type: &LogicalType) -> bool {
 fn export_table_rows(
     connection: &odbc_api::Connection<'_>,
     schema: &str,
-    source_table: &crate::domain::canonical::CanonicalTable,
-    target_table: &crate::domain::canonical::CanonicalTable,
+    source_table: &CanonicalTable,
+    target_table: &CanonicalTable,
     renderer: &dyn DialectRenderer,
     writer: &mut impl Write,
     batch_size: usize,
@@ -493,14 +524,18 @@ fn export_table_rows(
 /// Row-by-row export for tables with LOB columns using chunked `SQLGetData`.
 fn export_table_rows_rowwise(
     connection: &odbc_api::Connection<'_>,
-    schema: &str,
-    source_table: &crate::domain::canonical::CanonicalTable,
-    target_table: &crate::domain::canonical::CanonicalTable,
-    renderer: &dyn DialectRenderer,
     writer: &mut impl Write,
-    batch_size: usize,
-    unicode_safe_text: bool,
+    request: RowwiseTableExportRequest<'_>,
 ) -> Result<usize> {
+    let RowwiseTableExportRequest {
+        schema,
+        source_table,
+        target_table,
+        renderer,
+        batch_size,
+        unicode_safe_text,
+    } = request;
+
     let source_qualified_table = format!(
         "{}.{}",
         schema.trim().to_uppercase(),
@@ -754,7 +789,7 @@ pub fn parse_hex_bytes(hex_str: &str) -> Option<Vec<u8>> {
     if trimmed.is_empty() {
         return Some(vec![]);
     }
-    if trimmed.len() % 2 != 0 {
+    if !trimmed.len().is_multiple_of(2) {
         return None;
     }
     (0..trimmed.len())

@@ -185,4 +185,12 @@ export interface TestConnectionResponse {
 export interface DriverInfo {
   path: string;
   source: DriverSource;
+  drivers?: PackagedDriverInfo[];
+}
+
+export interface PackagedDriverInfo {
+  database: string;
+  path: string;
+  source: DriverSource;
+  required: boolean;
 }
