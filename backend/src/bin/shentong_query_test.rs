@@ -5,17 +5,20 @@
 ///   cargo run --bin shentong_query_test
 ///
 /// Requires aci.dll (Shentong client library) on PATH or in the working dir.
+#[path = "shentong_diag_env.rs"]
+mod shentong_diag_env;
+
 use shentong::Connection;
 
 fn main() {
-    let host = "192.168.3.34:2003";
-    let user = "SYSDBA";
-    let pass = "szoscar55";
+    let host = shentong_diag_env::connect("127.0.0.1:2003");
+    let user = shentong_diag_env::user("SYSDBA");
+    let pass = shentong_diag_env::password();
 
     println!("=== Shentong Query Pattern Test ===");
     println!("Connecting to {} as {} ...", host, user);
 
-    let conn = match Connection::connect(user, pass, host) {
+    let conn = match Connection::connect(&user, &pass, &host) {
         Ok(c) => {
             println!("OK: Connected successfully.\n");
             c
@@ -369,7 +372,7 @@ fn main() {
             if *label == "CREATE + SELECT" {
                 print!("  [try] CREATE TABLE _ACI_TEST_ => ");
                 // Create a table, query it, drop it
-                let fresh = match Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003") {
+                let fresh = match Connection::connect(&user, &pass, &host) {
                     Ok(c) => c,
                     Err(e) => {
                         println!("CONNECT ERROR: {}", e);
@@ -414,7 +417,7 @@ fn main() {
             }
 
             print!("  [try] {} : {} => ", label, sql);
-            let fresh = match Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003") {
+            let fresh = match Connection::connect(&user, &pass, &host) {
                 Ok(c) => c,
                 Err(e) => {
                     println!("CONNECT ERROR: {}", e);
@@ -450,7 +453,7 @@ fn main() {
     // 12. Key test: list user_tables and try to SELECT from each
     {
         println!("\n  --- user_tables listing + SELECT test ---");
-        let fresh = Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
+        let fresh = Connection::connect(&user, &pass, &host).unwrap();
         let sql = "SELECT table_name FROM user_tables WHERE table_name LIKE '%TEST%'";
         print!("  [ut] {} => ", sql);
         match fresh.query(sql, &[]) {
@@ -473,8 +476,7 @@ fn main() {
 
                 // Now try SELECT from each found table
                 for name in &names {
-                    let fresh2 =
-                        Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
+                    let fresh2 = Connection::connect(&user, &pass, &host).unwrap();
                     // Try the exact name as returned from user_tables
                     let sql1 = format!("SELECT * FROM {}", name);
                     print!("    SELECT * FROM {} => ", name);
@@ -494,8 +496,7 @@ fn main() {
                     }
 
                     // Try with double quotes around the exact name
-                    let fresh3 =
-                        Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
+                    let fresh3 = Connection::connect(&user, &pass, &host).unwrap();
                     let sql2 = format!(r#"SELECT * FROM "{}""#, name);
                     print!("    {} => ", sql2);
                     match fresh3.query(&sql2, &[]) {
@@ -514,8 +515,7 @@ fn main() {
                     }
 
                     // Try lowercase quoted
-                    let fresh4 =
-                        Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
+                    let fresh4 = Connection::connect(&user, &pass, &host).unwrap();
                     let lower_name = name.to_lowercase();
                     let sql3 = format!(r#"SELECT * FROM "{}""#, lower_name);
                     print!("    {} => ", sql3);
@@ -542,7 +542,7 @@ fn main() {
     // 13. Compare with a CREATE'd table behavior
     {
         println!("\n  --- CREATE vs existing table comparison ---");
-        let fresh = Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
+        let fresh = Connection::connect(&user, &pass, &host).unwrap();
 
         // Create table, commit, then try from fresh connection
         print!("  [cmp] CREATE TABLE _CMP_TEST_ => ");
@@ -571,8 +571,7 @@ fn main() {
                 }
 
                 // Try from fresh connection
-                let fresh2 =
-                    Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
+                let fresh2 = Connection::connect(&user, &pass, &host).unwrap();
                 print!("  [cmp] SELECT from new conn => ");
                 match fresh2.query("SELECT * FROM _CMP_TEST_", &[]) {
                     Ok(rows) => {
@@ -599,18 +598,13 @@ fn main() {
     // 14. Check if TEST_01 is in a different database
     {
         println!("\n  --- Database check ---");
-        let fresh = Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
+        let fresh = Connection::connect(&user, &pass, &host).unwrap();
         print!("  [db] current_database() => ");
         match fresh.query("SELECT current_database()", &[]) {
             Ok(rows) => {
-                for r in rows {
-                    match r {
-                        Ok(row) => {
-                            let v: String = row.get::<_, String>(0).unwrap_or_default();
-                            print!("{}", v);
-                        }
-                        Err(_) => {}
-                    }
+                for row in rows.flatten() {
+                    let v: String = row.get::<_, String>(0).unwrap_or_default();
+                    print!("{}", v);
                 }
                 println!();
             }
@@ -620,14 +614,9 @@ fn main() {
         print!("  [db] v$database => ");
         match fresh.query("SELECT name FROM v$database", &[]) {
             Ok(rows) => {
-                for r in rows {
-                    match r {
-                        Ok(row) => {
-                            let v: String = row.get::<_, String>(0).unwrap_or_default();
-                            print!("{} ", v);
-                        }
-                        Err(_) => {}
-                    }
+                for row in rows.flatten() {
+                    let v: String = row.get::<_, String>(0).unwrap_or_default();
+                    print!("{} ", v);
                 }
                 println!();
             }
@@ -638,7 +627,7 @@ fn main() {
     // 15. Try information_schema and SYS_DATABASE
     {
         println!("\n  --- information_schema and database listing ---");
-        let fresh = Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
+        let fresh = Connection::connect(&user, &pass, &host).unwrap();
 
         // information_schema.tables
         print!("  [is] information_schema.tables TEST_01 => ");
@@ -690,14 +679,9 @@ fn main() {
         print!("  [vd] v$database => ");
         match fresh.query("SELECT name FROM v$database", &[]) {
             Ok(rows) => {
-                for r in rows {
-                    match r {
-                        Ok(row) => {
-                            let v: String = row.get::<_, String>(0).unwrap_or_default();
-                            print!("{} ", v);
-                        }
-                        Err(_) => {}
-                    }
+                for row in rows.flatten() {
+                    let v: String = row.get::<_, String>(0).unwrap_or_default();
+                    print!("{} ", v);
                 }
                 println!();
             }
@@ -708,14 +692,24 @@ fn main() {
     // 16. Try connecting with database name in connect string (Oracle EZConnect style)
     {
         println!("\n  --- Connections with database name ---");
-        for (label, cs) in &[
-            ("host:port/OSRDB", "192.168.3.34:2003/OSRDB"),
-            ("host:port/osrdb", "192.168.3.34:2003/osrdb"),
-            ("host:port:OSRDB", "192.168.3.34:2003:OSRDB"),
-            ("//host:port/OSRDB", "//192.168.3.34:2003/OSRDB"),
-        ] {
+        let base_host = host
+            .trim_start_matches("//")
+            .split('/')
+            .next()
+            .unwrap_or(&host);
+        let database =
+            std::env::var("SHENTONG_DIAG_DATABASE").unwrap_or_else(|_| "OSRDB".to_string());
+        let lower_database = database.to_lowercase();
+        let variants = [
+            ("host:port/DB", format!("{}/{}", base_host, database)),
+            ("host:port/db", format!("{}/{}", base_host, lower_database)),
+            ("host:port:DB", format!("{}:{}", base_host, database)),
+            ("//host:port/DB", format!("//{}/{}", base_host, database)),
+        ];
+
+        for (label, cs) in &variants {
             print!("  [conn] {} => ", label);
-            match Connection::connect("SYSDBA", "szoscar55", cs) {
+            match Connection::connect(&user, &pass, cs.as_str()) {
                 Ok(c) => {
                     match c.query("SELECT * FROM TEST_01", &[]) {
                         Ok(rows) => {
@@ -734,10 +728,8 @@ fn main() {
                             let db = match c.query("SELECT current_database()", &[]) {
                                 Ok(r2) => {
                                     let mut d = String::new();
-                                    for r in r2 {
-                                        if let Ok(row) = r {
-                                            d = row.get::<_, String>(0).unwrap_or_default();
-                                        }
+                                    for row in r2.flatten() {
+                                        d = row.get::<_, String>(0).unwrap_or_default();
                                     }
                                     d
                                 }
@@ -755,7 +747,7 @@ fn main() {
     // 17. Check all_tables for database/tablespace info
     {
         println!("\n  --- all_tables extended info ---");
-        let fresh = Connection::connect("SYSDBA", "szoscar55", "192.168.3.34:2003").unwrap();
+        let fresh = Connection::connect(&user, &pass, &host).unwrap();
         print!("  [at] all_tables TEST_01 extended => ");
         match fresh.query("SELECT owner, table_name, tablespace_name FROM all_tables WHERE table_name = 'TEST_01'", &[]) {
             Ok(rows) => {

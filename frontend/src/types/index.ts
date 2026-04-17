@@ -103,6 +103,7 @@ export interface ExportRequest {
   config: ConnectionConfig;
   target_dialect?: DbType;
   export_schema?: string;
+  export_directory?: string;
   export_compat?: string;
   tables: TableIdentifier[];
   include_ddl: boolean;

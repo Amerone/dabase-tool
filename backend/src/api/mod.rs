@@ -42,7 +42,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/export/capabilities",
             get(capability::get_export_capabilities),
         )
-        .route("/api/export/directory", get(export::get_export_directory))
+        .route(
+            "/api/export/directory",
+            get(export::get_export_directory).post(export::save_export_directory),
+        )
         .route(
             "/api/config/connection",
             get(config::get_connection).post(config::save_connection),

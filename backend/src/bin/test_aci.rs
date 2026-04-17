@@ -3,6 +3,9 @@ extern "C" {
     static mut dpiDebugLevel: u64;
 }
 
+#[path = "shentong_diag_env.rs"]
+mod shentong_diag_env;
+
 fn main() {
     println!("=== ShenTong ACI connection test ===");
 
@@ -67,30 +70,32 @@ fn main() {
     // ShenTong ACI connect string formats to try:
     //   1. Simple connect: host:port/service  (no // prefix)
     //   2. TNS alias (looked up in tnsnames.aci via TNS_ADMIN)
-    //   3. Remote machine (bypasses Docker networking)
+    //   3. Configured target from SHENTONG_DIAG_CONNECT
     //   4. Full Oracle-style connect descriptor (bypasses both EZConnect and TNS lookup)
-    let connect_strings = [
+    let configured = shentong_diag_env::default_connect();
+    let connect_strings = vec![
         // Simple connect format (ShenTong native - no // prefix)
-        ("simple", "localhost:2003/osrdb"),
-        ("simple-upper", "localhost:2003/OSRDB"),
-        ("127_simple", "127.0.0.1:2003/osrdb"),
+        ("simple", "localhost:2003/osrdb".to_string()),
+        ("simple-upper", "localhost:2003/OSRDB".to_string()),
+        ("127_simple", "127.0.0.1:2003/osrdb".to_string()),
         // TNS aliases from tnsnames.aci
-        ("tns-alias-lower", "osrdb"),
-        ("tns-alias-upper", "OSRDB"),
+        ("tns-alias-lower", "osrdb".to_string()),
+        ("tns-alias-upper", "OSRDB".to_string()),
         // EZConnect with // (Oracle style - may or may not work)
-        ("ezconnect", "//localhost:2003/OSRDB"),
-        // Remote Windows machine (bypasses Docker)
-        ("remote", "192.168.3.34:2003/osrdb"),
-        ("remote-tns", "remote_osrdb"),
+        ("ezconnect", "//localhost:2003/OSRDB".to_string()),
+        ("configured", configured),
+        ("configured-tns", "remote_osrdb".to_string()),
         // Full Oracle-style connect descriptor (bypasses TNS resolution entirely)
-        ("full-desc-remote", "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=192.168.3.34)(PORT=2003))(CONNECT_DATA=(SERVICE_NAME=osrdb)))"),
-        ("full-desc-local", "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=2003))(CONNECT_DATA=(SERVICE_NAME=osrdb)))"),
+        ("full-desc-local", "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=2003))(CONNECT_DATA=(SERVICE_NAME=osrdb)))".to_string()),
     ];
+
+    let user = shentong_diag_env::user("sysdba");
+    let password = shentong_diag_env::password();
 
     for (label, connect_str) in &connect_strings {
         println!("\n[{}] Trying: {}", label, connect_str);
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
-        let result = shentong::Connection::connect("sysdba", "szoscar55", connect_str);
+        let result = shentong::Connection::connect(&user, &password, connect_str.as_str());
         match result {
             Ok(_) => {
                 println!("SUCCESS! Connected to ShenTong with: {}", connect_str);

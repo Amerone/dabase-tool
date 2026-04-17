@@ -1,6 +1,10 @@
-/// Debug: compare connect string pointer in for-loop vs direct byte literal
+// Debug: compare connect string pointer in for-loop vs direct byte literal
 #[cfg(windows)]
 use std::ffi::{c_void, CString};
+
+#[path = "shentong_diag_env.rs"]
+mod shentong_diag_env;
+
 #[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
@@ -126,8 +130,12 @@ fn run(aci_dir: Option<String>) {
         do_attach(env_nls, alloc, attach, cs.as_ptr(), cs.len(), "prime-fail");
     }
 
+    let configured_connect = shentong_diag_env::default_connect();
+
     println!("=== for-loop AFTER failed call ===");
-    for connect_str in &["192.168.3.34:2003/osrdb"] {
+    // Keep this as a single-element loop: the diagnostic compares loop vs non-loop pointer shape.
+    #[allow(clippy::single_element_loop)]
+    for connect_str in &[configured_connect.as_str()] {
         let cs = connect_str.as_bytes();
         do_attach(
             env_nls,
@@ -141,7 +149,7 @@ fn run(aci_dir: Option<String>) {
 
     println!("=== byte literal AFTER failed call ===");
     {
-        let cs = b"192.168.3.34:2003/osrdb";
+        let cs = configured_connect.as_bytes();
         do_attach(
             env_nls,
             alloc,

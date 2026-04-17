@@ -1,14 +1,17 @@
-/// Test: does creating TWO env handles (like ODPI) break ACIServerAttach?
-/// This mimics ODPI's call sequence using raw FFI to isolate the issue.
-///
-/// ODPI creates:
-///   1. Global env (charset=873/UTF8, mode=DPI_OCI_THREADED=1)  -- dpiGlobal__extendedInitialize
-///   2. Connection env (charset=852/GBK → we test 871, mode=ACI_OBJECT=2)
-///
-/// Direct FFI creates only ONE env and succeeds. Does the global env break things?
+// Test: does creating TWO env handles (like ODPI) break ACIServerAttach?
+// This mimics ODPI's call sequence using raw FFI to isolate the issue.
+//
+// ODPI creates:
+//   1. Global env (charset=873/UTF8, mode=DPI_OCI_THREADED=1)  -- dpiGlobal__extendedInitialize
+//   2. Connection env (charset=852/GBK -> we test 871, mode=ACI_OBJECT=2)
+//
+// Direct FFI creates only ONE env and succeeds. Does the global env break things?
 
 #[cfg(windows)]
 use std::ffi::{c_void, CString};
+
+#[path = "shentong_diag_env.rs"]
+mod shentong_diag_env;
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -87,12 +90,6 @@ fn test_two_envs(aci_dir: Option<String>) {
     const ACI_HTYPE_ERROR: u32 = 2;
     const ACI_HTYPE_SVCCTX: u32 = 3;
     const ACI_HTYPE_SERVER: u32 = 8;
-    const ACI_HTYPE_SESSION: u32 = 9;
-    const ACI_ATTR_USERNAME: u32 = 22;
-    const ACI_ATTR_PASSWORD: u32 = 23;
-    const ACI_ATTR_SERVER: u32 = 6;
-    const ACI_ATTR_SESSION: u32 = 7;
-    const ACI_CRED_RDBMS: u32 = 1;
     const ACI_DEFAULT: u32 = 0;
     const ACI_OBJECT: u32 = 2;
     const ACI_THREADED: u32 = 1;
@@ -115,10 +112,6 @@ fn test_two_envs(aci_dir: Option<String>) {
         unsafe extern "C" fn(*mut c_void, *mut *mut c_void, u32, usize, *mut *mut c_void) -> i32;
     type HandleFree = unsafe extern "C" fn(*mut c_void, u32) -> i32;
     type ServerAttach = unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, i32, u32) -> i32;
-    type AttrSet =
-        unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32, u32, *mut c_void) -> i32;
-    type SessionBegin =
-        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u32) -> i32;
     type AttrGet =
         unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut u32, u32, *mut c_void) -> i32;
     type NlsNumericInfoGet = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut i32, u32) -> i32;
@@ -133,9 +126,6 @@ fn test_two_envs(aci_dir: Option<String>) {
         unsafe { std::mem::transmute(get_fn(module, "ACIHandleFree").unwrap()) };
     let server_attach: ServerAttach =
         unsafe { std::mem::transmute(get_fn(module, "ACIServerAttach").unwrap()) };
-    let attr_set: AttrSet = unsafe { std::mem::transmute(get_fn(module, "ACIAttrSet").unwrap()) };
-    let session_begin: SessionBegin =
-        unsafe { std::mem::transmute(get_fn(module, "ACISessionBegin").unwrap()) };
     let attr_get: AttrGet = unsafe { std::mem::transmute(get_fn(module, "ACIAttrGet").unwrap()) };
     let nls_info: NlsNumericInfoGet =
         unsafe { std::mem::transmute(get_fn(module, "ACINlsNumericInfoGet").unwrap()) };
@@ -160,7 +150,7 @@ fn test_two_envs(aci_dir: Option<String>) {
         (code, String::from_utf8_lossy(&buf[..end]).to_string())
     };
 
-    let connect_str = "192.168.3.34:2003/osrdb";
+    let connect_str = shentong_diag_env::default_connect();
 
     // === Test 1: One env (like direct FFI - known to work) ===
     println!("\n--- Test 1: ONE env (charset=871, mode=ACI_OBJECT) ---");
@@ -565,10 +555,12 @@ fn test_two_envs(aci_dir: Option<String>) {
         }
     }
 
-    // === Test 7: "Priming" hypothesis — try localhost FIRST (fail), then 192.168.3.34 in NEW env ===
-    // In test_aci_ffi.rs the successful 192.168.3.34 attempt comes AFTER a failed localhost attempt.
+    // === Test 7: "Priming" hypothesis: try localhost FIRST, then configured target in NEW env ===
+    // In test_aci_ffi.rs the successful target attempt comes AFTER a failed localhost attempt.
     // Does the failed attempt "prime" ACI's internal state?
-    println!("\n--- Test 7: Prime with localhost attempt, then try 192.168.3.34 in fresh env ---");
+    println!(
+        "\n--- Test 7: Prime with localhost attempt, then try configured target in fresh env ---"
+    );
     {
         // Priming attempt: localhost (expected to fail)
         let prime_str = b"localhost:2003/osrdb";
@@ -639,7 +631,7 @@ fn test_two_envs(aci_dir: Option<String>) {
             // NOTE: do NOT free — same as test_aci_ffi loop (handles leak)
         }
 
-        // Now try 192.168.3.34 in a brand new env (exactly like test_aci_ffi.rs 2nd iteration)
+        // Now try configured target in a brand new env (exactly like test_aci_ffi.rs 2nd iteration)
         let mut env_h: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {
             env_nls(
@@ -672,9 +664,9 @@ fn test_two_envs(aci_dir: Option<String>) {
             let cs = connect_str.as_bytes();
             let rc2 =
                 unsafe { server_attach(srv_h, err_h, cs.as_ptr(), cs.len() as i32, ACI_DEFAULT) };
-            println!("  ACIServerAttach(192.168.3.34): rc={}", rc2);
+            println!("  ACIServerAttach(configured target): rc={}", rc2);
             if rc2 == 0 {
-                println!("  Test7 PRIMING SUCCESS: localhost failure enabled 192.168.3.34!");
+                println!("  Test7 PRIMING SUCCESS: localhost failure enabled configured target!");
             } else {
                 let (code, msg) = get_error(err_h);
                 println!("  Test7 FAIL code={} msg={}", code, msg);

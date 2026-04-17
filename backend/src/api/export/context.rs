@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{
     export::{
@@ -137,14 +137,31 @@ pub(super) fn sanitize_filename_part(s: &str) -> String {
         .collect()
 }
 
-pub(super) fn exports_dir() -> Result<PathBuf, String> {
+pub(super) fn default_exports_dir() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "Unable to determine home directory".to_string())?;
-    let dir = home.join(".amarone").join("exports");
+    ensure_export_dir(home.join(".amarone").join("exports"))
+}
+
+pub(super) fn resolve_export_dir(directory: Option<&str>) -> Result<PathBuf, String> {
+    let Some(raw) = directory.map(str::trim).filter(|value| !value.is_empty()) else {
+        return default_exports_dir();
+    };
+
+    let dir = PathBuf::from(raw);
+    if !dir.is_absolute() {
+        return Err("Export directory must be an absolute path".to_string());
+    }
+
+    ensure_export_dir(dir)
+}
+
+fn ensure_export_dir(dir: PathBuf) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Failed to create exports directory {:?}: {}", dir, e))?;
+        .map_err(|e| format!("Failed to create export directory {:?}: {}", dir, e))?;
     Ok(dir)
 }
 
+#[cfg(test)]
 pub(super) fn format_export_filename(
     source: &str,
     dialect: &str,
@@ -152,7 +169,18 @@ pub(super) fn format_export_filename(
     kind: &str,
     suffix: &str,
 ) -> Result<PathBuf, String> {
-    let dir = exports_dir()?;
+    let dir = default_exports_dir()?;
+    format_export_filename_in_dir(&dir, source, dialect, target, kind, suffix)
+}
+
+pub(super) fn format_export_filename_in_dir(
+    dir: &Path,
+    source: &str,
+    dialect: &str,
+    target: &str,
+    kind: &str,
+    suffix: &str,
+) -> Result<PathBuf, String> {
     Ok(dir.join(format!(
         "{}_to_{}_{}_{}_{}.sql",
         sanitize_filename_part(source),
@@ -211,7 +239,8 @@ pub(super) fn build_export_context(req: &mut ExportRequest) -> (ConnectionConfig
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_workload_warnings, format_error_chain, format_export_filename, resolve_compat,
+        collect_workload_warnings, format_error_chain, format_export_filename,
+        format_export_filename_in_dir, resolve_compat, resolve_export_dir,
         resolve_include_row_counts, resolve_target_dialect, resolve_target_schema,
         sanitize_filename_part,
     };
@@ -246,6 +275,24 @@ mod tests {
         assert!(path.is_absolute(), "export path must be absolute");
         let name = path.file_name().unwrap().to_str().unwrap();
         assert_eq!(name, "___evil_to_dm8_a_b_ddl_ts.sql");
+    }
+
+    #[test]
+    fn format_export_filename_uses_selected_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path =
+            format_export_filename_in_dir(dir.path(), "SRC", "dm8", "TGT", "ddl", "ts").unwrap();
+        assert_eq!(path.parent(), Some(dir.path()));
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            "SRC_to_dm8_TGT_ddl_ts.sql"
+        );
+    }
+
+    #[test]
+    fn resolve_export_dir_rejects_relative_path() {
+        let err = resolve_export_dir(Some("relative/path")).unwrap_err();
+        assert!(err.contains("absolute path"));
     }
 
     #[test]
@@ -295,6 +342,7 @@ mod tests {
             },
             target_dialect: None,
             export_schema: None,
+            export_directory: None,
             export_compat: None,
             tables: vec![],
             include_ddl: true,

@@ -21,12 +21,16 @@ import sys
 import socket
 import struct
 import hashlib
+import os
 
-HOST = "192.168.3.34"
-PORT = 2003
-USER = "SYSDBA"
-PASSWORD = "szoscar55"
-DBNAME = "OSRDB"
+HOST = os.environ.get("SHENTONG_DIAG_HOST", "127.0.0.1")
+PORT = int(os.environ.get("SHENTONG_DIAG_PORT", "2003"))
+USER = os.environ.get("SHENTONG_DIAG_USER", "SYSDBA")
+PASSWORD = os.environ.get("SHENTONG_DIAG_PASSWORD") or os.environ.get("SHENTONG_PASSWORD")
+DBNAME = os.environ.get("SHENTONG_DIAG_DATABASE", "OSRDB")
+
+if not PASSWORD:
+    sys.exit("Set SHENTONG_DIAG_PASSWORD or SHENTONG_PASSWORD to run this diagnostic")
 
 QUERIES = [
     "SELECT * FROM TEST_01",
@@ -186,7 +190,7 @@ def attempt_login():
             else:
                 err = parse_error(resp2) if resp2 else "(empty)"
                 print(f"  Auth failed: {err[:100]}")
-                print(f"  (Password '{PASSWORD}' may be incorrect for user '{USER}')")
+                print(f"  (Configured password may be incorrect for user '{USER}')")
         elif auth_type == 3:
             print("  Cleartext password requested")
             send_password(s, PASSWORD)

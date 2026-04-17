@@ -1,8 +1,11 @@
-/// Isolation: does a pointer to .rodata on the stack matter?
-/// Test: create a &str reference on the stack before calling ACIServerAttach
+// Isolation: does a pointer to .rodata on the stack matter?
+// Test: create a &str reference on the stack before calling ACIServerAttach
 
 #[cfg(windows)]
 use std::ffi::{c_void, CString};
+
+#[path = "shentong_diag_env.rs"]
+mod shentong_diag_env;
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -147,7 +150,8 @@ fn test(aci_dir: Option<String>) {
     let _error_get: FnErrGet =
         unsafe { std::mem::transmute(get_fn(module, "ACIErrorGet").unwrap()) };
 
-    let cs = b"192.168.3.34:2003/osrdb";
+    let configured_connect = shentong_diag_env::default_connect();
+    let cs = configured_connect.as_bytes();
 
     // Test A: plain block (baseline FAIL)
     println!("\n--- Test A: plain block (baseline FAIL expected) ---");
@@ -186,7 +190,8 @@ fn test(aci_dir: Option<String>) {
     println!("\n--- Test B: &str array ref on stack before call ---");
     {
         // This creates a slice reference on the stack (pointer to .rodata)
-        let _strs: &[&str] = &["192.168.3.34:2003/osrdb"];
+        let strs = [configured_connect.as_str()];
+        let _strs: &[&str] = &strs;
         let mut env_h: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {
             env_nls(
@@ -218,9 +223,11 @@ fn test(aci_dir: Option<String>) {
         }
     }
 
-    // Test C: attempt() helper with str slice from for-loop element
+    // Test C: attempt() helper with str slice from for-loop element.
+    // Keep this as a single-element loop: the diagnostic isolates loop codegen/stack shape.
     println!("\n--- Test C: for x in &[str], pass x.as_bytes() to attempt() ---");
-    for connect_str in &["192.168.3.34:2003/osrdb"] {
+    #[allow(clippy::single_element_loop)]
+    for connect_str in &[configured_connect.as_str()] {
         let bytes = connect_str.as_bytes();
         attempt(
             "C",
@@ -245,7 +252,8 @@ fn test(aci_dir: Option<String>) {
 
     // Test E: for-loop (known working) - confirm
     println!("\n--- Test E: for-slice (confirm working) ---");
-    for connect_str in &["192.168.3.34:2003/osrdb"] {
+    #[allow(clippy::single_element_loop)]
+    for connect_str in &[configured_connect.as_str()] {
         println!("  Trying: {}", connect_str);
         let mut env_h: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {

@@ -1,8 +1,11 @@
-/// ACI priming: confirm that keeping localhost handles ALIVE on stack is the key
-/// vs returning false from a closure (stack frame popped)
+// ACI priming: confirm that keeping localhost handles ALIVE on stack is the key
+// vs returning false from a closure (stack frame popped)
 
 #[cfg(windows)]
 use std::ffi::{c_void, CString};
+
+#[path = "shentong_diag_env.rs"]
+mod shentong_diag_env;
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -109,8 +112,12 @@ fn run(aci_dir: Option<String>) {
         (code, String::from_utf8_lossy(&buf[..end]).to_string())
     };
 
-    // --- Test A: localhost attempt then 192.168.3.34, but handles kept ALIVE on stack ---
-    println!("\n--- Test A: localhost + 192.168.3.34, handles ALIVE on stack (like for loop) ---");
+    let configured_connect = shentong_diag_env::default_connect();
+
+    // --- Test A: localhost attempt then configured target, but handles kept ALIVE on stack ---
+    println!(
+        "\n--- Test A: localhost + configured target, handles ALIVE on stack (like for loop) ---"
+    );
     {
         // localhost - these variables stay ALIVE in this block
         let mut env1: *mut c_void = std::ptr::null_mut();
@@ -146,7 +153,7 @@ fn run(aci_dir: Option<String>) {
             }
         }
 
-        // Now 192.168.3.34 with a NEW env — but env1/err1/svc1/srv1 still ALIVE here!
+        // Now configured target with a NEW env, while env1/err1/svc1/srv1 remain ALIVE.
         let mut env2: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {
             env_nls(
@@ -172,18 +179,20 @@ fn run(aci_dir: Option<String>) {
                 alloc(env2, &mut svc2, 3, 0, std::ptr::null_mut());
                 alloc(env2, &mut srv2, 8, 0, std::ptr::null_mut());
             }
-            let cs = b"192.168.3.34:2003/osrdb";
+            let cs = configured_connect.as_bytes();
             let rc2 = unsafe { attach(srv2, err2, cs.as_ptr(), cs.len() as i32, 0) };
-            println!("  192.168.3.34 attach: rc={}", rc2);
+            println!("  configured target attach: rc={}", rc2);
             if rc2 == 0 {
                 println!("  Test A: SUCCESS (handles alive)");
                 // Session
                 let mut ses: *mut c_void = std::ptr::null_mut();
+                let user = shentong_diag_env::user("sysdba");
+                let password = shentong_diag_env::password();
+                let u = user.as_bytes();
+                let p = password.as_bytes();
                 unsafe {
                     attr_set(svc2, 3, srv2, 0, 6, err2);
                     alloc(env2, &mut ses, 9, 0, std::ptr::null_mut());
-                    let u = b"sysdba";
-                    let p = b"szoscar55";
                     attr_set(ses, 9, u.as_ptr() as *mut c_void, u.len() as u32, 22, err2);
                     attr_set(ses, 9, p.as_ptr() as *mut c_void, p.len() as u32, 23, err2);
                     attr_set(svc2, 3, ses, 0, 7, err2);

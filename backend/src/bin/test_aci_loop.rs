@@ -1,7 +1,10 @@
-/// Test: does any for-loop (range 0..1) fix it, or is it specific to slice for-loops?
+// Test: does any for-loop (range 0..1) fix it, or is it specific to slice for-loops?
 
 #[cfg(windows)]
 use std::ffi::{c_void, CString};
+
+#[path = "shentong_diag_env.rs"]
+mod shentong_diag_env;
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -106,7 +109,8 @@ fn do_connect(
         handle_alloc(env_h, &mut srv_h, 8, 0, std::ptr::null_mut());
     }
 
-    let cs = b"192.168.3.34:2003/osrdb";
+    let connect = shentong_diag_env::default_connect();
+    let cs = connect.as_bytes();
     let rc = unsafe { server_attach(srv_h, err_h, cs.as_ptr(), cs.len() as i32, 0) };
     println!("  [{}] ACIServerAttach: rc={}", label, rc);
     if rc != 0 {
@@ -140,8 +144,10 @@ fn do_connect(
     unsafe {
         handle_alloc(env_h, &mut ses_h, 9, 0, std::ptr::null_mut());
     }
-    let user = b"sysdba";
-    let pwd = b"szoscar55";
+    let user = shentong_diag_env::user("sysdba");
+    let password = shentong_diag_env::password();
+    let user = user.as_bytes();
+    let pwd = password.as_bytes();
     unsafe {
         attr_set(
             ses_h,
@@ -246,7 +252,8 @@ fn test(aci_dir: Option<String>) {
             handle_alloc(env_h, &mut svc_h, 3, 0, std::ptr::null_mut());
             handle_alloc(env_h, &mut srv_h, 8, 0, std::ptr::null_mut());
         }
-        let cs = b"192.168.3.34:2003/osrdb";
+        let connect = shentong_diag_env::default_connect();
+        let cs = connect.as_bytes();
         let rc = unsafe { server_attach(srv_h, err_h, cs.as_ptr(), cs.len() as i32, 0) };
         println!("  ACIServerAttach: rc={}", rc);
         if rc != 0 {
@@ -307,7 +314,8 @@ fn test(aci_dir: Option<String>) {
                 handle_alloc(env_h, &mut svc_h, 3, 0, std::ptr::null_mut());
                 handle_alloc(env_h, &mut srv_h, 8, 0, std::ptr::null_mut());
             }
-            let cs = b"192.168.3.34:2003/osrdb";
+            let connect = shentong_diag_env::default_connect();
+            let cs = connect.as_bytes();
             let rc = unsafe { server_attach(srv_h, err_h, cs.as_ptr(), cs.len() as i32, 0) };
             println!("  ACIServerAttach: rc={}", rc);
             if rc != 0 {
@@ -364,7 +372,8 @@ fn test(aci_dir: Option<String>) {
                 handle_alloc(env_h, &mut svc_h, 3, 0, std::ptr::null_mut());
                 handle_alloc(env_h, &mut srv_h, 8, 0, std::ptr::null_mut());
             }
-            let cs = b"192.168.3.34:2003/osrdb";
+            let connect = shentong_diag_env::default_connect();
+            let cs = connect.as_bytes();
             let rc = unsafe { server_attach(srv_h, err_h, cs.as_ptr(), cs.len() as i32, 0) };
             println!("  ACIServerAttach: rc={}", rc);
             if rc != 0 {

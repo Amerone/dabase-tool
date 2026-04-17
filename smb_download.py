@@ -1,8 +1,16 @@
 from impacket.smbconnection import SMBConnection
 import os
+import sys
 
-conn = SMBConnection('192.168.3.34', '192.168.3.34', None, 445, timeout=10)
-conn.login('Administrator', '123456')
+host = os.environ.get('SHENTONG_SMB_HOST')
+user = os.environ.get('SHENTONG_SMB_USER')
+password = os.environ.get('SHENTONG_SMB_PASSWORD')
+
+if not host or not user or not password:
+    sys.exit('Set SHENTONG_SMB_HOST, SHENTONG_SMB_USER, and SHENTONG_SMB_PASSWORD before running this script')
+
+conn = SMBConnection(host, host, None, 445, timeout=10)
+conn.login(user, password)
 
 def download_file(share, remote_path, local_path):
     os.makedirs(os.path.dirname(local_path), exist_ok=True)

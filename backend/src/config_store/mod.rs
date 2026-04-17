@@ -34,6 +34,7 @@ pub struct ConfigStore {
 // --------------- encryption helpers ---------------
 
 const ENC_PREFIX: &str = "enc:";
+const EXPORT_DIRECTORY_KEY: &str = "export_directory";
 
 fn db_type_as_str(db_type: &DbType) -> &'static str {
     match db_type {
@@ -354,6 +355,17 @@ impl ConfigStore {
         Ok(affected > 0)
     }
 
+    pub fn get_export_directory(&self) -> Result<Option<String>> {
+        self.get_app_setting(EXPORT_DIRECTORY_KEY)
+    }
+
+    pub fn set_export_directory(&self, directory: &str) -> Result<String> {
+        let normalized = directory.trim();
+        ensure!(!normalized.is_empty(), "Export directory cannot be empty");
+        self.set_app_setting(EXPORT_DIRECTORY_KEY, normalized)?;
+        Ok(normalized.to_string())
+    }
+
     fn init_db(&self) -> Result<()> {
         let conn = Connection::open(&self.db_path)
             .with_context(|| format!("Failed to open SQLite at {:?}", self.db_path))?;
@@ -376,6 +388,34 @@ impl ConfigStore {
 
         ensure_export_schema_column(&conn)?;
         ensure_database_column(&conn)?;
+        ensure_app_settings_table(&conn)?;
+
+        Ok(())
+    }
+
+    fn get_app_setting(&self, key: &str) -> Result<Option<String>> {
+        let conn = Connection::open(&self.db_path)
+            .with_context(|| format!("Failed to open SQLite at {:?}", self.db_path))?;
+
+        conn.query_row(
+            "SELECT value FROM app_settings WHERE key = ?1 LIMIT 1",
+            params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn set_app_setting(&self, key: &str, value: &str) -> Result<()> {
+        let conn = Connection::open(&self.db_path)
+            .with_context(|| format!("Failed to open SQLite at {:?}", self.db_path))?;
+        let updated_at = Utc::now().to_rfc3339();
+
+        conn.execute(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            params![key, value, updated_at],
+        )?;
 
         Ok(())
     }
@@ -464,6 +504,18 @@ fn ensure_database_column(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE connections ADD COLUMN database TEXT", [])?;
     }
 
+    Ok(())
+}
+
+fn ensure_app_settings_table(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -651,5 +703,22 @@ mod tests {
         let deleted = store.delete_connection_by_id(saved.id).unwrap();
         assert!(deleted);
         assert!(store.list_connections().unwrap().is_empty());
+    }
+
+    #[test]
+    fn export_directory_round_trips_through_app_settings() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("config.db");
+        let store = ConfigStore::new_with_path(db_path).unwrap();
+        let export_dir = dir.path().join("exports");
+        let export_dir_str = export_dir.to_string_lossy().to_string();
+
+        assert!(store.get_export_directory().unwrap().is_none());
+
+        let saved = store.set_export_directory(&export_dir_str).unwrap();
+        assert_eq!(saved, export_dir_str);
+
+        let fetched = store.get_export_directory().unwrap();
+        assert_eq!(fetched.as_deref(), Some(export_dir_str.as_str()));
     }
 }

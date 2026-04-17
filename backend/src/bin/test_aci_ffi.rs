@@ -1,19 +1,18 @@
-/// Direct ACI FFI test - bypasses ODPI entirely
-/// Tests ACIServerAttach and ACISessionBegin directly via Windows LoadLibrary
+// Direct ACI FFI test - bypasses ODPI entirely
+// Tests ACIServerAttach and ACISessionBegin directly via Windows LoadLibrary
 
 #[cfg(windows)]
 use std::ffi::{c_void, CString};
+
+#[path = "shentong_diag_env.rs"]
+mod shentong_diag_env;
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
     fn LoadLibraryA(name: *const u8) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
-    fn FreeLibrary(module: *mut c_void) -> i32;
 }
-
-#[cfg(windows)]
-type AciFn = unsafe extern "C" fn() -> i32;
 
 #[cfg(windows)]
 fn get_fn(module: *mut c_void, name: &str) -> Option<*mut c_void> {
@@ -141,7 +140,10 @@ fn test_aci_direct(aci_dir: Option<String>) {
         (code, msg)
     };
 
-    for connect_str in &["localhost:2003/osrdb", "192.168.3.34:2003/osrdb"] {
+    let configured_connect = shentong_diag_env::default_connect();
+    let connect_strings = ["localhost:2003/osrdb".to_string(), configured_connect];
+
+    for connect_str in &connect_strings {
         println!("\nTrying: {}", connect_str);
 
         // Create env
@@ -219,8 +221,10 @@ fn test_aci_direct(aci_dir: Option<String>) {
         }
 
         // Set user/password
-        let user = b"sysdba";
-        let pwd = b"szoscar55";
+        let user = shentong_diag_env::user("sysdba");
+        let password = shentong_diag_env::password();
+        let user = user.as_bytes();
+        let pwd = password.as_bytes();
         unsafe {
             attr_set(
                 ses_h,

@@ -6,6 +6,7 @@ import {
   FileTextOutlined,
   FolderOpenOutlined,
   RocketOutlined,
+  SaveOutlined,
 } from '@ant-design/icons';
 import {
   Checkbox,
@@ -25,10 +26,12 @@ import { animate } from 'animejs';
 import type { CapabilityLevel, ExportCapabilityReport, ExportRequest } from '@/types';
 import { calcProgress } from '@/utils/exportProgress';
 import {
+  chooseExportDirectory,
   exportData,
   exportDDL,
   getExportCapabilities,
   getExportDirectory,
+  saveExportDirectory,
 } from '@/services/api';
 import { useExportStore } from '@/store/useExportStore';
 import { SectionHeader } from './common/SectionHeader';
@@ -78,6 +81,8 @@ export default function ExportConfig() {
   const [includeRowCountsSupported, setIncludeRowCountsSupported] = useState(true);
   const [includeRowCountsNote, setIncludeRowCountsNote] = useState<string | null>(null);
   const [capabilityReport, setCapabilityReport] = useState<ExportCapabilityReport | null>(null);
+  const [exportDirectory, setExportDirectory] = useState('');
+  const [directoryLoading, setDirectoryLoading] = useState(false);
   const animatedProgressRef = useRef(0);
   const animatedProgressWholeRef = useRef(-1);
   const resultRef = useRef<HTMLDivElement>(null);
@@ -128,6 +133,26 @@ export default function ExportConfig() {
       resultRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
   }, [exportResult]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setDirectoryLoading(true);
+    void getExportDirectory()
+      .then((response) => {
+        if (!cancelled && response.success && response.data) {
+          setExportDirectory(response.data);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setDirectoryLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const loadCapability = useCallback(
     async (source: typeof sourceDbType, target: typeof targetDialect) => {
@@ -185,13 +210,11 @@ export default function ExportConfig() {
   }, [config, form, loadCapability, sourceDbType, targetDialect]);
 
   const handleOpenFolder = async () => {
-    const response = await getExportDirectory();
-    if (!response.success || !response.data) {
-      message.error(response.error || '获取导出目录失败');
+    const directory = exportDirectory.trim();
+    if (!directory) {
+      message.warning('请先设置导出目录');
       return;
     }
-
-    const directory = response.data;
     if (isTauri()) {
       try {
         const { openPath } = await import('@tauri-apps/plugin-opener');
@@ -207,6 +230,43 @@ export default function ExportConfig() {
       message.success(`路径已复制: ${directory}`);
     } catch {
       message.info(`导出目录: ${directory}`);
+    }
+  };
+
+  const persistExportDirectory = async (directory: string, showSuccess = true) => {
+    const normalized = directory.trim();
+    if (!normalized) {
+      message.warning('导出目录不能为空');
+      return null;
+    }
+
+    const response = await saveExportDirectory(normalized);
+    if (!response.success || !response.data) {
+      message.error(response.error || '保存导出目录失败');
+      return null;
+    }
+
+    setExportDirectory(response.data);
+    if (showSuccess) {
+      message.success('导出目录已保存');
+    }
+    return response.data;
+  };
+
+  const handleChooseDirectory = async () => {
+    setDirectoryLoading(true);
+    try {
+      const response = await chooseExportDirectory(exportDirectory.trim() || undefined);
+      if (!response.success) {
+        message.info(response.error || '浏览器模式请手动输入导出目录');
+        return;
+      }
+      if (!response.data) {
+        return;
+      }
+      await persistExportDirectory(response.data);
+    } finally {
+      setDirectoryLoading(false);
     }
   };
 
@@ -227,6 +287,11 @@ export default function ExportConfig() {
 
     try {
       const values = await form.validateFields();
+      const savedExportDirectory = await persistExportDirectory(exportDirectory, false);
+      if (!savedExportDirectory) {
+        return;
+      }
+
       const source = config.db_type ?? 'dm8';
       const target = values.target_dialect ?? source;
 
@@ -273,6 +338,7 @@ export default function ExportConfig() {
         config,
         target_dialect: target,
         export_schema: values.export_schema?.trim() || undefined,
+        export_directory: savedExportDirectory,
         export_compat: values.export_compat,
         tables: selectedTables.map((name) => ({ schema: config.schema, name })),
         include_ddl: values.include_ddl,
@@ -362,6 +428,38 @@ export default function ExportConfig() {
   return (
     <TechCard>
       <SectionHeader title="导出控制台" subtitle="设置导出策略并执行任务" />
+
+      <div className="export-directory-panel">
+        <div className="export-directory-header">
+          <div>
+            <p className="export-directory-title">导出目录</p>
+            <p className="export-directory-note">导出前会保存该目录，下次自动使用。</p>
+          </div>
+        </div>
+        <Space.Compact className="export-directory-control">
+          <Input
+            value={exportDirectory}
+            onChange={(event) => setExportDirectory(event.target.value)}
+            placeholder="请选择或输入服务器可访问的绝对路径"
+            disabled={directoryLoading || loading}
+          />
+          <TechButton
+            icon={<FolderOpenOutlined />}
+            onClick={handleChooseDirectory}
+            loading={directoryLoading}
+            disabled={loading}
+          >
+            选择目录
+          </TechButton>
+          <TechButton
+            icon={<SaveOutlined />}
+            onClick={() => void persistExportDirectory(exportDirectory)}
+            disabled={directoryLoading || loading}
+          >
+            保存
+          </TechButton>
+        </Space.Compact>
+      </div>
 
       <Form
         form={form}

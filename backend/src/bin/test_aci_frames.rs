@@ -1,13 +1,16 @@
-/// Test: does splitting ACI calls across different stack frames cause failure?
-/// ODPI splits: dpiOci__envNlsCreate (frame1) → dpiOci__handleAlloc (frame2) → dpiOci__serverAttach (frame3)
-/// Direct FFI does all in one frame → works
-///
-/// This test compares:
-/// A) All calls in one function (like do_attach) → expect SUCCESS
-/// B) Calls split across separate functions → expect FAIL?
+// Test: does splitting ACI calls across different stack frames cause failure?
+// ODPI splits: dpiOci__envNlsCreate (frame1) -> dpiOci__handleAlloc (frame2) -> dpiOci__serverAttach (frame3)
+// Direct FFI does all in one frame -> works
+//
+// This test compares:
+// A) All calls in one function (like do_attach) -> expect SUCCESS
+// B) Calls split across separate functions -> expect FAIL?
 
 #[cfg(windows)]
 use std::ffi::{c_void, CString};
+
+#[path = "shentong_diag_env.rs"]
+mod shentong_diag_env;
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -173,7 +176,8 @@ fn run(aci_dir: Option<String>) {
         println!("  code={} '{}'", code, String::from_utf8_lossy(&buf[..n]));
     };
 
-    let cs = b"192.168.3.34:2003/osrdb";
+    let configured_connect = shentong_diag_env::default_connect();
+    let cs = configured_connect.as_bytes();
 
     // === Method 0: do_attach_all localhost priming — SAME FUNCTION as Method C ===
     println!("\n--- Method 0b: do_attach_all localhost priming (same function as Method C) ---");
@@ -259,13 +263,15 @@ fn run(aci_dir: Option<String>) {
             print_err(err);
         } else {
             let mut ses: *mut c_void = std::ptr::null_mut();
+            let user = shentong_diag_env::user("sysdba");
+            let password = shentong_diag_env::password();
+            let u = user.as_bytes();
+            let p = password.as_bytes();
             unsafe {
                 attr_set(svc, 3, srv, 0, 6, err);
                 alloc(env, &mut ses, 9, 0, std::ptr::null_mut());
             }
             unsafe {
-                let u = b"sysdba";
-                let p = b"szoscar55";
                 attr_set(ses, 9, u.as_ptr() as *mut c_void, u.len() as u32, 22, err);
                 attr_set(ses, 9, p.as_ptr() as *mut c_void, p.len() as u32, 23, err);
                 attr_set(svc, 3, ses, 0, 7, err);
@@ -296,13 +302,15 @@ fn run(aci_dir: Option<String>) {
             print_err(err);
         } else {
             let mut ses: *mut c_void = std::ptr::null_mut();
+            let user = shentong_diag_env::user("sysdba");
+            let password = shentong_diag_env::password();
+            let u = user.as_bytes();
+            let p = password.as_bytes();
             unsafe {
                 attr_set(svc, 3, srv, 0, 6, err);
                 alloc(env, &mut ses, 9, 0, std::ptr::null_mut());
             }
             unsafe {
-                let u = b"sysdba";
-                let p = b"szoscar55";
                 attr_set(ses, 9, u.as_ptr() as *mut c_void, u.len() as u32, 22, err);
                 attr_set(ses, 9, p.as_ptr() as *mut c_void, p.len() as u32, 23, err);
                 attr_set(svc, 3, ses, 0, 7, err);
@@ -319,7 +327,7 @@ fn run(aci_dir: Option<String>) {
     // === Method C: same as test_aci_ptr.rs do_attach approach ===
     println!("\n--- Method C: call do_attach_all function directly ---");
     {
-        let cs = b"192.168.3.34:2003/osrdb";
+        let cs = configured_connect.as_bytes();
         do_attach_all(env_nls, alloc, attach, cs.as_ptr(), cs.len(), "method-C");
     }
 

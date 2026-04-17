@@ -1,7 +1,16 @@
-$target = "\\192.168.3.34\C$"
-$user = "192.168.3.34\Administrator"
-$pass = ConvertTo-SecureString "123456" -AsPlainText -Force
-$cred = New-Object System.Management.Automation.PSCredential($user, $pass)
+param(
+    [string]$RemoteHost = $env:SHENTONG_SMB_HOST,
+    [string]$User = $env:SHENTONG_SMB_USER,
+    [string]$Password = $env:SHENTONG_SMB_PASSWORD
+)
+
+if (-not $RemoteHost -or -not $User -or -not $Password) {
+    throw "Set SHENTONG_SMB_HOST, SHENTONG_SMB_USER, and SHENTONG_SMB_PASSWORD before running this script."
+}
+
+$target = "\\$RemoteHost\C$"
+$pass = ConvertTo-SecureString $Password -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential($User, $pass)
 
 # Try mapping the share
 $drive = New-PSDrive -Name S -PSProvider FileSystem -Root $target -Credential $cred -ErrorAction Stop

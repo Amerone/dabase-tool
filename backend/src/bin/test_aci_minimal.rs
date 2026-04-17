@@ -1,9 +1,12 @@
-/// Minimal ACI FFI test: priming hypothesis
-/// Test A: ONLY 192.168.3.34 (expected FAIL - no priming)
-/// Test B: localhost first, then 192.168.3.34 in fresh env (expected SUCCESS - primed)
+// Minimal ACI FFI test: priming hypothesis
+// Test A: ONLY configured target (expected FAIL - no priming)
+// Test B: localhost first, then configured target in fresh env (expected SUCCESS - primed)
 
 #[cfg(windows)]
 use std::ffi::{c_void, CString};
+
+#[path = "shentong_diag_env.rs"]
+mod shentong_diag_env;
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -124,11 +127,13 @@ fn run(aci_dir: Option<String>) {
             println!("  [{}] attach OK → trying session...", label);
             // Full session test like test_aci_ffi
             let mut ses: *mut c_void = std::ptr::null_mut();
+            let user = shentong_diag_env::user("sysdba");
+            let password = shentong_diag_env::password();
+            let u = user.as_bytes();
+            let p = password.as_bytes();
             unsafe {
                 attr_set(svc, 3, srv, 0, 6, err);
                 alloc(env, &mut ses, 9, 0, std::ptr::null_mut());
-                let u = b"sysdba";
-                let p = b"szoscar55";
                 attr_set(ses, 9, u.as_ptr() as *mut c_void, u.len() as u32, 22, err);
                 attr_set(ses, 9, p.as_ptr() as *mut c_void, p.len() as u32, 23, err);
                 attr_set(svc, 3, ses, 0, 7, err);
@@ -161,13 +166,15 @@ fn run(aci_dir: Option<String>) {
         }
     };
 
-    println!("\n--- Test A: ONLY 192.168.3.34 (no priming) ---");
-    let a = try_connect("192.168.3.34:2003/osrdb", "A");
+    let configured_connect = shentong_diag_env::default_connect();
+
+    println!("\n--- Test A: ONLY configured target (no priming) ---");
+    let a = try_connect(&configured_connect, "A");
     println!("  Test A: {}", if a { "SUCCESS" } else { "FAIL" });
 
-    println!("\n--- Test B: localhost first (prime), then 192.168.3.34 ---");
+    println!("\n--- Test B: localhost first (prime), then configured target ---");
     try_connect("localhost:2003/osrdb", "B-prime");
-    let b = try_connect("192.168.3.34:2003/osrdb", "B-real");
+    let b = try_connect(&configured_connect, "B-real");
     println!(
         "  Test B: {}",
         if b {

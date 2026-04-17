@@ -156,6 +156,9 @@ function extractApiError(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message) {
     return error.message;
   }
+  if (typeof error === 'string' && error.trim()) {
+    return error;
+  }
   return fallback;
 }
 
@@ -633,6 +636,26 @@ export const getDriverInfo = async (): Promise<DriverInfo | null> => {
   }
 };
 
+export const chooseExportDirectory = async (
+  initialDirectory?: string
+): Promise<ApiResponse<string | null>> => {
+  if (!isTauri()) {
+    return {
+      success: false,
+      error: '桌面端可打开系统目录选择器，浏览器模式请手动输入导出目录',
+    };
+  }
+
+  try {
+    const selected = await invoke<string | null>('choose_export_directory', {
+      initialDirectory,
+    });
+    return { success: true, data: selected };
+  } catch (error) {
+    return { success: false, error: extractApiError(error, 'Failed to choose export directory') };
+  }
+};
+
 export const getExportDirectory = async (): Promise<ApiResponse<string>> => {
   try {
     const api = await getApi();
@@ -640,5 +663,15 @@ export const getExportDirectory = async (): Promise<ApiResponse<string>> => {
     return response.data;
   } catch (error) {
     return { success: false, error: extractApiError(error, 'Failed to load export directory') };
+  }
+};
+
+export const saveExportDirectory = async (directory: string): Promise<ApiResponse<string>> => {
+  try {
+    const api = await getApi();
+    const response = await api.post<ApiResponse<string>>('/export/directory', { directory });
+    return response.data;
+  } catch (error) {
+    return { success: false, error: extractApiError(error, 'Failed to save export directory') };
   }
 };

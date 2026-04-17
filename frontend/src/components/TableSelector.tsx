@@ -182,94 +182,98 @@ export default function TableSelector() {
   }
 
   return (
-    <TechCard delay={180} style={{ marginTop: 24 }}>
+    <TechCard className="selected-table-card" delay={180} style={{ marginTop: 24 }}>
       <SectionHeader title="已选清单" subtitle={`共 ${selectedTables.length} 张表`} />
 
-      <Collapse
-        ghost
-        destroyInactivePanel
-        activeKey={activeKeys}
-        onChange={handleCollapseChange}
-        expandIcon={({ isActive }) => (
-          <CodeOutlined rotate={isActive ? 90 : 0} style={{ color: '#13c2c2' }} />
-        )}
-      >
-        {selectedTables.map((tableName) => {
-          const summary = summaryMap.get(tableName);
-          const details = detailsMap[tableName];
-          const loading = loadingMap[tableName];
+      <div className="selected-table-list">
+        <Collapse
+          ghost
+          destroyInactivePanel
+          activeKey={activeKeys}
+          onChange={handleCollapseChange}
+          expandIcon={({ isActive }) => (
+            <CodeOutlined rotate={isActive ? 90 : 0} style={{ color: '#13c2c2' }} />
+          )}
+        >
+          {selectedTables.map((tableName) => {
+            const summary = summaryMap.get(tableName);
+            const details = detailsMap[tableName];
+            const loading = loadingMap[tableName];
 
-          return (
-            <Panel
-              header={
-                <Space style={{ width: '100%', justifyContent: 'space-between' }}>
-                  <span className="selected-table-name">{tableName}</span>
-                  <Space>
-                    {summary && (
-                      <Tag className="selected-table-tag">
-                        {(summary.row_count ?? 0).toLocaleString()} rows
-                      </Tag>
-                    )}
-                    <Button
-                      type="text"
-                      size="small"
-                      danger
-                      icon={<DeleteOutlined />}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        toggleTable(tableName);
-                      }}
-                    />
-                  </Space>
-                </Space>
-              }
-              key={tableName}
-              extra={
-                <Button
-                  type="link"
-                  size="small"
-                  icon={<ReloadOutlined />}
+            return (
+              <Panel
+                header={
+                  <div className="selected-table-panel-header">
+                    <span className="selected-table-name" title={tableName}>
+                      {tableName}
+                    </span>
+                    <Space className="selected-table-actions" size={6}>
+                      {summary && (
+                        <Tag className="selected-table-tag">
+                          {(summary.row_count ?? 0).toLocaleString()} rows
+                        </Tag>
+                      )}
+                      <Button
+                        type="text"
+                        size="small"
+                        danger
+                        icon={<DeleteOutlined />}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          toggleTable(tableName);
+                        }}
+                      />
+                    </Space>
+                  </div>
+                }
+                key={tableName}
+                extra={
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<ReloadOutlined />}
                     onClick={(event) => {
                       event.stopPropagation();
                       void fetchDetailsBatch([tableName], true);
                     }}
                   />
-              }
-              className="selected-table-panel"
-            >
-              {loading && (
-                <div className="selected-table-loading">
-                  <Spin size="small" />
-                  <span>加载结构详情中...</span>
-                </div>
-              )}
+                }
+                className="selected-table-panel"
+              >
+                {loading && (
+                  <div className="selected-table-loading">
+                    <Spin size="small" />
+                    <span>加载结构详情中...</span>
+                  </div>
+                )}
 
-              {!loading && !details && (
-                <div className="selected-table-metadata">
-                  <p>详情暂不可用，可点击右上角刷新重试。</p>
-                </div>
-              )}
+                {!loading && !details && (
+                  <div className="selected-table-metadata">
+                    <p>详情暂不可用，可点击右上角刷新重试。</p>
+                  </div>
+                )}
 
-              {!loading && details && (
-                <div className="selected-table-metadata">
-                  <p>
-                    列数: <span>{details.columns.length}</span>
-                  </p>
-                  <p>
-                    主键列: <span>{details.primary_keys.length}</span>
-                  </p>
-                  <p>
-                    索引数: <span>{details.indexes.length}</span>
-                  </p>
-                  <p>
-                    外键数: <span>{details.foreign_keys.length}</span>
-                  </p>
-                </div>
-              )}
-            </Panel>
-          );
-        })}
-      </Collapse>
+                {!loading && details && (
+                  <div className="selected-table-metadata">
+                    <p>
+                      列数: <span>{details.columns.length}</span>
+                    </p>
+                    <p>
+                      主键列: <span>{details.primary_keys.length}</span>
+                    </p>
+                    <p>
+                      索引数: <span>{details.indexes.length}</span>
+                    </p>
+                    <p>
+                      外键数: <span>{details.foreign_keys.length}</span>
+                    </p>
+                  </div>
+                )}
+              </Panel>
+            );
+          })}
+        </Collapse>
+      </div>
     </TechCard>
   );
 }

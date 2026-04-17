@@ -3,6 +3,7 @@
 mod driver;
 
 use driver::{discover_and_apply, DriverSetup, DriverSource};
+use std::path::PathBuf;
 use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
@@ -53,11 +54,48 @@ fn driver_info(state: State<'_, AppState>) -> DriverInfo {
     }
 }
 
+#[tauri::command]
+async fn choose_export_directory(
+    app: tauri::AppHandle,
+    initial_directory: Option<String>,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut dialog = app.dialog().file().set_title("选择导出目录");
+
+        if let Some(directory) = initial_directory
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let path = PathBuf::from(directory);
+            if path.exists() {
+                dialog = dialog.set_directory(path);
+            }
+        }
+
+        dialog
+            .blocking_pick_folder()
+            .map(|folder| {
+                folder
+                    .into_path()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .map_err(|err| err.to_string())
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![backend_base_url, driver_info])
+        .invoke_handler(tauri::generate_handler![
+            backend_base_url,
+            driver_info,
+            choose_export_directory
+        ])
         .setup(|app| {
             let resolved = match discover_and_apply(app.handle()) {
                 Ok(setup) => setup,

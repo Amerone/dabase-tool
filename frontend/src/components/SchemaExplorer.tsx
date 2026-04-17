@@ -123,22 +123,30 @@ export default function SchemaExplorer() {
         title: '表名',
         dataIndex: 'name',
         key: 'name',
-        width: '38%',
+        width: 230,
         sorter: (a, b) => a.name.localeCompare(b.name),
-        render: (text: string) => <span className="schema-table-name">{text}</span>,
+        render: (text: string) => (
+          <span className="schema-table-name" title={text}>
+            {text}
+          </span>
+        ),
       },
       {
         title: '注释',
         dataIndex: 'comment',
         key: 'comment',
-        ellipsis: true,
-        render: (text?: string) => <span className="schema-table-comment">{text || '-'}</span>,
+        width: 280,
+        render: (text?: string) => (
+          <span className="schema-table-comment" title={text || '-'}>
+            {text || '-'}
+          </span>
+        ),
       },
       {
         title: '估算行数',
         dataIndex: 'row_count',
         key: 'row_count',
-        width: 140,
+        width: 110,
         align: 'right',
         render: (count?: number) => (
           <Tag className="schema-table-count">{(count ?? 0).toLocaleString()}</Tag>
@@ -222,12 +230,14 @@ export default function SchemaExplorer() {
       </Space>
 
       <Table<TableType>
+        className="schema-table"
         rowKey="name"
         columns={columns}
         dataSource={filteredTables}
         loading={loading}
-        virtual
+        tableLayout="fixed"
         rowSelection={{
+          columnWidth: 48,
           selectedRowKeys: selectedTables,
           onChange: handleSelectionChange,
           preserveSelectedRowKeys: true,
@@ -240,7 +250,7 @@ export default function SchemaExplorer() {
           onChange: (current, pageSize) => setPagination({ current, pageSize }),
           showTotal: (total) => `共 ${total} 条`,
         }}
-        scroll={{ y: 460 }}
+        scroll={{ x: 680, y: 460 }}
         size="middle"
       />
     </TechCard>

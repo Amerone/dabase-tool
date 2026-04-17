@@ -1,12 +1,19 @@
 import { chromium } from 'playwright';
 
-const BASE = 'http://localhost:5173';
+const BASE = process.env.E2E_BASE_URL ?? 'http://localhost:5173';
+const password = process.env.SHENTONG_PASSWORD ?? process.env.SHENTONG_DIAG_PASSWORD;
+
+if (!password) {
+  console.error('Set SHENTONG_PASSWORD or SHENTONG_DIAG_PASSWORD before running this E2E test');
+  process.exit(2);
+}
+
 const SHENTONG_CONFIG = {
-  host: '192.168.3.34',
-  port: '2003',
-  username: 'SYSDBA',
-  password: 'szoscar55',
-  schema: 'SYSDBA',
+  host: process.env.SHENTONG_HOST ?? '127.0.0.1',
+  port: process.env.SHENTONG_PORT ?? '2003',
+  username: process.env.SHENTONG_USER ?? 'SYSDBA',
+  password,
+  schema: process.env.SHENTONG_SCHEMA ?? process.env.SHENTONG_USER ?? 'SYSDBA',
 };
 
 async function sleep(ms) {

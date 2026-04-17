@@ -1,9 +1,12 @@
-/// ACI reuse-variable test: use SAME stack variable for both attempts
-/// In test_aci_ffi for loop, env_h/err_h/svc_h/srv_h are at the SAME stack
-/// addresses across iterations. Test if reusing same variables is the key.
+// ACI reuse-variable test: use SAME stack variable for both attempts
+// In test_aci_ffi for loop, env_h/err_h/svc_h/srv_h are at the SAME stack
+// addresses across iterations. Test if reusing same variables is the key.
 
 #[cfg(windows)]
 use std::ffi::{c_void, CString};
+
+#[path = "shentong_diag_env.rs"]
+mod shentong_diag_env;
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -113,9 +116,9 @@ fn run(aci_dir: Option<String>) {
     // === Test: REUSE same stack variables for both attempts ===
     // Declare handles ONCE, outside the per-attempt blocks
     let mut env_h: *mut c_void = std::ptr::null_mut();
-    let mut err_h: *mut c_void = std::ptr::null_mut();
-    let mut svc_h: *mut c_void = std::ptr::null_mut();
-    let mut srv_h: *mut c_void = std::ptr::null_mut();
+    let mut err_h: *mut c_void;
+    let mut svc_h: *mut c_void;
+    let mut srv_h: *mut c_void;
 
     println!(
         "\n--- Attempt 1: localhost (prime) using env_h@{:p} ---",
@@ -155,8 +158,10 @@ fn run(aci_dir: Option<String>) {
         }
     }
 
+    let configured_connect = shentong_diag_env::default_connect();
+
     println!(
-        "\n--- Attempt 2: 192.168.3.34 REUSING same env_h@{:p} ---",
+        "\n--- Attempt 2: configured target REUSING same env_h@{:p} ---",
         &env_h
     );
     // OVERWRITE env_h with new value — same STACK ADDRESS, new ACI handle
@@ -185,17 +190,19 @@ fn run(aci_dir: Option<String>) {
             alloc(env_h, &mut svc_h, 3, 0, std::ptr::null_mut());
             alloc(env_h, &mut srv_h, 8, 0, std::ptr::null_mut());
         }
-        let cs = b"192.168.3.34:2003/osrdb";
+        let cs = configured_connect.as_bytes();
         let rc2 = unsafe { attach(srv_h, err_h, cs.as_ptr(), cs.len() as i32, 0) };
-        println!("  192.168.3.34 attach: rc={}", rc2);
+        println!("  configured target attach: rc={}", rc2);
         if rc2 == 0 {
             println!("  SAME-VARIABLE REUSE: SUCCESS!");
             let mut ses_h: *mut c_void = std::ptr::null_mut();
+            let user = shentong_diag_env::user("sysdba");
+            let password = shentong_diag_env::password();
+            let u = user.as_bytes();
+            let p = password.as_bytes();
             unsafe {
                 attr_set(svc_h, 3, srv_h, 0, 6, err_h);
                 alloc(env_h, &mut ses_h, 9, 0, std::ptr::null_mut());
-                let u = b"sysdba";
-                let p = b"szoscar55";
                 attr_set(
                     ses_h,
                     9,

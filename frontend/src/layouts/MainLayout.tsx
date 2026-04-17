@@ -40,7 +40,6 @@ export default function MainLayout() {
         <Layout className="app-layout">
           <Header className="app-header">
             <div ref={brandRef} className="app-brand">
-              <p className="app-kicker">Database Export Workbench</p>
               <Title level={3} className="app-title">
                 Amarone Data Bridge
               </Title>

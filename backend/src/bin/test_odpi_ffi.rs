@@ -1,15 +1,4 @@
-/// Test ODPI initialization directly via FFI, bypassing the rust-shentong wrapper
-#[cfg(windows)]
-mod win32 {
-    use std::ffi::c_void;
-    #[link(name = "kernel32")]
-    extern "system" {
-        pub fn LoadLibraryW(lp_lib_file_name: *const u16) -> *mut c_void;
-        pub fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const u8) -> *mut c_void;
-        pub fn GetLastError() -> u32;
-    }
-}
-
+// Test ODPI initialization directly via FFI, bypassing the rust-shentong wrapper
 // Raw FFI to ODPI functions (compiled into our binary via libodpic.a)
 extern "C" {
     fn dpiContext_createWithParams(

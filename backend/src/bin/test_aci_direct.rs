@@ -1,5 +1,7 @@
-/// Minimal test: directly load aci.dll from Rust using raw Win32 API
-/// bypassing ODPI entirely, to verify aci.dll works from Rust.
+#![allow(clippy::manual_c_str_literals)]
+
+// Minimal test: directly load aci.dll from Rust using raw Win32 API
+// bypassing ODPI entirely, to verify aci.dll works from Rust.
 #[cfg(windows)]
 mod win32 {
     use std::ffi::c_void;

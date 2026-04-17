@@ -1,8 +1,11 @@
-/// Isolation test: test_aci_clone.rs WITHOUT a for-loop
-/// If this FAILS where test_aci_clone.rs SUCCEEDS, the for-loop itself is the key difference.
+// Isolation test: test_aci_clone.rs WITHOUT a for-loop
+// If this FAILS where test_aci_clone.rs SUCCEEDS, the for-loop itself is the key difference.
 
 #[cfg(windows)]
 use std::ffi::{c_void, CString};
+
+#[path = "shentong_diag_env.rs"]
+mod shentong_diag_env;
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -127,8 +130,8 @@ fn test(aci_dir: Option<String>) {
     };
 
     // === SAME CODE AS test_aci_clone.rs BUT NO for-loop ===
-    // Direct inline block instead of: for connect_str in &["192.168.3.34:2003/osrdb"] { ... }
-    println!("\nTrying: 192.168.3.34:2003/osrdb (INLINE, no loop)");
+    let configured_connect = shentong_diag_env::default_connect();
+    println!("\nTrying configured target (INLINE, no loop)");
     {
         let mut env_h: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {
@@ -166,7 +169,7 @@ fn test(aci_dir: Option<String>) {
             handle_alloc(env_h, &mut srv_h, ACI_HTYPE_SERVER, 0, std::ptr::null_mut());
         }
 
-        let cs_bytes = b"192.168.3.34:2003/osrdb";
+        let cs_bytes = configured_connect.as_bytes();
         let rc = unsafe {
             server_attach(
                 srv_h,
@@ -198,8 +201,10 @@ fn test(aci_dir: Option<String>) {
             );
         }
 
-        let user = b"sysdba";
-        let pwd = b"szoscar55";
+        let user = shentong_diag_env::user("sysdba");
+        let password = shentong_diag_env::password();
+        let user = user.as_bytes();
+        let pwd = password.as_bytes();
         unsafe {
             attr_set(
                 ses_h,

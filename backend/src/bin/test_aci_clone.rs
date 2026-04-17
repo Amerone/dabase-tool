@@ -1,8 +1,11 @@
-/// ACI clone test: exact copy of test_aci_ffi loop, but WITHOUT the path setup
-/// to isolate if path/env matters vs code structure
+// ACI clone test: exact copy of test_aci_ffi loop, but WITHOUT the path setup
+// to isolate if path/env matters vs code structure
 
 #[cfg(windows)]
 use std::ffi::{c_void, CString};
+
+#[path = "shentong_diag_env.rs"]
+mod shentong_diag_env;
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -128,11 +131,12 @@ fn test(aci_dir: Option<String>) {
 
     // EXACT SAME LOOP as test_aci_ffi.rs
     // Change slice to test different combinations:
-    // ["localhost:2003/osrdb", "192.168.3.34:2003/osrdb"] → known to work
-    // ["192.168.3.34:2003/osrdb"] → does for loop alone help?
-    // ["localhost:2003/osrdb", "192.168.3.34:2003/osrdb", "192.168.3.34:2003/osrdb"] → 3 attempts
-    println!("Testing with only 192.168.3.34 in the for loop...");
-    for connect_str in &["192.168.3.34:2003/osrdb"] {
+    // ["localhost:2003/osrdb", "127.0.0.1:2003/osrdb"] → known to work
+    // ["127.0.0.1:2003/osrdb"] → does for loop alone help?
+    // ["localhost:2003/osrdb", "127.0.0.1:2003/osrdb", "127.0.0.1:2003/osrdb"] → 3 attempts
+    let configured_connect = shentong_diag_env::default_connect();
+    println!("Testing with only the configured target in the for loop...");
+    for connect_str in &[configured_connect.as_str()] {
         println!("\nTrying: {}", connect_str);
 
         let mut env_h: *mut c_void = std::ptr::null_mut();
@@ -202,8 +206,10 @@ fn test(aci_dir: Option<String>) {
             );
         }
 
-        let user = b"sysdba";
-        let pwd = b"szoscar55";
+        let user = shentong_diag_env::user("sysdba");
+        let password = shentong_diag_env::password();
+        let user = user.as_bytes();
+        let pwd = password.as_bytes();
         unsafe {
             attr_set(
                 ses_h,

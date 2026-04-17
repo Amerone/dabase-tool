@@ -152,6 +152,8 @@ pub struct ExportRequest {
     pub config: ConnectionConfig,
     pub target_dialect: Option<DbType>,
     pub export_schema: Option<String>,
+    #[serde(default)]
+    pub export_directory: Option<String>,
     pub export_compat: Option<String>,
     pub tables: Vec<TableIdentifier>,
     pub include_ddl: bool,

@@ -8,11 +8,15 @@
 //!
 //! MySQL / KingBase / 神通：对应 HOST 未设置时自动跳过。
 
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
-use axum::extract::Json;
+use axum::extract::{Json, State};
 use dm8_export_backend::{
-    api::export::{export_data, export_ddl},
+    api::{
+        export::{export_data, export_ddl},
+        AppState,
+    },
+    config_store::ConfigStore,
     db::service,
     models::{ConnectionConfig, DbType, ExportRequest, TableIdentifier},
 };
@@ -143,6 +147,7 @@ fn base_export_req(config: ConnectionConfig) -> ExportRequest {
         export_schema: Some(config.schema.clone()),
         config,
         target_dialect: None,
+        export_directory: None,
         export_compat: Some("script".into()),
         tables: vec![],
         include_ddl: true,
@@ -153,6 +158,17 @@ fn base_export_req(config: ConnectionConfig) -> ExportRequest {
         strict_mode: false,
         identifier_case: None,
     }
+}
+
+fn test_state() -> (AppState, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = ConfigStore::new_with_path(dir.path().join("config.db")).unwrap();
+    (
+        AppState {
+            config_store: Arc::new(store),
+        },
+        dir,
+    )
 }
 
 /// Convert a list of table name strings into `TableIdentifier` with the given schema.
@@ -243,7 +259,8 @@ async fn dm8_05_export_ddl_self() {
     req.target_dialect = Some(DbType::Dm8);
     req.tables = table_ids(&cfg.schema, names);
 
-    let result = export_ddl(Json(req)).await;
+    let (state, _dir) = test_state();
+    let result = export_ddl(State(state), Json(req)).await;
     match &result {
         Ok(r) => println!("[DM8→DM8] DDL 导出 ✓  file={}", file_path_from_ok(r)),
         Err(e) => println!("[DM8→DM8] DDL 导出失败 status={:?} msg={:?}", e.0, e.1),
@@ -267,7 +284,8 @@ async fn dm8_06_export_data_self() {
     req.include_data = true;
     req.include_row_counts = true;
 
-    let result = export_data(Json(req)).await;
+    let (state, _dir) = test_state();
+    let result = export_data(State(state), Json(req)).await;
     match &result {
         Ok(r) => println!("[DM8→DM8] 数据导出 ✓  file={}", file_path_from_ok(r)),
         Err(e) => println!("[DM8→DM8] 数据导出失败 status={:?}", e.0),
@@ -289,7 +307,8 @@ async fn dm8_07_export_ddl_to_mysql() {
     req.export_compat = None;
     req.tables = table_ids(&cfg.schema, names);
 
-    let result = export_ddl(Json(req)).await;
+    let (state, _dir) = test_state();
+    let result = export_ddl(State(state), Json(req)).await;
     match &result {
         Ok(r) => println!("[DM8→MySQL] DDL 导出 ✓  file={}", file_path_from_ok(r)),
         Err(e) => println!("[DM8→MySQL] DDL 导出失败 status={:?}", e.0),
@@ -310,7 +329,8 @@ async fn dm8_08_export_ddl_to_kingbase() {
     req.target_dialect = Some(DbType::Kingbase);
     req.tables = table_ids(&cfg.schema, names);
 
-    let result = export_ddl(Json(req)).await;
+    let (state, _dir) = test_state();
+    let result = export_ddl(State(state), Json(req)).await;
     match &result {
         Ok(r) => println!("[DM8→KingBase] DDL 导出 ✓  file={}", file_path_from_ok(r)),
         Err(e) => println!("[DM8→KingBase] DDL 导出失败 status={:?}", e.0),
@@ -416,7 +436,8 @@ async fn mysql_05_export_ddl_self() {
     req.export_compat = None;
     req.tables = table_ids(&cfg.schema, names);
 
-    let result = export_ddl(Json(req)).await;
+    let (state, _dir) = test_state();
+    let result = export_ddl(State(state), Json(req)).await;
     match &result {
         Ok(r) => println!("[MySQL→MySQL] DDL 导出 ✓  file={}", file_path_from_ok(r)),
         Err(e) => println!("[MySQL→MySQL] DDL 导出失败 status={:?}", e.0),
@@ -443,7 +464,8 @@ async fn mysql_06_export_ddl_to_dm8() {
     req.target_dialect = Some(DbType::Dm8);
     req.tables = table_ids(&cfg.schema, names);
 
-    let result = export_ddl(Json(req)).await;
+    let (state, _dir) = test_state();
+    let result = export_ddl(State(state), Json(req)).await;
     match &result {
         Ok(r) => println!("[MySQL→DM8] DDL 导出 ✓  file={}", file_path_from_ok(r)),
         Err(e) => println!("[MySQL→DM8] DDL 导出失败 status={:?}", e.0),
@@ -528,7 +550,8 @@ async fn kingbase_04_export_ddl_self() {
     req.target_dialect = Some(DbType::Kingbase);
     req.tables = table_ids(&cfg.schema, names);
 
-    let result = export_ddl(Json(req)).await;
+    let (state, _dir) = test_state();
+    let result = export_ddl(State(state), Json(req)).await;
     match &result {
         Ok(r) => println!(
             "[KingBase→KingBase] DDL 导出 ✓  file={}",
@@ -559,7 +582,8 @@ async fn kingbase_05_export_ddl_to_mysql() {
     req.export_compat = None;
     req.tables = table_ids(&cfg.schema, names);
 
-    let result = export_ddl(Json(req)).await;
+    let (state, _dir) = test_state();
+    let result = export_ddl(State(state), Json(req)).await;
     match &result {
         Ok(r) => println!("[KingBase→MySQL] DDL 导出 ✓  file={}", file_path_from_ok(r)),
         Err(e) => println!("[KingBase→MySQL] DDL 导出失败 status={:?}", e.0),
