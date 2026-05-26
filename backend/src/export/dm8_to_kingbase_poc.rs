@@ -172,13 +172,9 @@ fn format_kingbase_column_def(column: &Column) -> String {
         .map(str::trim)
         .filter(|d| !d.is_empty())
     {
-        // Map common DM8-specific defaults to KingBase equivalents
-        let pg_default = match default.to_uppercase().as_str() {
-            "SYSDATE" => "CURRENT_TIMESTAMP".to_string(),
-            "SYSTIMESTAMP" => "CURRENT_TIMESTAMP".to_string(),
-            _ => default.to_string(),
-        };
-        parts.push(format!("DEFAULT {}", pg_default));
+        if let Some(pg_default) = sanitize_kingbase_default(default, &kb_type) {
+            parts.push(format!("DEFAULT {}", pg_default));
+        }
     }
 
     let nullability = if column.nullable { "NULL" } else { "NOT NULL" };
@@ -501,4 +497,104 @@ fn quote_qualified_identifier(name: &str) -> String {
         .map(quote_identifier)
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// Map a DM8 / MySQL-style column default expression to a KingBase-safe expression.
+///
+/// Returns `None` when the default cannot be represented safely on KingBase
+/// and should be dropped (KingBase column defaults must match the column type;
+/// e.g. `TIMESTAMP DEFAULT 0` from MySQL is rejected as `integer != timestamp`).
+///
+/// Handled cases:
+/// - `SYSDATE` / `SYSTIMESTAMP` → `CURRENT_TIMESTAMP`
+/// - `CURRENT_TIMESTAMP()` (MySQL empty parens) → `CURRENT_TIMESTAMP`
+/// - Bare `0` on a date/time-mapped column → drop (caller emits no DEFAULT)
+fn sanitize_kingbase_default(raw: &str, kb_type: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    let kb_upper = kb_type.trim().to_ascii_uppercase();
+    let is_temporal = kb_upper.starts_with("TIMESTAMP")
+        || kb_upper.starts_with("DATE")
+        || kb_upper.starts_with("TIME");
+
+    // MySQL "zero timestamp" placeholder — KingBase rejects integer-typed default
+    // on temporal columns. Drop so the column simply has no DEFAULT.
+    if is_temporal && (trimmed == "0" || trimmed == "'0'" || upper == "'0000-00-00 00:00:00'"
+        || upper == "'0000-00-00'")
+    {
+        return None;
+    }
+
+    // Strip MySQL-style empty parentheses on CURRENT_TIMESTAMP keyword.
+    // Preserve precision form `CURRENT_TIMESTAMP(n)` unchanged.
+    if upper == "CURRENT_TIMESTAMP()" || upper.replace(' ', "") == "CURRENT_TIMESTAMP()" {
+        return Some("CURRENT_TIMESTAMP".to_string());
+    }
+
+    let mapped = match upper.as_str() {
+        "SYSDATE" | "SYSTIMESTAMP" => "CURRENT_TIMESTAMP".to_string(),
+        _ => trimmed.to_string(),
+    };
+    Some(mapped)
+}
+
+#[cfg(test)]
+mod default_sanitize_tests {
+    use super::sanitize_kingbase_default;
+
+    #[test]
+    fn drops_zero_default_on_timestamp_column() {
+        assert_eq!(sanitize_kingbase_default("0", "TIMESTAMP"), None);
+        assert_eq!(sanitize_kingbase_default("0", "TIMESTAMP(0)"), None);
+        assert_eq!(sanitize_kingbase_default("0", "DATE"), None);
+        assert_eq!(
+            sanitize_kingbase_default("'0000-00-00 00:00:00'", "TIMESTAMP"),
+            None
+        );
+        assert_eq!(sanitize_kingbase_default("'0000-00-00'", "DATE"), None);
+    }
+
+    #[test]
+    fn keeps_zero_default_on_numeric_column() {
+        assert_eq!(
+            sanitize_kingbase_default("0", "INTEGER"),
+            Some("0".to_string())
+        );
+        assert_eq!(
+            sanitize_kingbase_default("0", "SMALLINT"),
+            Some("0".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_empty_parens_from_current_timestamp() {
+        assert_eq!(
+            sanitize_kingbase_default("CURRENT_TIMESTAMP()", "TIMESTAMP"),
+            Some("CURRENT_TIMESTAMP".to_string())
+        );
+        assert_eq!(
+            sanitize_kingbase_default("current_timestamp ( )", "TIMESTAMP"),
+            Some("CURRENT_TIMESTAMP".to_string())
+        );
+    }
+
+    #[test]
+    fn keeps_current_timestamp_with_precision() {
+        assert_eq!(
+            sanitize_kingbase_default("CURRENT_TIMESTAMP(6)", "TIMESTAMP"),
+            Some("CURRENT_TIMESTAMP(6)".to_string())
+        );
+    }
+
+    #[test]
+    fn maps_oracle_sysdate_keywords() {
+        assert_eq!(
+            sanitize_kingbase_default("SYSDATE", "TIMESTAMP"),
+            Some("CURRENT_TIMESTAMP".to_string())
+        );
+        assert_eq!(
+            sanitize_kingbase_default("SYSTIMESTAMP", "TIMESTAMP"),
+            Some("CURRENT_TIMESTAMP".to_string())
+        );
+    }
 }

@@ -290,7 +290,7 @@ impl DialectRenderer for KingbaseDialectRenderer {
         if kingbase_requires_single_row_insert(table) {
             let statements = rows
                 .iter()
-                .map(|row| render_kingbase_single_row_insert(&target_ident, &columns, row))
+                .map(|row| render_kingbase_single_row_insert(&target_ident, &columns, table, row))
                 .collect::<Vec<_>>();
             return Ok(statements.join("\n"));
         }
@@ -301,7 +301,10 @@ impl DialectRenderer for KingbaseDialectRenderer {
                 let literals = row
                     .values
                     .iter()
-                    .map(kingbase_format_value)
+                    .enumerate()
+                    .map(|(idx, v)| {
+                        kingbase_format_value_for_column(v, kingbase_column_logical_type(table, idx))
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({})", literals)
@@ -343,7 +346,7 @@ impl DialectRenderer for KingbaseDialectRenderer {
             writeln!(
                 writer,
                 "{}",
-                render_kingbase_single_row_insert(&target_ident, &columns, row)
+                render_kingbase_single_row_insert(&target_ident, &columns, table, row)
             )?;
         }
 
@@ -368,7 +371,13 @@ impl DialectRenderer for KingbaseDialectRenderer {
             .map(|col| kingbase_quote_ident(&col.name))
             .collect::<Vec<_>>()
             .join(", ");
-        let formatted_values = values.iter().map(kingbase_format_value).collect::<Vec<_>>();
+        let formatted_values = values
+            .iter()
+            .enumerate()
+            .map(|(idx, v)| {
+                kingbase_format_value_for_column(v, kingbase_column_logical_type(table, idx))
+            })
+            .collect::<Vec<_>>();
         let where_predicate = kingbase_primary_key_predicate(table, values);
 
         write_kingbase_lob_insert_block(
@@ -549,12 +558,14 @@ impl DialectRenderer for ShentongDialectRenderer {
             .collect::<Vec<_>>()
             .join(", ");
         let formatted_values: Vec<String> = values.iter().map(shentong_format_value).collect();
+        let where_predicate = shentong_primary_key_predicate(table, values);
         write_shentong_lob_insert_block(
             writer,
             &target_ident,
             &columns_str,
             &formatted_values,
             large_blobs,
+            where_predicate.as_deref(),
         )
     }
 }
@@ -630,6 +641,34 @@ pub const SHENTONG_INLINE_BLOB_MAX_BYTES: usize = 16383;
 /// Each chunk should stay within SQL parser limits for HEXTORAW().
 const SHENTONG_LOB_CHUNK_BYTES: usize = 16000;
 
+fn shentong_primary_key_predicate(
+    table: &CanonicalTable,
+    values: &[CanonicalValue],
+) -> Option<String> {
+    if table.primary_keys.is_empty() {
+        return None;
+    }
+
+    let mut predicates = Vec::with_capacity(table.primary_keys.len());
+    for pk in &table.primary_keys {
+        let column_index = table
+            .columns
+            .iter()
+            .position(|col| col.name.eq_ignore_ascii_case(pk))?;
+        let value = values.get(column_index)?;
+        if matches!(value, CanonicalValue::Null) {
+            return None;
+        }
+        predicates.push(format!(
+            "{} = {}",
+            shentong_quote_ident(pk),
+            shentong_format_value(value)
+        ));
+    }
+
+    Some(predicates.join(" AND "))
+}
+
 /// Write INSERT + UPDATE statements for a row with large BLOB values in ShenTong OSCAR.
 ///
 /// Strategy: INSERT the row with the first chunk of each BLOB inline, then append
@@ -648,6 +687,7 @@ pub fn write_shentong_lob_insert_block(
     columns_str: &str,
     column_values: &[String],
     large_blobs: &[(usize, Vec<u8>)],
+    where_predicate: Option<&str>,
 ) -> Result<()> {
     let col_names: Vec<&str> = columns_str.split(", ").collect();
 
@@ -667,21 +707,32 @@ pub fn write_shentong_lob_insert_block(
     )?;
 
     // Step 2: For each large BLOB with remaining data, append chunks via UPDATE.
-    // Use the first column (assumed PK/unique) as WHERE condition.
-    let pk_col = col_names.first().unwrap_or(&"\"id\"");
-    let pk_val = &column_values[0];
+    let has_remaining_chunks = large_blobs
+        .iter()
+        .any(|(_, bytes)| bytes.len() > SHENTONG_LOB_CHUNK_BYTES);
+    let where_predicate = if has_remaining_chunks {
+        Some(where_predicate.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Shentong large BLOB export requires a non-null primary key on table {}",
+                target_table_ident
+            )
+        })?)
+    } else {
+        None
+    };
 
     for (col_idx, bytes) in large_blobs.iter() {
         if bytes.len() <= SHENTONG_LOB_CHUNK_BYTES {
             continue; // fully inserted in step 1
         }
         let blob_col = col_names.get(*col_idx).unwrap_or(&"\"data\"");
+        let where_predicate = where_predicate.expect("checked when remaining chunks exist");
         for chunk in bytes[SHENTONG_LOB_CHUNK_BYTES..].chunks(SHENTONG_LOB_CHUNK_BYTES) {
             let hex = bytes_to_hex_upper(chunk);
             writeln!(
                 writer,
-                "UPDATE {} SET {} = {} || TO_BLOB(HEXTORAW('{}')) WHERE {} = {};",
-                target_table_ident, blob_col, blob_col, hex, pk_col, pk_val
+                "UPDATE {} SET {} = {} || TO_BLOB(HEXTORAW('{}')) WHERE {};",
+                target_table_ident, blob_col, blob_col, hex, where_predicate
             )?;
         }
     }
@@ -724,18 +775,48 @@ fn kingbase_requires_single_row_insert(table: &CanonicalTable) -> bool {
 fn render_kingbase_single_row_insert(
     target_table_ident: &str,
     columns: &str,
+    table: &CanonicalTable,
     row: &CanonicalRow,
 ) -> String {
     let literals = row
         .values
         .iter()
-        .map(kingbase_format_value)
+        .enumerate()
+        .map(|(idx, v)| {
+            kingbase_format_value_for_column(v, kingbase_column_logical_type(table, idx))
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!(
         "INSERT INTO {} ({}) VALUES ({});",
         target_table_ident, columns, literals
     )
+}
+
+fn kingbase_column_logical_type(table: &CanonicalTable, idx: usize) -> Option<&LogicalType> {
+    table.columns.get(idx).map(|col| &col.logical_type)
+}
+
+/// Format a value for KingBase, taking the target column's logical type into account.
+///
+/// The only context-sensitive case is `Boolean`: when the target column is itself
+/// a Boolean we emit `TRUE`/`FALSE`, but when it is a numeric type (the typical
+/// DM8→KingBase mapping for `BIT` is `SMALLINT`) we emit `1`/`0` so KingBase's
+/// strict type system does not reject the literal.
+fn kingbase_format_value_for_column(
+    value: &CanonicalValue,
+    target_type: Option<&LogicalType>,
+) -> String {
+    if let CanonicalValue::Boolean(b) = value {
+        let want_numeric = matches!(
+            target_type,
+            Some(LogicalType::Integer) | Some(LogicalType::Decimal) | Some(LogicalType::Float)
+        );
+        if want_numeric {
+            return if *b { "1".to_string() } else { "0".to_string() };
+        }
+    }
+    kingbase_format_value(value)
 }
 
 fn kingbase_format_value(value: &CanonicalValue) -> String {
@@ -788,7 +869,7 @@ fn kingbase_primary_key_predicate(
         predicates.push(format!(
             "{} = {}",
             kingbase_quote_ident(pk),
-            kingbase_format_value(value)
+            kingbase_format_value_for_column(value, Some(&table.columns[column_index].logical_type))
         ));
     }
 
@@ -1002,6 +1083,68 @@ mod tests {
     }
 
     #[test]
+    fn kingbase_boolean_renders_numeric_for_integer_column() {
+        let renderer = KingbaseDialectRenderer;
+        let table = CanonicalTable {
+            name: "t".to_string(),
+            columns: vec![
+                CanonicalColumn {
+                    name: "id".to_string(),
+                    logical_type: LogicalType::Integer,
+                    nullable: false,
+                    identity: false,
+                },
+                // DM8 BIT → KingBase SMALLINT (mapped via dm8_to_kingbase). The
+                // canonical type stays Boolean because the source column was BIT,
+                // but the DDL emitted SMALLINT, so the literal must be 0/1.
+                CanonicalColumn {
+                    name: "deleted".to_string(),
+                    logical_type: LogicalType::Integer,
+                    nullable: false,
+                    identity: false,
+                },
+            ],
+            primary_keys: vec!["id".to_string()],
+        };
+        let row = CanonicalRow {
+            values: vec![CanonicalValue::Integer(1), CanonicalValue::Boolean(false)],
+        };
+
+        let sql = renderer.render_insert_batch(&table, &[row]).unwrap();
+        assert!(sql.contains(", 0)"), "expected boolean→0, got: {}", sql);
+        assert!(!sql.contains("FALSE"), "must not emit FALSE literal: {}", sql);
+    }
+
+    #[test]
+    fn kingbase_boolean_keeps_true_false_for_boolean_column() {
+        let renderer = KingbaseDialectRenderer;
+        let table = CanonicalTable {
+            name: "t".to_string(),
+            columns: vec![
+                CanonicalColumn {
+                    name: "id".to_string(),
+                    logical_type: LogicalType::Integer,
+                    nullable: false,
+                    identity: false,
+                },
+                CanonicalColumn {
+                    name: "active".to_string(),
+                    logical_type: LogicalType::Boolean,
+                    nullable: false,
+                    identity: false,
+                },
+            ],
+            primary_keys: vec!["id".to_string()],
+        };
+        let row = CanonicalRow {
+            values: vec![CanonicalValue::Integer(1), CanonicalValue::Boolean(true)],
+        };
+
+        let sql = renderer.render_insert_batch(&table, &[row]).unwrap();
+        assert!(sql.contains("TRUE"), "expected boolean→TRUE, got: {}", sql);
+    }
+
+    #[test]
     fn kingbase_format_value_binary_uses_decoding() {
         let renderer = KingbaseDialectRenderer;
         let table = CanonicalTable {
@@ -1159,6 +1302,7 @@ mod tests {
             "\"ID\", \"DATA\"",
             &values,
             &large_blobs,
+            None,
         )
         .unwrap();
 
@@ -1200,6 +1344,7 @@ mod tests {
             "\"ID\", \"DATA\"",
             &values,
             &large_blobs,
+            Some("\"ID\" = 'pk1'"),
         )
         .unwrap();
 
@@ -1215,6 +1360,25 @@ mod tests {
         );
         assert!(rendered.contains("SET \"DATA\" = \"DATA\" || TO_BLOB(HEXTORAW('"));
         assert!(rendered.contains("WHERE \"ID\" = 'pk1'"));
+    }
+
+    #[test]
+    fn shentong_lob_insert_large_blob_requires_primary_key_predicate() {
+        let mut buf = Vec::new();
+        let values = vec!["'pk1'".to_string(), "NULL".to_string()];
+        let large_blobs = vec![(1usize, vec![0xAB; 40000])];
+
+        let err = write_shentong_lob_insert_block(
+            &mut buf,
+            "\"S\".\"T\"",
+            "\"ID\", \"DATA\"",
+            &values,
+            &large_blobs,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("requires a non-null primary key"));
     }
 
     #[test]
