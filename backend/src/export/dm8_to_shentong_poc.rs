@@ -285,8 +285,9 @@ fn format_shentong_column_def(column: &Column, force_indexable: bool) -> String 
         .map(str::trim)
         .filter(|d| !d.is_empty())
     {
-        let converted = convert_default_for_shentong(default, &st_type);
-        parts.push(format!("DEFAULT {}", converted));
+        if let Some(converted) = convert_default_for_shentong(default, &st_type) {
+            parts.push(format!("DEFAULT {}", converted));
+        }
     }
 
     let nullability = if column.nullable { "NULL" } else { "NOT NULL" };
@@ -297,45 +298,63 @@ fn format_shentong_column_def(column: &Column, force_indexable: bool) -> String 
 
 /// Convert a DM8 DEFAULT value expression to Shentong-compatible syntax.
 ///
+/// Returns `Some(expr)` to emit `DEFAULT expr`, or `None` to drop the DEFAULT
+/// clause entirely (used when the source default cannot be represented safely
+/// on the target — e.g. MySQL-leaked `0` zero-timestamp on a `TIMESTAMP` column).
+///
 /// Key differences:
 /// - BOOLEAN columns (from DM8 BIT): `DEFAULT 0` → `DEFAULT FALSE`, `DEFAULT 1` → `DEFAULT TRUE`
-/// - `CURRENT_TIMESTAMP()` → `CURRENT_TIMESTAMP` (Shentong rejects parentheses)
+/// - `CURRENT_TIMESTAMP()` / `CURRENT_TIMESTAMP ( )` → `CURRENT_TIMESTAMP` (Shentong rejects empty parens)
 /// - `SYSTIMESTAMP` → `CURRENT_TIMESTAMP` (not supported in Shentong)
-/// - `CURRENT_DATE()` → `CURRENT_DATE`
-/// - `CURRENT_TIME()` → `CURRENT_TIME`
-fn convert_default_for_shentong(default: &str, shentong_type: &str) -> String {
+/// - Bare `0` or `'0000-00-00 ...'` on a temporal column → drop (Oracle-compat strict typing)
+fn convert_default_for_shentong(default: &str, shentong_type: &str) -> Option<String> {
+    let trimmed = default.trim();
+    let upper = trimmed.to_uppercase();
+    let st_upper = shentong_type.trim().to_uppercase();
+
     // DM8 BIT → Shentong BOOLEAN: convert integer defaults to boolean literals
-    if shentong_type.to_uppercase() == "BOOLEAN" {
-        return match default {
+    if st_upper == "BOOLEAN" {
+        return Some(match trimmed {
             "0" => "FALSE".to_string(),
             "1" => "TRUE".to_string(),
-            _ => default.to_string(),
-        };
+            _ => trimmed.to_string(),
+        });
     }
 
-    let upper = default.trim().to_uppercase();
+    // Drop integer/zero-date placeholders on temporal columns. Shentong (OSCAR)
+    // is strict-typed like Oracle; `DEFAULT 0` on a TIMESTAMP would error out.
+    let is_temporal = st_upper.starts_with("TIMESTAMP")
+        || st_upper.starts_with("DATE")
+        || st_upper.starts_with("TIME");
+    if is_temporal
+        && (trimmed == "0"
+            || trimmed == "'0'"
+            || upper == "'0000-00-00 00:00:00'"
+            || upper == "'0000-00-00'")
+    {
+        return None;
+    }
 
     // SYSTIMESTAMP → CURRENT_TIMESTAMP (Shentong does not support SYSTIMESTAMP)
     if upper == "SYSTIMESTAMP" || upper == "SYSTIMESTAMP()" {
-        return "CURRENT_TIMESTAMP".to_string();
+        return Some("CURRENT_TIMESTAMP".to_string());
     }
 
-    // CURRENT_TIMESTAMP() → CURRENT_TIMESTAMP (strip empty parentheses)
-    if upper == "CURRENT_TIMESTAMP()" {
-        return "CURRENT_TIMESTAMP".to_string();
+    // CURRENT_TIMESTAMP() / CURRENT_TIMESTAMP ( ) → CURRENT_TIMESTAMP
+    // (preserve precision form like CURRENT_TIMESTAMP(6))
+    if upper.replace(' ', "") == "CURRENT_TIMESTAMP()" {
+        return Some("CURRENT_TIMESTAMP".to_string());
     }
 
-    // CURRENT_DATE() → CURRENT_DATE
-    if upper == "CURRENT_DATE()" {
-        return "CURRENT_DATE".to_string();
+    // CURRENT_DATE() / CURRENT_TIME() → drop empty parens
+    if upper.replace(' ', "") == "CURRENT_DATE()" {
+        return Some("CURRENT_DATE".to_string());
+    }
+    if upper.replace(' ', "") == "CURRENT_TIME()" {
+        return Some("CURRENT_TIME".to_string());
     }
 
-    // CURRENT_TIME() → CURRENT_TIME
-    if upper == "CURRENT_TIME()" {
-        return "CURRENT_TIME".to_string();
-    }
-
-    default.to_string()
+    Some(trimmed.to_string())
 }
 
 /// Generate a Shentong-compatible CREATE TABLE statement with COMMENTs.
@@ -902,7 +921,7 @@ fn quote_qualified_identifier(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapt_trigger_for_shentong, convert_sequence_refs_to_shentong,
+        adapt_trigger_for_shentong, convert_default_for_shentong, convert_sequence_refs_to_shentong,
         generate_shentong_create_table,
     };
     use crate::models::{
@@ -1052,6 +1071,59 @@ mod tests {
             "REFERENCING clause should be removed"
         );
         assert!(result.contains(":NEW.ID"), "body :NEW should be preserved");
+    }
+
+    #[test]
+    fn convert_default_drops_zero_on_temporal_column() {
+        assert_eq!(convert_default_for_shentong("0", "TIMESTAMP"), None);
+        assert_eq!(convert_default_for_shentong("0", "TIMESTAMP(6)"), None);
+        assert_eq!(convert_default_for_shentong("0", "DATE"), None);
+        assert_eq!(
+            convert_default_for_shentong("'0000-00-00 00:00:00'", "TIMESTAMP"),
+            None
+        );
+        assert_eq!(convert_default_for_shentong("'0000-00-00'", "DATE"), None);
+    }
+
+    #[test]
+    fn convert_default_keeps_zero_on_numeric_column() {
+        assert_eq!(
+            convert_default_for_shentong("0", "NUMBER(10)"),
+            Some("0".to_string())
+        );
+        assert_eq!(
+            convert_default_for_shentong("0", "INTEGER"),
+            Some("0".to_string())
+        );
+    }
+
+    #[test]
+    fn convert_default_normalises_current_timestamp_parens() {
+        assert_eq!(
+            convert_default_for_shentong("CURRENT_TIMESTAMP()", "TIMESTAMP"),
+            Some("CURRENT_TIMESTAMP".to_string())
+        );
+        assert_eq!(
+            convert_default_for_shentong("current_timestamp ( )", "TIMESTAMP"),
+            Some("CURRENT_TIMESTAMP".to_string())
+        );
+        // precision form must be preserved
+        assert_eq!(
+            convert_default_for_shentong("CURRENT_TIMESTAMP(6)", "TIMESTAMP"),
+            Some("CURRENT_TIMESTAMP(6)".to_string())
+        );
+    }
+
+    #[test]
+    fn convert_default_maps_boolean_zero_one() {
+        assert_eq!(
+            convert_default_for_shentong("0", "BOOLEAN"),
+            Some("FALSE".to_string())
+        );
+        assert_eq!(
+            convert_default_for_shentong("1", "BOOLEAN"),
+            Some("TRUE".to_string())
+        );
     }
 
     #[test]
