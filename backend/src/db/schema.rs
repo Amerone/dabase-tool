@@ -574,6 +574,31 @@ mod tests {
     }
 
     #[test]
+    fn remove_complete_selected_table_details_rejects_empty_column_metadata() {
+        let mut map = HashMap::from([(
+            "TEST_ASSOCIATION_20260624135807355".to_string(),
+            TableDetails {
+                name: "TEST_ASSOCIATION_20260624135807355".to_string(),
+                comment: None,
+                columns: vec![],
+                primary_keys: vec![],
+                indexes: vec![],
+                unique_constraints: vec![],
+                foreign_keys: vec![],
+                check_constraints: vec![],
+                triggers: vec![],
+            },
+        )]);
+
+        let details = super::remove_complete_selected_table_details(
+            &mut map,
+            "TEST_ASSOCIATION_20260624135807355",
+        );
+
+        assert!(details.is_none());
+    }
+
+    #[test]
     fn trigger_metadata_missing_detects_missing_trigger_type_column() {
         let err = anyhow::anyhow!(
             "State: 42S22, Native error: -2111, Message: 第1 行附近出现错误: 无效的列名[TRIGGER_TYPE]"
@@ -1334,6 +1359,52 @@ fn remove_selected_table_details(
         .or_else(|| map.remove(&exact_name.to_uppercase()))
 }
 
+fn remove_complete_selected_table_details(
+    map: &mut HashMap<String, TableDetails>,
+    selected_name: &str,
+) -> Option<TableDetails> {
+    remove_selected_table_details(map, selected_name).filter(|details| !details.columns.is_empty())
+}
+
+/**
+* AI generated 2026-06-24 17:54:40
+* Author: 梁国栋
+* Version: v1.0.0
+* Function: Fill gaps left by DM8 batch metadata queries with the existing per-table metadata path so one missed table does not fail a full export.
+* Revision history:
+* - 2026-06-24 17:54:40 v1.0.0 Added single-table metadata fallback for batch query misses, reviewer: 梁国栋
+*/
+fn complete_missing_table_details(
+    connection: &Connection<'_>,
+    schema: &str,
+    table_names: &[String],
+    mut map: HashMap<String, TableDetails>,
+) -> Result<Vec<TableDetails>> {
+    let mut result = Vec::with_capacity(table_names.len());
+
+    for table_name in table_names {
+        if let Some(details) = remove_complete_selected_table_details(&mut map, table_name) {
+            result.push(details);
+            continue;
+        }
+
+        tracing::warn!(
+            schema = schema,
+            table = table_name.as_str(),
+            "Batch DM8 metadata query missed selected table; retrying with single-table metadata query"
+        );
+        let details = get_table_details(connection, schema, table_name).with_context(|| {
+            format!(
+                "Failed to fetch fallback metadata for selected table '{}.{}'",
+                schema, table_name
+            )
+        })?;
+        result.push(details);
+    }
+
+    Ok(result)
+}
+
 /// Fetch full `TableDetails` for multiple tables in one shot.
 ///
 /// Uses `IN (…)` bulk queries instead of a per-table round-trip for each
@@ -2002,11 +2073,5 @@ pub fn get_tables_details_batch(
 
     tracing::info!("get_tables_details_batch: [8/8] triggers done");
 
-    // Return in original order, preserving only tables that exist
-    let result = table_names
-        .iter()
-        .filter_map(|n| remove_selected_table_details(&mut map, n))
-        .filter(|t| !t.columns.is_empty())
-        .collect();
-    Ok(result)
+    complete_missing_table_details(connection, &owner, table_names, map)
 }
