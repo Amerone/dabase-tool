@@ -468,7 +468,9 @@ pub fn fetch_row_count(connection: &Connection<'_>, schema: &str, table: &str) -
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
-    use crate::models::Column;
+    use std::collections::HashMap;
+
+    use crate::models::{Column, TableDetails};
 
     use super::{deduplicate_columns, is_trigger_metadata_missing, trigger_fallback_level};
 
@@ -514,6 +516,61 @@ mod tests {
         assert!(columns[1].identity);
         assert_eq!(columns[1].identity_start, Some(1));
         assert_eq!(columns[1].identity_increment, Some(1));
+    }
+
+    #[test]
+    fn metadata_query_table_names_includes_exact_and_uppercase_names() {
+        let names = super::metadata_query_table_names(&[
+            "business_filling".to_string(),
+            "PLATFORM_USER".to_string(),
+        ]);
+
+        assert_eq!(
+            names,
+            vec![
+                "business_filling".to_string(),
+                "BUSINESS_FILLING".to_string(),
+                "PLATFORM_USER".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_selected_table_details_prefers_exact_case_match() {
+        let mut map = HashMap::from([
+            (
+                "business_filling".to_string(),
+                TableDetails {
+                    name: "business_filling".to_string(),
+                    comment: None,
+                    columns: vec![sample_column("id")],
+                    primary_keys: vec![],
+                    indexes: vec![],
+                    unique_constraints: vec![],
+                    foreign_keys: vec![],
+                    check_constraints: vec![],
+                    triggers: vec![],
+                },
+            ),
+            (
+                "BUSINESS_FILLING".to_string(),
+                TableDetails {
+                    name: "BUSINESS_FILLING".to_string(),
+                    comment: None,
+                    columns: vec![sample_column("ID")],
+                    primary_keys: vec![],
+                    indexes: vec![],
+                    unique_constraints: vec![],
+                    foreign_keys: vec![],
+                    check_constraints: vec![],
+                    triggers: vec![],
+                },
+            ),
+        ]);
+
+        let details = super::remove_selected_table_details(&mut map, "business_filling").unwrap();
+
+        assert_eq!(details.name, "business_filling");
     }
 
     #[test]
@@ -1241,6 +1298,42 @@ fn make_in_clause(names: &[String]) -> String {
         .join(", ")
 }
 
+/**
+* AI generated 2026-06-24 16:57:36
+* Author: 梁国栋
+* Version: v1.0.0
+* Function: Build and consume the DM8 metadata table-name set with both exact and uppercase names so quoted lowercase tables are not lost in batch metadata export.
+* Revision history:
+* - 2026-06-24 16:57:36 v1.0.0 Added exact-name metadata matching for case-sensitive DM8 tables, reviewer: 梁国栋
+*/
+fn metadata_query_table_names(table_names: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut query_names = Vec::with_capacity(table_names.len() * 2);
+
+    for table_name in table_names {
+        let exact_name = table_name.trim();
+        if !exact_name.is_empty() && seen.insert(exact_name.to_string()) {
+            query_names.push(exact_name.to_string());
+        }
+
+        let upper_name = exact_name.to_uppercase();
+        if !upper_name.is_empty() && seen.insert(upper_name.clone()) {
+            query_names.push(upper_name);
+        }
+    }
+
+    query_names
+}
+
+fn remove_selected_table_details(
+    map: &mut HashMap<String, TableDetails>,
+    selected_name: &str,
+) -> Option<TableDetails> {
+    let exact_name = selected_name.trim();
+    map.remove(exact_name)
+        .or_else(|| map.remove(&exact_name.to_uppercase()))
+}
+
 /// Fetch full `TableDetails` for multiple tables in one shot.
 ///
 /// Uses `IN (…)` bulk queries instead of a per-table round-trip for each
@@ -1255,11 +1348,11 @@ pub fn get_tables_details_batch(
     }
 
     let owner = schema.to_uppercase();
-    let names_upper: Vec<String> = table_names.iter().map(|n| n.to_uppercase()).collect();
-    let in_clause = make_in_clause(&names_upper);
+    let query_names = metadata_query_table_names(table_names);
+    let in_clause = make_in_clause(&query_names);
 
     // Seed result map in original order
-    let mut map: HashMap<String, TableDetails> = names_upper
+    let mut map: HashMap<String, TableDetails> = query_names
         .iter()
         .map(|n| {
             (
@@ -1910,9 +2003,9 @@ pub fn get_tables_details_batch(
     tracing::info!("get_tables_details_batch: [8/8] triggers done");
 
     // Return in original order, preserving only tables that exist
-    let result = names_upper
+    let result = table_names
         .iter()
-        .filter_map(|n| map.remove(n))
+        .filter_map(|n| remove_selected_table_details(&mut map, n))
         .filter(|t| !t.columns.is_empty())
         .collect();
     Ok(result)

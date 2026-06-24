@@ -5,7 +5,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Local;
 use odbc_api::{
     buffers::TextRowSet,
@@ -61,11 +61,10 @@ pub fn export_table_data(
 
     let source_schema_upper = source_schema.to_uppercase();
     let target_schema_upper = target_schema.to_uppercase();
-    let table_upper = table.to_uppercase();
-    let source_qualified_table = format!("{}.{}", source_schema_upper, table_upper);
-    let target_qualified_table = format!("{}.{}", target_schema_upper, table_upper);
-    let source_ident = quote_identifier(&source_qualified_table);
-    let target_ident = quote_identifier(&target_qualified_table);
+    let table_name = table.trim();
+    let source_qualified_table = format!("{}.{}", source_schema_upper, table_name);
+    let source_ident = quote_qualified_table(&source_schema_upper, table_name);
+    let target_ident = quote_qualified_table(&target_schema_upper, table_name);
 
     let column_idents: Vec<String> = table_details
         .columns
@@ -150,11 +149,10 @@ fn export_table_data_rowwise(
 
     let source_schema_upper = source_schema.to_uppercase();
     let target_schema_upper = target_schema.to_uppercase();
-    let table_upper = table.to_uppercase();
-    let source_qualified_table = format!("{}.{}", source_schema_upper, table_upper);
-    let target_qualified_table = format!("{}.{}", target_schema_upper, table_upper);
-    let source_ident = quote_identifier(&source_qualified_table);
-    let target_ident = quote_identifier(&target_qualified_table);
+    let table_name = table.trim();
+    let source_qualified_table = format!("{}.{}", source_schema_upper, table_name);
+    let source_ident = quote_qualified_table(&source_schema_upper, table_name);
+    let target_ident = quote_qualified_table(&target_schema_upper, table_name);
 
     let column_idents: Vec<String> = table_details
         .columns
@@ -461,9 +459,12 @@ pub fn export_schema_data(
 
     // Pre-fetch table details（批量查询，减少 ODBC 往返次数）
     let table_names: Vec<String> = tables.iter().map(|t| t.name.clone()).collect();
-    let table_details_cache: Vec<crate::models::TableDetails> =
+    let table_details_cache = align_table_details_to_selection(
+        tables,
         get_tables_details_batch(connection, &source_schema_upper, &table_names)
-            .context("Failed to batch-fetch table metadata")?;
+            .context("Failed to batch-fetch table metadata")?,
+        &source_schema_upper,
+    )?;
 
     // Compute FK-aware table ordering (parents before children for INSERT)
     let insert_order = topological_sort_by_fk(tables, &table_details_cache);
@@ -543,9 +544,8 @@ pub fn export_schema_data(
             if fk_names.is_empty() {
                 None
             } else {
-                let table_upper = tables[idx].name.to_uppercase();
-                let qualified =
-                    quote_identifier(&format!("{}.{}", target_schema_upper, table_upper));
+                let table_name = tables[idx].name.trim();
+                let qualified = quote_qualified_table(&target_schema_upper, table_name);
                 Some((qualified, fk_names))
             }
         })
@@ -581,8 +581,8 @@ pub fn export_schema_data(
     writeln!(writer, "-- ========================================")?;
     writeln!(writer)?;
     for &idx in &truncate_order {
-        let table_upper = tables[idx].name.to_uppercase();
-        let qualified = quote_identifier(&format!("{}.{}", target_schema_upper, table_upper));
+        let table_name = tables[idx].name.trim();
+        let qualified = quote_qualified_table(&target_schema_upper, table_name);
         writeln!(writer, "TRUNCATE TABLE {};", qualified)?;
     }
     writeln!(writer)?;
@@ -603,7 +603,7 @@ pub fn export_schema_data(
             writeln!(writer)?;
         }
 
-        let table_upper = tables[idx].name.to_uppercase();
+        let table_name = tables[idx].name.trim();
         let table_details = &table_details_cache[idx];
         let has_identity = table_details.columns.iter().any(|col| col.identity);
         let expected_rows = table_row_counts[idx];
@@ -612,12 +612,12 @@ pub fn export_schema_data(
             writer,
             "-- 表数据：{}.{}{}",
             target_schema_upper,
-            table_upper,
+            table_name,
             expected_rows
                 .map(|c| format!("（{} 行）", c))
                 .unwrap_or_else(|| "（行数未知）".to_string())
         )?;
-        let qualified = quote_identifier(&format!("{}.{}", target_schema_upper, table_upper));
+        let qualified = quote_qualified_table(&target_schema_upper, table_name);
 
         if has_identity {
             write_identity_insert(&mut writer, &qualified, true)?;
@@ -666,6 +666,54 @@ pub fn export_schema_data(
         .flush()
         .context("Failed to flush data export to disk")?;
     Ok(exported_total)
+}
+
+/**
+* AI generated 2026-06-24 16:20:11
+* Author: 梁国栋
+* Version: v1.0.0
+* Function: Align batch-fetched table metadata to the selected table order and fail with a clear error when metadata is missing, preventing index-based export from panicking.
+* Revision history:
+* - 2026-06-24 16:20:11 v1.0.0 Added export table metadata alignment validation, reviewer: 梁国栋
+*/
+fn align_table_details_to_selection(
+    tables: &[TableIdentifier],
+    details: Vec<TableDetails>,
+    source_schema: &str,
+) -> Result<Vec<TableDetails>> {
+    let requested_count = tables.len();
+    let metadata_count = details.len();
+    let mut details_by_name: HashMap<String, TableDetails> = details
+        .into_iter()
+        .map(|table_details| (table_details.name.clone(), table_details))
+        .collect();
+
+    let mut aligned = Vec::with_capacity(tables.len());
+    let mut missing_tables = Vec::new();
+
+    for table in tables {
+        let table_name = table.name.trim();
+        if let Some(table_details) = details_by_name
+            .remove(table_name)
+            .or_else(|| details_by_name.remove(&table_name.to_uppercase()))
+        {
+            aligned.push(table_details);
+        } else {
+            missing_tables.push(table_name.to_string());
+        }
+    }
+
+    if !missing_tables.is_empty() {
+        bail!(
+            "DM8 table metadata is missing for schema '{}' tables: {}. Requested {} tables but metadata returned {} tables. Verify the selected tables exist and the current account can read ALL_TAB_COLUMNS for them.",
+            source_schema,
+            missing_tables.join(", "),
+            requested_count,
+            metadata_count
+        );
+    }
+
+    Ok(aligned)
 }
 
 /// Generic FK topological sort: accepts table names + per-table FK lists,
@@ -960,6 +1008,17 @@ fn escape_single_quotes(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+fn format_string_literal(raw: &str) -> String {
+    if !raw.contains('&') {
+        return format!("'{}'", escape_single_quotes(raw));
+    }
+
+    raw.split('&')
+        .map(|part| format!("'{}'", escape_single_quotes(part)))
+        .collect::<Vec<_>>()
+        .join(" || CHR(38) || ")
+}
+
 /// Decode a hex string (e.g. "4F2A") into raw bytes.
 /// Used by format_literal's binary path where TextRowSet returns hex text.
 fn hex_str_to_bytes(hex: &str) -> Vec<u8> {
@@ -985,6 +1044,10 @@ fn quote_identifier(identifier: &str) -> String {
         .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn quote_qualified_table(schema: &str, table: &str) -> String {
+    quote_identifier(&format!("{}.{}", schema.trim(), table.trim()))
 }
 
 fn is_date_type(dt: &str) -> bool {
@@ -1059,7 +1122,7 @@ fn format_literal(data_type: &str, raw: &str) -> String {
         } else {
             "YYYY-MM-DD"
         };
-        return format!("TO_DATE('{}','{}')", escape_single_quotes(raw), format_str);
+        return format!("TO_DATE({},'{}')", format_string_literal(raw), format_str);
     }
     if is_timestamp_type(&upper) {
         // Normalize ISO 8601 format to DM8-compatible format
@@ -1108,18 +1171,18 @@ fn format_literal(data_type: &str, raw: &str) -> String {
         // Use TO_TIMESTAMP_TZ for TIMESTAMP WITH TIME ZONE types or values with timezone
         if upper.contains("TIME ZONE") || has_tz {
             return format!(
-                "TO_TIMESTAMP_TZ('{}','{}')",
-                escape_single_quotes(&normalized),
+                "TO_TIMESTAMP_TZ({},'{}')",
+                format_string_literal(&normalized),
                 format_str
             );
         }
         return format!(
-            "TO_TIMESTAMP('{}','{}')",
-            escape_single_quotes(&normalized),
+            "TO_TIMESTAMP({},'{}')",
+            format_string_literal(&normalized),
             format_str
         );
     }
-    format!("'{}'", escape_single_quotes(raw))
+    format_string_literal(raw)
 }
 
 /// Check if the string has a timezone offset (+HH:MM or -HH:MM).
@@ -1158,6 +1221,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn quote_qualified_table_preserves_requested_table_case() {
+        let qualified = super::quote_qualified_table("SYSDBA", "business_filling");
+
+        assert_eq!(qualified, "\"SYSDBA\".\"business_filling\"");
+    }
+
     fn make_details(name: &str, fks: Vec<ForeignKey>) -> TableDetails {
         TableDetails {
             name: name.to_uppercase(),
@@ -1170,6 +1240,40 @@ mod tests {
             check_constraints: vec![],
             triggers: vec![],
         }
+    }
+
+    #[test]
+    fn align_table_details_to_selection_preserves_requested_order() {
+        let tables = vec![make_table_id("A"), make_table_id("B")];
+        let details = vec![make_details("B", vec![]), make_details("A", vec![])];
+
+        let aligned = super::align_table_details_to_selection(&tables, details, "S").unwrap();
+
+        assert_eq!(aligned[0].name, "A");
+        assert_eq!(aligned[1].name, "B");
+    }
+
+    #[test]
+    fn align_table_details_to_selection_prefers_exact_case_match() {
+        let tables = vec![make_table_id("business_filling")];
+        let mut exact_details = make_details("business_filling", vec![]);
+        exact_details.name = "business_filling".to_string();
+        let details = vec![make_details("BUSINESS_FILLING", vec![]), exact_details];
+
+        let aligned = super::align_table_details_to_selection(&tables, details, "S").unwrap();
+
+        assert_eq!(aligned[0].name, "business_filling");
+    }
+
+    #[test]
+    fn align_table_details_to_selection_reports_missing_metadata() {
+        let tables = vec![make_table_id("A"), make_table_id("B")];
+        let details = vec![make_details("A", vec![])];
+
+        let err = super::align_table_details_to_selection(&tables, details, "S").unwrap_err();
+
+        assert!(err.to_string().contains("B"));
+        assert!(err.to_string().contains("ALL_TAB_COLUMNS"));
     }
 
     fn make_fk(ref_table: &str) -> ForeignKey {
@@ -1270,6 +1374,46 @@ mod tests {
         assert!(rendered.contains("-- 警告: 本脚本会先 TRUNCATE 表，再执行数据插入。"));
         assert!(rendered.contains("-- 说明: 插入前会将序列重置到 START 值。"));
         assert!(!rendered.contains("DM8 Data Export"));
+    }
+
+    #[test]
+    fn format_literal_rewrites_ampersand_for_disql() {
+        let rendered = super::format_literal(
+            "VARCHAR",
+            "jdbc:dm://127.0.0.1:5236/?platform&zeroDateTimeBehavior=convertToNull&useUnicode=true",
+        );
+
+        assert_eq!(
+            rendered,
+            "'jdbc:dm://127.0.0.1:5236/?platform' || CHR(38) || 'zeroDateTimeBehavior=convertToNull' || CHR(38) || 'useUnicode=true'"
+        );
+        assert!(!rendered.contains('&'));
+    }
+
+    #[test]
+    fn format_literal_preserves_quotes_while_rewriting_ampersand() {
+        let rendered = super::format_literal("VARCHAR", "O'Reilly & Associates");
+
+        assert_eq!(rendered, "'O''Reilly ' || CHR(38) || ' Associates'");
+        assert!(!rendered.contains('&'));
+    }
+
+    #[test]
+    fn format_date_literal_rewrites_ampersand_inside_value() {
+        let rendered = super::format_literal("DATE", "2026-02-10&bad");
+
+        assert!(rendered.starts_with("TO_DATE("));
+        assert!(rendered.contains("'2026-02-10' || CHR(38) || 'bad'"));
+        assert!(!rendered.contains('&'));
+    }
+
+    #[test]
+    fn format_timestamp_literal_rewrites_ampersand_inside_value() {
+        let rendered = super::format_literal("TIMESTAMP", "2026-02-10 10:15:41&bad");
+
+        assert!(rendered.starts_with("TO_TIMESTAMP("));
+        assert!(rendered.contains("'2026-02-10 10:15:41' || CHR(38) || 'bad'"));
+        assert!(!rendered.contains('&'));
     }
 
     #[test]
