@@ -10,6 +10,7 @@ import {
 
 import { useExportStore } from '@/store/useExportStore';
 import { TechButton } from '@/components/common/TechButton';
+import { tableKey } from '@/utils/tableIdentity';
 
 const ConnectionForm = lazy(() => import('@/components/ConnectionForm'));
 const SchemaExplorer = lazy(() => import('@/components/SchemaExplorer'));
@@ -23,10 +24,11 @@ export default function ExportWizard() {
   const isConnected = useExportStore((state) => state.isConnected);
   const selectedTables = useExportStore((state) => state.selectedTables);
   const tables = useExportStore((state) => state.tables);
+  const config = useExportStore((state) => state.connectionConfig);
 
   const rowCountMap = useMemo(() => {
-    return new Map(tables.map((table) => [table.name, table.row_count ?? 0]));
-  }, [tables]);
+    return new Map(tables.map((table) => [tableKey(table, config?.schema ?? ''), table.row_count ?? 0]));
+  }, [config?.schema, tables]);
 
   const totalRows = useMemo(() => {
     return selectedTables.reduce((acc, tableName) => acc + (rowCountMap.get(tableName) ?? 0), 0);

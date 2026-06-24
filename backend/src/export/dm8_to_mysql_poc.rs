@@ -884,15 +884,15 @@ mod tests {
     #[test]
     fn parse_dm8_value_maps_numeric_and_bool() {
         assert_eq!(
-            parse_dm8_value(&LogicalType::Integer, Some("42".to_string())),
+            parse_dm8_value(&LogicalType::Integer, Some("42".to_string())).unwrap(),
             CanonicalValue::Integer(42)
         );
         assert_eq!(
-            parse_dm8_value(&LogicalType::Boolean, Some("Y".to_string())),
+            parse_dm8_value(&LogicalType::Boolean, Some("Y".to_string())).unwrap(),
             CanonicalValue::Boolean(true)
         );
         assert_eq!(
-            parse_dm8_value(&LogicalType::Boolean, Some("0".to_string())),
+            parse_dm8_value(&LogicalType::Boolean, Some("0".to_string())).unwrap(),
             CanonicalValue::Boolean(false)
         );
     }

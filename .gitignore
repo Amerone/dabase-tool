@@ -1,6 +1,8 @@
 # Rust
 /backend/target/
 /backend/target-codex*/
+/backend/target_codex*/
+/backend/target_verify/
 /src-tauri/target/
 /src-tauri/target-codex*/
 **/*.rs.bk
@@ -52,3 +54,4 @@ _codex_write_test.txt
 
 # Git worktrees
 .worktrees/
+.aider*

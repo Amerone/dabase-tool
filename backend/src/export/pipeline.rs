@@ -10,7 +10,7 @@
 use std::{
     any::Any,
     fs::{self, File},
-    io::{BufWriter, Read as _, Write},
+    io::{self, BufWriter, Write},
     panic::{catch_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::Arc,
@@ -230,8 +230,9 @@ impl DataExportPipeline {
         for (layer_idx, layer) in layers.iter().enumerate() {
             tracing::debug!("Pipeline layer {}: {} tables", layer_idx, layer.len());
 
-            // Limit parallelism within each layer
-            let effective_parallelism = layer.len().min(self.max_parallelism);
+            // Limit parallelism within each layer.
+            let effective_parallelism =
+                effective_layer_parallelism(layer.len(), self.max_parallelism);
 
             if effective_parallelism <= 1 || layer.len() == 1 {
                 // Single-threaded path: export directly to main writer
@@ -254,98 +255,99 @@ impl DataExportPipeline {
                     total_rows += count;
                 }
             } else {
-                // Parallel path: each thread writes to a temp file, then merge
-                let results = std::thread::scope(|scope| -> Result<Vec<TableExportResult>> {
-                    let mut handles = Vec::with_capacity(layer.len());
+                // Parallel path: each bounded chunk writes to temp files, then streams merge.
+                for chunk in layer.chunks(effective_parallelism) {
+                    let results = std::thread::scope(|scope| -> Result<Vec<TableExportResult>> {
+                        let mut handles = Vec::with_capacity(chunk.len());
 
-                    for &idx in layer {
-                        let env = Arc::clone(&environment);
-                        let cs = &conn_string;
-                        let source_schema = &self.source_schema;
-                        let details = &all_details[idx];
-                        let target_det = &target_details[idx];
-                        let batch_size = self.batch_size;
-                        let tmp_dir = &temp_dir;
-                        let unicode_safe_text = self.unicode_safe_text;
+                        for &idx in chunk {
+                            let env = Arc::clone(&environment);
+                            let cs = &conn_string;
+                            let source_schema = &self.source_schema;
+                            let details = &all_details[idx];
+                            let target_det = &target_details[idx];
+                            let batch_size = self.batch_size;
+                            let tmp_dir = &temp_dir;
+                            let unicode_safe_text = self.unicode_safe_text;
 
-                        handles.push(scope.spawn(move || -> Result<TableExportResult> {
-                            catch_unwind(AssertUnwindSafe(|| -> Result<TableExportResult> {
-                                let temp_path = tmp_dir.join(format!("table_{}.tmp.sql", idx));
-                                let temp_file = File::create(&temp_path).with_context(|| {
-                                    format!("Failed to create temp file for table {}", idx)
-                                })?;
-                                let mut tw = BufWriter::with_capacity(1024 * 1024, temp_file);
+                            handles.push(scope.spawn(move || -> Result<TableExportResult> {
+                                catch_unwind(AssertUnwindSafe(|| -> Result<TableExportResult> {
+                                    let temp_path = tmp_dir.join(format!("table_{}.tmp.sql", idx));
+                                    let temp_file =
+                                        File::create(&temp_path).with_context(|| {
+                                            format!("Failed to create temp file for table {}", idx)
+                                        })?;
+                                    let mut tw = BufWriter::with_capacity(1024 * 1024, temp_file);
 
-                                // Create independent ODBC connection for this thread
-                                let thread_conn = env
-                                    .connect_with_connection_string(
-                                        cs,
-                                        ConnectionOptions::default(),
-                                    )
-                                    .with_context(|| {
-                                        format!(
-                                            "Pipeline worker failed to connect for table {}",
-                                            idx
+                                    // Create independent ODBC connection for this thread
+                                    let thread_conn = env
+                                        .connect_with_connection_string(
+                                            cs,
+                                            ConnectionOptions::default(),
                                         )
-                                    })?;
+                                        .with_context(|| {
+                                            format!(
+                                                "Pipeline worker failed to connect for table {}",
+                                                idx
+                                            )
+                                        })?;
 
-                                let source_table = canonical_table_from_details(details);
-                                let target_table = canonical_table_from_details(target_det);
+                                    let source_table = canonical_table_from_details(details);
+                                    let target_table = canonical_table_from_details(target_det);
 
-                                let count = export_table_to_writer(
-                                    &thread_conn,
-                                    &mut tw,
-                                    TableWriterExportRequest {
+                                    let count = export_table_to_writer(
+                                        &thread_conn,
+                                        &mut tw,
+                                        TableWriterExportRequest {
+                                            source_schema,
+                                            source_table: &source_table,
+                                            target_table: &target_table,
+                                            details,
+                                            renderer,
+                                            batch_size,
+                                            unicode_safe_text,
+                                        },
+                                    )?;
+
+                                    tw.flush()?;
+                                    Ok(TableExportResult {
+                                        row_count: count,
+                                        temp_path,
+                                    })
+                                }))
+                                .map_err(|panic| {
+                                    anyhow::anyhow!(
+                                        "Pipeline worker panicked while exporting {}.{}: {}",
                                         source_schema,
-                                        source_table: &source_table,
-                                        target_table: &target_table,
-                                        details,
-                                        renderer,
-                                        batch_size,
-                                        unicode_safe_text,
-                                    },
-                                )?;
+                                        details.name,
+                                        panic_payload_to_string(panic)
+                                    )
+                                })?
+                            }));
+                        }
 
-                                tw.flush()?;
-                                Ok(TableExportResult {
-                                    row_count: count,
-                                    temp_path,
-                                })
-                            }))
-                            .map_err(|panic| {
-                                anyhow::anyhow!(
-                                    "Pipeline worker panicked while exporting {}.{}: {}",
-                                    source_schema,
-                                    details.name,
-                                    panic_payload_to_string(panic)
-                                )
-                            })?
-                        }));
-                    }
-
-                    handles
-                        .into_iter()
-                        .map(|h| {
-                            h.join().map_err(|panic| {
-                                anyhow::anyhow!(
-                                    "Pipeline worker thread panicked: {}",
-                                    panic_payload_to_string(panic)
-                                )
-                            })?
-                        })
-                        .collect()
-                })?;
-
-                // Merge temp files into main writer in layer order
-                for result in &results {
-                    let mut tmp_file = File::open(&result.temp_path).with_context(|| {
-                        format!("Failed to open temp file {:?}", result.temp_path)
+                        handles
+                            .into_iter()
+                            .map(|h| {
+                                h.join().map_err(|panic| {
+                                    anyhow::anyhow!(
+                                        "Pipeline worker thread panicked: {}",
+                                        panic_payload_to_string(panic)
+                                    )
+                                })?
+                            })
+                            .collect()
                     })?;
-                    let mut buf = Vec::new();
-                    tmp_file.read_to_end(&mut buf)?;
-                    writer.write_all(&buf)?;
-                    let _ = fs::remove_file(&result.temp_path);
-                    total_rows += result.row_count;
+
+                    // Merge temp files into main writer in layer order without loading whole files.
+                    for result in &results {
+                        let mut tmp_file = File::open(&result.temp_path).with_context(|| {
+                            format!("Failed to open temp file {:?}", result.temp_path)
+                        })?;
+                        io::copy(&mut tmp_file, &mut writer)?;
+                        let _ = fs::remove_file(&result.temp_path);
+                        total_rows += result.row_count;
+                    }
                 }
             }
         }
@@ -508,7 +510,13 @@ fn export_table_rows(
             let mut values = Vec::with_capacity(source_table.columns.len());
             for (col_index, col) in source_table.columns.iter().enumerate() {
                 let cell_value = decode_cell(batch, col_index, row_index);
-                values.push(parse_dm8_value(&col.logical_type, cell_value));
+                let value = parse_dm8_value(&col.logical_type, cell_value).with_context(|| {
+                    format!(
+                        "Failed to parse DM8 value for {}.{} column '{}'",
+                        schema, source_table.name, col.name
+                    )
+                })?;
+                values.push(value);
             }
             rows.push(CanonicalRow { values });
         }
@@ -620,7 +628,14 @@ fn export_table_rows_rowwise(
                     })?
                 };
                 if let Some(text) = text {
-                    values.push(parse_dm8_value(&column.logical_type, Some(text)));
+                    values.push(
+                        parse_dm8_value(&column.logical_type, Some(text)).with_context(|| {
+                            format!(
+                                "Failed to parse DM8 value for {} column '{}'",
+                                source_qualified_table, column.name
+                            )
+                        })?,
+                    );
                 } else {
                     values.push(CanonicalValue::Null);
                 }
@@ -747,9 +762,13 @@ fn panic_payload_to_string(panic: Box<dyn Any + Send>) -> String {
     }
 }
 
+fn effective_layer_parallelism(layer_len: usize, max_parallelism: usize) -> usize {
+    layer_len.min(max_parallelism.max(1)).max(1)
+}
+
 /// Parse a raw DM8 cell value into a CanonicalValue based on logical type.
-pub fn parse_dm8_value(logical_type: &LogicalType, raw: Option<String>) -> CanonicalValue {
-    match raw {
+pub fn parse_dm8_value(logical_type: &LogicalType, raw: Option<String>) -> Result<CanonicalValue> {
+    Ok(match raw {
         None => CanonicalValue::Null,
         Some(s) if s.trim().is_empty() => match logical_type {
             LogicalType::String | LogicalType::Text => CanonicalValue::String(String::new()),
@@ -757,31 +776,44 @@ pub fn parse_dm8_value(logical_type: &LogicalType, raw: Option<String>) -> Canon
         },
         Some(s) => match logical_type {
             LogicalType::Integer => s
+                .trim()
                 .parse::<i64>()
                 .map(CanonicalValue::Integer)
-                .unwrap_or(CanonicalValue::Null),
+                .with_context(|| format!("Invalid DM8 integer literal '{}'", s))?,
             LogicalType::Decimal => CanonicalValue::Decimal(s),
             LogicalType::Float => s
+                .trim()
                 .parse::<f64>()
                 .map(CanonicalValue::Float)
-                .unwrap_or(CanonicalValue::Null),
+                .with_context(|| format!("Invalid DM8 float literal '{}'", s))?,
             LogicalType::Boolean => {
-                let is_true = s.trim().eq_ignore_ascii_case("Y")
-                    || s.trim() == "1"
-                    || s.trim().eq_ignore_ascii_case("TRUE")
-                    || s.trim().eq_ignore_ascii_case("T");
-                CanonicalValue::Boolean(is_true)
+                let trimmed = s.trim();
+                if trimmed.eq_ignore_ascii_case("Y")
+                    || trimmed == "1"
+                    || trimmed.eq_ignore_ascii_case("TRUE")
+                    || trimmed.eq_ignore_ascii_case("T")
+                {
+                    CanonicalValue::Boolean(true)
+                } else if trimmed.eq_ignore_ascii_case("N")
+                    || trimmed == "0"
+                    || trimmed.eq_ignore_ascii_case("FALSE")
+                    || trimmed.eq_ignore_ascii_case("F")
+                {
+                    CanonicalValue::Boolean(false)
+                } else {
+                    return Err(anyhow::anyhow!("Invalid DM8 boolean literal '{}'", s));
+                }
             }
             LogicalType::Binary => parse_hex_bytes(&s)
                 .map(CanonicalValue::Binary)
-                .unwrap_or(CanonicalValue::Null),
+                .ok_or_else(|| anyhow::anyhow!("Invalid DM8 hex binary literal '{}'", s))?,
             LogicalType::Date => CanonicalValue::Date(s),
             LogicalType::DateTime => CanonicalValue::DateTime(s),
             LogicalType::Json => CanonicalValue::Json(s),
             LogicalType::String | LogicalType::Text => CanonicalValue::String(s),
             LogicalType::Unknown => CanonicalValue::String(s),
         },
-    }
+    })
 }
 
 pub fn parse_hex_bytes(hex_str: &str) -> Option<Vec<u8>> {
@@ -844,7 +876,7 @@ mod tests {
     #[test]
     fn parse_dm8_value_integer() {
         assert_eq!(
-            parse_dm8_value(&LogicalType::Integer, Some("42".to_string())),
+            parse_dm8_value(&LogicalType::Integer, Some("42".to_string())).unwrap(),
             CanonicalValue::Integer(42)
         );
     }
@@ -852,15 +884,15 @@ mod tests {
     #[test]
     fn parse_dm8_value_boolean_case_insensitive() {
         assert_eq!(
-            parse_dm8_value(&LogicalType::Boolean, Some("true".to_string())),
+            parse_dm8_value(&LogicalType::Boolean, Some("true".to_string())).unwrap(),
             CanonicalValue::Boolean(true)
         );
         assert_eq!(
-            parse_dm8_value(&LogicalType::Boolean, Some("Y".to_string())),
+            parse_dm8_value(&LogicalType::Boolean, Some("Y".to_string())).unwrap(),
             CanonicalValue::Boolean(true)
         );
         assert_eq!(
-            parse_dm8_value(&LogicalType::Boolean, Some("0".to_string())),
+            parse_dm8_value(&LogicalType::Boolean, Some("0".to_string())).unwrap(),
             CanonicalValue::Boolean(false)
         );
     }
@@ -868,13 +900,29 @@ mod tests {
     #[test]
     fn parse_dm8_value_null_on_empty() {
         assert_eq!(
-            parse_dm8_value(&LogicalType::Integer, Some("".to_string())),
+            parse_dm8_value(&LogicalType::Integer, Some("".to_string())).unwrap(),
             CanonicalValue::Null
         );
         assert_eq!(
-            parse_dm8_value(&LogicalType::String, Some("".to_string())),
+            parse_dm8_value(&LogicalType::String, Some("".to_string())).unwrap(),
             CanonicalValue::String(String::new())
         );
+    }
+
+    #[test]
+    fn parse_dm8_value_rejects_invalid_literals() {
+        assert!(parse_dm8_value(&LogicalType::Integer, Some("abc".to_string())).is_err());
+        assert!(parse_dm8_value(&LogicalType::Float, Some("not-float".to_string())).is_err());
+        assert!(parse_dm8_value(&LogicalType::Boolean, Some("maybe".to_string())).is_err());
+        assert!(parse_dm8_value(&LogicalType::Binary, Some("ABC".to_string())).is_err());
+    }
+
+    #[test]
+    fn effective_layer_parallelism_is_bounded_and_nonzero() {
+        assert_eq!(effective_layer_parallelism(10, 4), 4);
+        assert_eq!(effective_layer_parallelism(3, 10), 3);
+        assert_eq!(effective_layer_parallelism(10, 0), 1);
+        assert_eq!(effective_layer_parallelism(0, 4), 1);
     }
 
     #[test]

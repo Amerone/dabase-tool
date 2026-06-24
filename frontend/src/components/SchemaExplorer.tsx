@@ -8,6 +8,7 @@ import type { Table as TableType } from '@/types';
 import { listTables } from '@/services/api';
 import { useExportStore } from '@/store/useExportStore';
 import { buildConnectionKey } from '@/utils/connectionKey';
+import { tableKey } from '@/utils/tableIdentity';
 import { SectionHeader } from './common/SectionHeader';
 import { TechButton } from './common/TechButton';
 import { TechCard } from './common/TechCard';
@@ -65,9 +66,9 @@ export default function SchemaExplorer() {
           const nextTables = result.data;
           setStoreTables(nextTables, configKey);
 
-          const tableNames = new Set(nextTables.map((table) => table.name));
+          const tableKeys = new Set(nextTables.map((table) => tableKey(table, config.schema)));
           const currentSelected = useExportStore.getState().selectedTables;
-          const nextSelected = currentSelected.filter((name) => tableNames.has(name));
+          const nextSelected = currentSelected.filter((key) => tableKeys.has(key));
           if (nextSelected.length !== currentSelected.length) {
             setSelectedTables(nextSelected);
           }
@@ -114,8 +115,9 @@ export default function SchemaExplorer() {
   }, [deferredSearch, tables]);
 
   const visibleTableNames = useMemo(() => {
-    return new Set(filteredTables.map((item) => item.name));
-  }, [filteredTables]);
+    const fallbackSchema = config?.schema ?? '';
+    return new Set(filteredTables.map((item) => tableKey(item, fallbackSchema)));
+  }, [config?.schema, filteredTables]);
 
   const columns: ColumnsType<TableType> = useMemo(
     () => [
@@ -159,8 +161,9 @@ export default function SchemaExplorer() {
   const handleSelectAllVisible = () => {
     const current = new Set(selectedTables);
     const originalSize = current.size;
+    const fallbackSchema = config?.schema ?? '';
     for (const item of filteredTables) {
-      current.add(item.name);
+      current.add(tableKey(item, fallbackSchema));
     }
     if (current.size === originalSize) {
       return;
@@ -169,7 +172,7 @@ export default function SchemaExplorer() {
   };
 
   const handleClearVisible = () => {
-    const next = selectedTables.filter((name) => !visibleTableNames.has(name));
+    const next = selectedTables.filter((key) => !visibleTableNames.has(key));
     if (isSameSelection(next, selectedTables)) {
       return;
     }
@@ -177,7 +180,7 @@ export default function SchemaExplorer() {
   };
 
   const handleSelectionChange = (selectedRowKeys: Key[]) => {
-    const keepHidden = selectedTables.filter((name) => !visibleTableNames.has(name));
+    const keepHidden = selectedTables.filter((key) => !visibleTableNames.has(key));
     const next = Array.from(new Set([...keepHidden, ...(selectedRowKeys as string[])]));
     if (isSameSelection(next, selectedTables)) {
       return;
@@ -231,7 +234,7 @@ export default function SchemaExplorer() {
 
       <Table<TableType>
         className="schema-table"
-        rowKey="name"
+        rowKey={(record) => tableKey(record, config.schema)}
         columns={columns}
         dataSource={filteredTables}
         loading={loading}

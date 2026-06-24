@@ -34,6 +34,7 @@ import {
   saveExportDirectory,
 } from '@/services/api';
 import { useExportStore } from '@/store/useExportStore';
+import { parseTableKey } from '@/utils/tableIdentity';
 import { SectionHeader } from './common/SectionHeader';
 import { TechButton } from './common/TechButton';
 import { TechCard } from './common/TechCard';
@@ -340,7 +341,7 @@ export default function ExportConfig() {
         export_schema: values.export_schema?.trim() || undefined,
         export_directory: savedExportDirectory,
         export_compat: values.export_compat,
-        tables: selectedTables.map((name) => ({ schema: config.schema, name })),
+        tables: selectedTables.map((key) => parseTableKey(key, config.schema)),
         include_ddl: values.include_ddl,
         include_data: values.include_data,
         batch_size: values.batch_size || 1000,

@@ -134,6 +134,7 @@ pub async fn export_kingbase_to_kingbase_data(
 
         let count = export_table_rows(
             &client,
+            &table_id.schema,
             &source_table,
             &target_table,
             renderer.as_ref(),
@@ -234,6 +235,7 @@ async fn fetch_primary_keys(
 
 async fn export_table_rows(
     client: &tokio_postgres::Client,
+    source_schema: &str,
     source_table: &CanonicalTable,
     target_table: &CanonicalTable,
     renderer: &dyn crate::dialect::DialectRenderer,
@@ -244,7 +246,6 @@ async fn export_table_rows(
         return Ok(0);
     }
 
-    let schema = pg_native::resolve_table_schema(client, &source_table.name).await?;
     let selected_columns = source_table
         .columns
         .iter()
@@ -254,7 +255,7 @@ async fn export_table_rows(
     let sql = format!(
         "SELECT {} FROM {}.{}",
         selected_columns,
-        quote_ident(&schema),
+        quote_ident(source_schema),
         quote_ident(&source_table.name)
     );
 
@@ -272,8 +273,18 @@ async fn export_table_rows(
     use futures_util::stream::TryStreamExt;
     while let Some(row) = row_stream.try_next().await? {
         let mut values = Vec::with_capacity(source_table.columns.len());
-        for (col_index, logical_type) in logical_types.iter().enumerate() {
-            let value = parse_row_value(&row, col_index, logical_type);
+        for (col_index, (column, logical_type)) in source_table
+            .columns
+            .iter()
+            .zip(logical_types.iter())
+            .enumerate()
+        {
+            let value = parse_row_value(&row, col_index, logical_type).with_context(|| {
+                format!(
+                    "Failed to decode Kingbase value for {}.{} column '{}'",
+                    source_schema, source_table.name, column.name
+                )
+            })?;
             values.push(value);
         }
         batch_rows.push(CanonicalRow { values });
@@ -301,42 +312,40 @@ async fn export_table_rows(
     Ok(total_rows)
 }
 
-fn parse_row_value(row: &Row, col_index: usize, logical_type: &LogicalType) -> CanonicalValue {
-    match logical_type {
+fn parse_row_value(
+    row: &Row,
+    col_index: usize,
+    logical_type: &LogicalType,
+) -> Result<CanonicalValue> {
+    Ok(match logical_type {
         LogicalType::Integer => row
             .try_get::<_, Option<i64>>(col_index)
-            .ok()
-            .flatten()
+            .with_context(|| format!("Failed to decode column {} as integer", col_index))?
             .map(CanonicalValue::Integer)
             .unwrap_or(CanonicalValue::Null),
         LogicalType::Decimal => row
             .try_get::<_, Option<String>>(col_index)
-            .ok()
-            .flatten()
+            .with_context(|| format!("Failed to decode column {} as decimal text", col_index))?
             .map(CanonicalValue::Decimal)
             .unwrap_or(CanonicalValue::Null),
         LogicalType::Float => row
             .try_get::<_, Option<f64>>(col_index)
-            .ok()
-            .flatten()
+            .with_context(|| format!("Failed to decode column {} as float", col_index))?
             .map(CanonicalValue::Float)
             .unwrap_or(CanonicalValue::Null),
         LogicalType::Boolean => row
             .try_get::<_, Option<bool>>(col_index)
-            .ok()
-            .flatten()
+            .with_context(|| format!("Failed to decode column {} as boolean", col_index))?
             .map(CanonicalValue::Boolean)
             .unwrap_or(CanonicalValue::Null),
         LogicalType::Binary => row
             .try_get::<_, Option<Vec<u8>>>(col_index)
-            .ok()
-            .flatten()
+            .with_context(|| format!("Failed to decode column {} as binary", col_index))?
             .map(CanonicalValue::Binary)
             .unwrap_or(CanonicalValue::Null),
         LogicalType::Date | LogicalType::DateTime => row
             .try_get::<_, Option<String>>(col_index)
-            .ok()
-            .flatten()
+            .with_context(|| format!("Failed to decode column {} as date/time text", col_index))?
             .map(|s| match logical_type {
                 LogicalType::Date => CanonicalValue::Date(s),
                 _ => CanonicalValue::DateTime(s),
@@ -344,17 +353,15 @@ fn parse_row_value(row: &Row, col_index: usize, logical_type: &LogicalType) -> C
             .unwrap_or(CanonicalValue::Null),
         LogicalType::Json => row
             .try_get::<_, Option<String>>(col_index)
-            .ok()
-            .flatten()
+            .with_context(|| format!("Failed to decode column {} as json text", col_index))?
             .map(CanonicalValue::Json)
             .unwrap_or(CanonicalValue::Null),
         LogicalType::String | LogicalType::Text | LogicalType::Unknown => row
             .try_get::<_, Option<String>>(col_index)
-            .ok()
-            .flatten()
+            .with_context(|| format!("Failed to decode column {} as text", col_index))?
             .map(CanonicalValue::String)
             .unwrap_or(CanonicalValue::Null),
-    }
+    })
 }
 
 fn quote_ident(value: &str) -> String {

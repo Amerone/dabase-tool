@@ -303,7 +303,10 @@ impl DialectRenderer for KingbaseDialectRenderer {
                     .iter()
                     .enumerate()
                     .map(|(idx, v)| {
-                        kingbase_format_value_for_column(v, kingbase_column_logical_type(table, idx))
+                        kingbase_format_value_for_column(
+                            v,
+                            kingbase_column_logical_type(table, idx),
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -869,7 +872,10 @@ fn kingbase_primary_key_predicate(
         predicates.push(format!(
             "{} = {}",
             kingbase_quote_ident(pk),
-            kingbase_format_value_for_column(value, Some(&table.columns[column_index].logical_type))
+            kingbase_format_value_for_column(
+                value,
+                Some(&table.columns[column_index].logical_type)
+            )
         ));
     }
 
@@ -1112,7 +1118,11 @@ mod tests {
 
         let sql = renderer.render_insert_batch(&table, &[row]).unwrap();
         assert!(sql.contains(", 0)"), "expected boolean→0, got: {}", sql);
-        assert!(!sql.contains("FALSE"), "must not emit FALSE literal: {}", sql);
+        assert!(
+            !sql.contains("FALSE"),
+            "must not emit FALSE literal: {}",
+            sql
+        );
     }
 
     #[test]

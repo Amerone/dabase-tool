@@ -519,8 +519,11 @@ fn sanitize_kingbase_default(raw: &str, kb_type: &str) -> Option<String> {
 
     // MySQL "zero timestamp" placeholder — KingBase rejects integer-typed default
     // on temporal columns. Drop so the column simply has no DEFAULT.
-    if is_temporal && (trimmed == "0" || trimmed == "'0'" || upper == "'0000-00-00 00:00:00'"
-        || upper == "'0000-00-00'")
+    if is_temporal
+        && (trimmed == "0"
+            || trimmed == "'0'"
+            || upper == "'0000-00-00 00:00:00'"
+            || upper == "'0000-00-00'")
     {
         return None;
     }

@@ -137,6 +137,18 @@ pub(super) fn sanitize_filename_part(s: &str) -> String {
         .collect()
 }
 
+pub(super) fn identifier_case_filename_marker(identifier_case: Option<&str>) -> Option<String> {
+    let normalized = identifier_case
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_ascii_lowercase();
+
+    match normalized.as_str() {
+        "lower" | "upper" | "preserve" => Some(format!("case_{normalized}")),
+        _ => None,
+    }
+}
+
 pub(super) fn default_exports_dir() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "Unable to determine home directory".to_string())?;
     ensure_export_dir(home.join(".amarone").join("exports"))
@@ -170,7 +182,7 @@ pub(super) fn format_export_filename(
     suffix: &str,
 ) -> Result<PathBuf, String> {
     let dir = default_exports_dir()?;
-    format_export_filename_in_dir(&dir, source, dialect, target, kind, suffix)
+    format_export_filename_in_dir(&dir, source, dialect, target, kind, suffix, None)
 }
 
 pub(super) fn format_export_filename_in_dir(
@@ -180,14 +192,28 @@ pub(super) fn format_export_filename_in_dir(
     target: &str,
     kind: &str,
     suffix: &str,
+    identifier_case: Option<&str>,
 ) -> Result<PathBuf, String> {
-    Ok(dir.join(format!(
-        "{}_to_{}_{}_{}_{}.sql",
+    let case_marker = identifier_case_filename_marker(identifier_case);
+    let mut parts = vec![
         sanitize_filename_part(source),
+        "to".to_string(),
         sanitize_filename_part(dialect),
         sanitize_filename_part(target),
-        kind,
-        suffix
+        kind.to_string(),
+    ];
+    if let Some(marker) = case_marker {
+        parts.push(marker);
+    }
+    parts.push(suffix.to_string());
+
+    Ok(dir.join(format!(
+        "{}.sql",
+        parts
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("_")
     )))
 }
 
@@ -240,9 +266,9 @@ pub(super) fn build_export_context(req: &mut ExportRequest) -> (ConnectionConfig
 mod tests {
     use super::{
         collect_workload_warnings, format_error_chain, format_export_filename,
-        format_export_filename_in_dir, resolve_compat, resolve_export_dir,
-        resolve_include_row_counts, resolve_target_dialect, resolve_target_schema,
-        sanitize_filename_part,
+        format_export_filename_in_dir, identifier_case_filename_marker, resolve_compat,
+        resolve_export_dir, resolve_include_row_counts, resolve_target_dialect,
+        resolve_target_schema, sanitize_filename_part,
     };
     use crate::export::ddl::TriggerTerminator;
     use crate::export::orchestrator::{ExportExecutionPath, ExportWorkload};
@@ -281,11 +307,47 @@ mod tests {
     fn format_export_filename_uses_selected_directory() {
         let dir = tempfile::TempDir::new().unwrap();
         let path =
-            format_export_filename_in_dir(dir.path(), "SRC", "dm8", "TGT", "ddl", "ts").unwrap();
+            format_export_filename_in_dir(dir.path(), "SRC", "dm8", "TGT", "ddl", "ts", None)
+                .unwrap();
         assert_eq!(path.parent(), Some(dir.path()));
         assert_eq!(
             path.file_name().unwrap().to_str().unwrap(),
             "SRC_to_dm8_TGT_ddl_ts.sql"
+        );
+    }
+
+    #[test]
+    fn format_export_filename_includes_identifier_case_when_selected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = format_export_filename_in_dir(
+            dir.path(),
+            "SRC",
+            "kingbase",
+            "TGT",
+            "ddl",
+            "ts",
+            Some("lower"),
+        )
+        .unwrap();
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            "SRC_to_kingbase_TGT_ddl_case_lower_ts.sql"
+        );
+    }
+
+    #[test]
+    fn identifier_case_filename_marker_normalizes_known_values() {
+        assert_eq!(
+            identifier_case_filename_marker(Some(" Upper ")).as_deref(),
+            Some("case_upper")
+        );
+    }
+
+    #[test]
+    fn identifier_case_filename_marker_ignores_unknown_values() {
+        assert_eq!(
+            identifier_case_filename_marker(Some("mixed")).as_deref(),
+            None
         );
     }
 

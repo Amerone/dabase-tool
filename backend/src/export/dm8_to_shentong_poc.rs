@@ -921,8 +921,8 @@ fn quote_qualified_identifier(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapt_trigger_for_shentong, convert_default_for_shentong, convert_sequence_refs_to_shentong,
-        generate_shentong_create_table,
+        adapt_trigger_for_shentong, convert_default_for_shentong,
+        convert_sequence_refs_to_shentong, generate_shentong_create_table,
     };
     use crate::models::{
         CheckConstraint, Column, ForeignKey, Index, TableDetails, TriggerDefinition,

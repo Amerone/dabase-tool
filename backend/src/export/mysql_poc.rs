@@ -14,8 +14,8 @@ use crate::{
         logical_type_from_db_type, CanonicalColumn, CanonicalRow, CanonicalTable, CanonicalValue,
         LogicalType,
     },
-    export::{data::topological_sort_by_foreign_keys, orchestrator::LegacyExportPlan},
-    models::{ConnectionConfig, DbType, ForeignKey},
+    export::orchestrator::LegacyExportPlan,
+    models::{ConnectionConfig, DbType},
 };
 
 pub async fn export_mysql_to_mysql_ddl(
@@ -63,7 +63,7 @@ pub async fn export_mysql_to_target_ddl(
     }
 
     writer.flush().context("Failed to flush mysql ddl export")?;
-    pool.close().await;
+    drop(pool);
     Ok(())
 }
 
@@ -81,6 +81,9 @@ pub async fn export_mysql_to_target_data(
     target_dialect: DbType,
     batch_size: usize,
 ) -> Result<usize> {
+    let t0 = std::time::Instant::now();
+    tracing::info!("mysql export: start, {} tables", plan.tables.len());
+
     if let Some(parent) = plan.output_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create output parent {}", parent.display()))?;
@@ -90,11 +93,24 @@ pub async fn export_mysql_to_target_data(
         .with_context(|| format!("Failed to create {}", plan.output_path.display()))?;
     let mut writer = BufWriter::new(file);
     let renderer = renderer_for(&target_dialect);
+
+    tracing::info!(
+        "mysql export: creating pool... +{}ms",
+        t0.elapsed().as_millis()
+    );
     let pool = mysql::create_pool(config, 2).await?;
+    tracing::info!(
+        "mysql export: pool created, acquiring conn... +{}ms",
+        t0.elapsed().as_millis()
+    );
     let mut conn = pool
         .acquire()
         .await
         .context("Failed to acquire MySQL connection")?;
+    tracing::info!(
+        "mysql export: conn acquired +{}ms",
+        t0.elapsed().as_millis()
+    );
     let effective_batch_size = batch_size.max(1);
 
     writeln!(
@@ -106,10 +122,6 @@ pub async fn export_mysql_to_target_data(
     writeln!(writer, "-- target schema: {}", plan.target_schema)?;
     writeln!(writer)?;
 
-    // Keep one consistent snapshot for the full export so no-PK tables can be exported online
-    // without duplicate/missing rows caused by concurrent writes.
-    begin_read_only_snapshot(&mut conn).await?;
-
     let result = export_tables_data(
         &mut conn,
         plan,
@@ -119,18 +131,15 @@ pub async fn export_mysql_to_target_data(
     )
     .await;
 
-    if result.is_ok() {
-        sqlx::query("COMMIT")
-            .execute(&mut *conn)
-            .await
-            .context("Failed to commit MySQL snapshot transaction")?;
-    } else {
-        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-    }
-
     let total_rows = result?;
+    tracing::info!(
+        "mysql export: done, {} rows in {}ms",
+        total_rows,
+        t0.elapsed().as_millis()
+    );
 
-    pool.close().await;
+    drop(conn);
+    drop(pool);
     writer
         .flush()
         .context("Failed to flush mysql data export")?;
@@ -146,44 +155,24 @@ async fn export_tables_data(
 ) -> Result<usize> {
     let mut total_rows = 0usize;
 
-    // Phase 0: Collect FK info for all tables
-    // We need a pool for fetch_foreign_keys; create a temporary one-connection pool
-    // by re-using the existing connection's transaction context via direct queries.
-    let mut table_names = Vec::with_capacity(plan.tables.len());
-    let mut table_fks: Vec<Vec<ForeignKey>> = Vec::with_capacity(plan.tables.len());
-    for table_id in &plan.tables {
-        let fks = fetch_fks_inline(conn, &plan.source_schema, &table_id.name).await?;
-        table_names.push(table_id.name.clone());
-        table_fks.push(fks);
-    }
-
-    // Compute FK-aware ordering
-    let insert_order = topological_sort_by_foreign_keys(&table_names, &table_fks);
-    let truncate_order: Vec<usize> = insert_order.iter().copied().rev().collect();
-
-    // Phase 1: TRUNCATE all tables (children first) — MySQL backtick syntax
-    writeln!(
-        writer,
-        "-- Phase 1: TRUNCATE tables (children before parents)"
-    )?;
-    for &idx in &truncate_order {
-        let table_id = &plan.tables[idx];
-        writeln!(
-            writer,
-            "TRUNCATE TABLE {}.{};",
-            quote_ident(&plan.target_schema),
-            quote_ident(&table_id.name)
-        )?;
-    }
-    writeln!(writer)?;
-
-    // Phase 2: INSERT data (parents first)
-    writeln!(writer, "-- Phase 2: INSERT data (parents before children)")?;
-    for &idx in &insert_order {
-        let table_id = &plan.tables[idx];
+    // Export tables in the order provided (skip FK-based reordering for speed).
+    for (idx, table_id) in plan.tables.iter().enumerate() {
+        let t_table = std::time::Instant::now();
+        tracing::info!(
+            "[{}/{}] inspecting {}",
+            idx + 1,
+            plan.tables.len(),
+            table_id
+        );
         let source_table = inspect_canonical_table(conn, &plan.source_schema, &table_id.name)
             .await
             .with_context(|| format!("Failed to inspect table '{}'", table_id))?;
+        tracing::info!(
+            "[{}/{}] inspected in {}ms, exporting rows...",
+            idx + 1,
+            plan.tables.len(),
+            t_table.elapsed().as_millis()
+        );
         let mut target_table = source_table.clone();
         target_table.name = format!("{}.{}", plan.target_schema, &table_id.name);
 
@@ -198,6 +187,14 @@ async fn export_tables_data(
         )
         .await
         .with_context(|| format!("Failed to stream data for '{}'", table_id))?;
+        tracing::info!(
+            "[{}/{}] {} done: {} rows in {}ms",
+            idx + 1,
+            plan.tables.len(),
+            table_id,
+            row_count,
+            t_table.elapsed().as_millis()
+        );
 
         if row_count > 0 {
             writeln!(writer)?;
@@ -206,93 +203,6 @@ async fn export_tables_data(
     }
 
     Ok(total_rows)
-}
-
-/// Fetch foreign keys for a single table using the existing MySQL connection
-/// (works within an active transaction, unlike pool-based fetch_foreign_keys).
-async fn fetch_fks_inline(
-    conn: &mut MySqlConnection,
-    schema: &str,
-    table: &str,
-) -> Result<Vec<ForeignKey>> {
-    use std::collections::HashMap;
-
-    let rows = sqlx::query(
-        "SELECT rc.CONSTRAINT_NAME, \
-                kcu.COLUMN_NAME, \
-                kcu.REFERENCED_TABLE_NAME, \
-                kcu.REFERENCED_COLUMN_NAME, \
-                kcu.ORDINAL_POSITION \
-         FROM information_schema.REFERENTIAL_CONSTRAINTS rc \
-         JOIN information_schema.KEY_COLUMN_USAGE kcu \
-           ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA \
-          AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME \
-         WHERE rc.CONSTRAINT_SCHEMA = ? \
-           AND kcu.TABLE_NAME = ? \
-         ORDER BY rc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION",
-    )
-    .bind(schema)
-    .bind(table)
-    .fetch_all(&mut *conn)
-    .await
-    .context("Failed to query MySQL foreign keys")?;
-
-    #[derive(Default)]
-    struct FkAgg {
-        referenced_table: Option<String>,
-        columns: Vec<(u64, String)>,
-        referenced_columns: Vec<(u64, String)>,
-    }
-
-    let mut grouped: HashMap<String, FkAgg> = HashMap::new();
-    for row in rows {
-        let name: String = row.get("CONSTRAINT_NAME");
-        let seq: u64 = row.try_get::<u64, _>("ORDINAL_POSITION").unwrap_or(1);
-        let column: String = row.get("COLUMN_NAME");
-        let referenced_table: String = row.get("REFERENCED_TABLE_NAME");
-        let referenced_column: String = row.get("REFERENCED_COLUMN_NAME");
-
-        let agg = grouped.entry(name).or_default();
-        if agg.referenced_table.is_none() {
-            agg.referenced_table = Some(referenced_table);
-        }
-        agg.columns.push((seq, column));
-        agg.referenced_columns.push((seq, referenced_column));
-    }
-
-    let mut fks: Vec<ForeignKey> = grouped
-        .into_iter()
-        .map(|(name, mut agg)| {
-            agg.columns.sort_by_key(|(pos, _)| *pos);
-            agg.referenced_columns.sort_by_key(|(pos, _)| *pos);
-            ForeignKey {
-                name,
-                columns: agg.columns.into_iter().map(|(_, c)| c).collect(),
-                referenced_table: format!(
-                    "{}.{}",
-                    schema,
-                    agg.referenced_table.unwrap_or_default()
-                ),
-                referenced_columns: agg.referenced_columns.into_iter().map(|(_, c)| c).collect(),
-                delete_rule: None,
-                update_rule: None,
-            }
-        })
-        .collect();
-    fks.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(fks)
-}
-
-async fn begin_read_only_snapshot(conn: &mut MySqlConnection) -> Result<()> {
-    sqlx::query("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-        .execute(&mut *conn)
-        .await
-        .context("Failed to set MySQL transaction isolation level")?;
-    sqlx::query("START TRANSACTION READ ONLY WITH CONSISTENT SNAPSHOT")
-        .execute(&mut *conn)
-        .await
-        .context("Failed to start MySQL consistent snapshot transaction")?;
-    Ok(())
 }
 
 async fn inspect_canonical_table(
@@ -325,10 +235,9 @@ async fn inspect_canonical_table(
     let columns = column_rows
         .into_iter()
         .map(|row| {
-            let name = row.get::<String, _>("COLUMN_NAME");
-            let data_type = row.get::<String, _>("COLUMN_TYPE");
-            let nullable = row
-                .try_get::<String, _>("IS_NULLABLE")
+            let name = mysql_row_get_string(&row, "COLUMN_NAME");
+            let data_type = mysql_row_get_string(&row, "COLUMN_TYPE");
+            let nullable = mysql_row_try_get_string(&row, "IS_NULLABLE")
                 .map(|v| v.eq_ignore_ascii_case("YES"))
                 .unwrap_or(true);
 
@@ -361,7 +270,7 @@ async fn inspect_canonical_table(
 
     let primary_keys = pk_rows
         .into_iter()
-        .map(|row| row.get::<String, _>("COLUMN_NAME"))
+        .map(|row| mysql_row_get_string(&row, "COLUMN_NAME"))
         .collect::<Vec<_>>();
 
     Ok(CanonicalTable {
@@ -429,11 +338,13 @@ async fn export_table_rows_stream(
 }
 
 fn row_to_canonical(row: sqlx::mysql::MySqlRow, table: &CanonicalTable) -> Result<CanonicalRow> {
+    use sqlx::Row as _;
+
     let mut values = Vec::with_capacity(table.columns.len());
     for col in &table.columns {
         let raw: Option<String> = row
-            .try_get(col.name.as_str())
-            .with_context(|| format!("Failed to decode column '{}'", col.name))?;
+            .try_get::<Option<String>, _>(col.name.as_str())
+            .unwrap_or(None);
         values.push(parse_value(&col.logical_type, raw));
     }
     Ok(CanonicalRow { values })
@@ -512,6 +423,26 @@ fn ensure_identifier_not_empty(value: &str, kind: &str) -> Result<()> {
         kind
     );
     Ok(())
+}
+
+/// MySQL information_schema returns text columns as BLOB under the binary protocol.
+/// Try String first, fall back to Vec<u8> → String conversion.
+fn mysql_row_get_string(row: &sqlx::mysql::MySqlRow, col: &str) -> String {
+    row.try_get::<String, _>(col)
+        .or_else(|_| {
+            row.try_get::<Vec<u8>, _>(col)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        })
+        .unwrap_or_default()
+}
+
+fn mysql_row_try_get_string(row: &sqlx::mysql::MySqlRow, col: &str) -> Option<String> {
+    row.try_get::<String, _>(col)
+        .or_else(|_| {
+            row.try_get::<Vec<u8>, _>(col)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        })
+        .ok()
 }
 
 #[cfg(test)]

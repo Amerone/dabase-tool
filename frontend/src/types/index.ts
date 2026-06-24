@@ -29,6 +29,7 @@ export interface NamedConnectionResponse {
 }
 
 export interface Table {
+  schema?: string;
   name: string;
   comment?: string;
   row_count?: number;

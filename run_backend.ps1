@@ -1,3 +1,5 @@
+$repoRoot = $PSScriptRoot
+
 # Setup Visual Studio environment and run backend
 $vcvars = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
 $tempFile = [System.IO.Path]::GetTempFileName() + ".txt"
@@ -40,12 +42,15 @@ $msvcInc    = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\
 $env:INCLUDE = "$msvcInc;$sdkBase\ucrt;$sdkBase\um;$sdkBase\shared;$env:INCLUDE"
 Write-Host "INCLUDE = $env:INCLUDE"
 
-# Set DM8 driver path
-$env:DM8_DRIVER_PATH = "E:\self\tool-database\drivers\dm8\windows\dodbc.dll"
-$env:PATH = "E:\self\tool-database\drivers\dm8\windows;$env:PATH"
+# Set DM8 driver path. Do not set DM8_ODBC_DRIVER to a DLL path:
+# Windows ODBC Driver Manager resolves DM8 through the HKLM driver name.
+$driverDir = Join-Path $repoRoot "drivers\dm8\windows"
+$env:DM8_DRIVER_PATH = Join-Path $driverDir "dodbc.dll"
+$env:PATH = "$driverDir;$env:PATH"
+Remove-Item Env:\DM8_ODBC_DRIVER -ErrorAction SilentlyContinue
 
 # Ensure DM8 ODBC driver is registered in HKLM (Windows ODBC DM only reads HKLM)
-$driverName = "DM8 ODBC Driver"
+$driverName = "Amarone DM8 ODBC Driver"
 $hklmDriversPath = "HKLM:\SOFTWARE\ODBC\ODBCINST.INI\ODBC Drivers"
 $alreadyRegistered = $false
 try {
@@ -58,7 +63,7 @@ if (-not $alreadyRegistered) {
     Write-Host "Registering DM8 ODBC driver (UAC prompt may appear)..."
     $registerScript = "$PSScriptRoot\scripts\register_dm8_odbc.ps1"
     $proc = Start-Process powershell.exe `
-        -ArgumentList "-ExecutionPolicy Bypass -File `"$registerScript`" -DriverDll `"$env:DM8_DRIVER_PATH`"" `
+        -ArgumentList "-ExecutionPolicy Bypass -File `"$registerScript`" -DriverDll `"$env:DM8_DRIVER_PATH`" -DriverName `"$driverName`"" `
         -Verb RunAs -Wait -PassThru
     if ($proc.ExitCode -ne 0) {
         Write-Host "WARNING: ODBC driver registration failed. Run scripts\register_dm8_odbc.ps1 as Administrator."
@@ -66,5 +71,5 @@ if (-not $alreadyRegistered) {
 }
 
 # Run backend
-Set-Location "E:\self\tool-database\backend"
+Set-Location (Join-Path $repoRoot "backend")
 & cargo run

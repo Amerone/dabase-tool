@@ -10,6 +10,7 @@ import type {
   ExportResponse,
   NamedConnectionResponse,
   StoredConnectionResponse,
+  TableIdentifier,
   Table,
   TableDetails,
   TestConnectionResponse,
@@ -66,12 +67,34 @@ function normalizeTableName(tableName: string): string {
   return tableName.trim();
 }
 
-function makeTableDetailsCacheKey(configKey: string, tableName: string): string {
-  return `${configKey}|${normalizeTableName(tableName)}`;
+function normalizeTableRef(
+  table: string | TableIdentifier,
+  fallbackSchema: string
+): TableIdentifier {
+  if (typeof table === 'string') {
+    return {
+      schema: fallbackSchema,
+      name: normalizeTableName(table),
+    };
+  }
+
+  return {
+    schema: table.schema.trim() || fallbackSchema,
+    name: normalizeTableName(table.name),
+  };
+}
+
+function tableRefKey(table: TableIdentifier): string {
+  return `${table.schema.trim()}|${normalizeTableName(table.name)}`;
+}
+
+function makeTableDetailsCacheKey(configKey: string, schema: string, tableName: string): string {
+  return `${configKey}|${schema.trim()}|${normalizeTableName(tableName)}`;
 }
 
 function rememberTableDetails(
   configKey: string,
+  schema: string,
   tableName: string,
   details: TableDetails,
   combined?: Map<string, TableDetails>
@@ -81,25 +104,26 @@ function rememberTableDetails(
     return;
   }
 
-  tableDetailsCache.set(makeTableDetailsCacheKey(configKey, normalizedName), {
+  const normalizedSchema = schema.trim();
+  tableDetailsCache.set(makeTableDetailsCacheKey(configKey, normalizedSchema, normalizedName), {
     expiresAt: Date.now() + TABLE_DETAILS_TTL_MS,
     value: { success: true, data: details },
   });
-  combined?.set(normalizedName, details);
+  combined?.set(`${normalizedSchema}|${normalizedName}`, details);
 }
 
-function makeTableDetailsBatchInflightKey(configKey: string, tableNames: string[]): string {
-  const normalized = tableNames.map(normalizeTableName);
+function makeTableDetailsBatchInflightKey(configKey: string, tableRefs: TableIdentifier[]): string {
+  const normalized = tableRefs.map(tableRefKey);
   return `${configKey}|${normalized.join(',')}`;
 }
 
 function buildOrderedTableDetails(
-  requestedNames: string[],
+  requestedRefs: TableIdentifier[],
   byName: Map<string, TableDetails>
 ): TableDetails[] | null {
   const ordered: TableDetails[] = [];
-  for (const tableName of requestedNames) {
-    const details = byName.get(normalizeTableName(tableName));
+  for (const table of requestedRefs) {
+    const details = byName.get(tableRefKey(table));
     if (!details) {
       return null;
     }
@@ -292,17 +316,18 @@ export const listTables = async (
 
 export const getTableDetails = async (
   config: ConnectionConfig,
-  tableName: string,
+  table: string | TableIdentifier,
   options: FetchOptions = {}
 ): Promise<ApiResponse<TableDetails>> => {
   const normalizedConfig = normalizeConfig(config);
-  const normalizedTableName = tableName.trim();
+  const tableRef = normalizeTableRef(table, normalizedConfig.schema);
+  const normalizedTableName = tableRef.name.trim();
   if (!normalizedTableName) {
     return { success: false, error: 'Table name is required' };
   }
 
   const configKey = buildConnectionKey(normalizedConfig);
-  const cacheKey = makeTableDetailsCacheKey(configKey, normalizedTableName);
+  const cacheKey = makeTableDetailsCacheKey(configKey, tableRef.schema, normalizedTableName);
   const now = Date.now();
   const inflightKey = `${cacheKey}|refresh:${Boolean(options.forceRefresh)}`;
   const inflight = tableDetailsInflight.get(inflightKey);
@@ -322,7 +347,7 @@ export const getTableDetails = async (
       const api = await getApi();
       const payload = {
         ...normalizedConfig,
-        table_schema: normalizedConfig.schema,
+        table_schema: tableRef.schema,
         force_refresh: Boolean(options.forceRefresh),
       };
       const response = await api.post<ApiResponse<TableDetails>>(
@@ -349,31 +374,35 @@ export const getTableDetails = async (
   return request;
 };
 
-function normalizeTableNames(tableNames: string[]): string[] {
+function normalizeTableRefs(
+  tables: Array<string | TableIdentifier>,
+  fallbackSchema: string
+): TableIdentifier[] {
   const seen = new Set<string>();
-  const normalized: string[] = [];
-  for (const name of tableNames) {
-    const trimmed = name.trim();
-    if (!trimmed) {
+  const normalized: TableIdentifier[] = [];
+  for (const table of tables) {
+    const ref = normalizeTableRef(table, fallbackSchema);
+    if (!ref.name) {
       continue;
     }
-    if (seen.has(trimmed)) {
+    const key = tableRefKey(ref);
+    if (seen.has(key)) {
       continue;
     }
-    seen.add(trimmed);
-    normalized.push(trimmed);
+    seen.add(key);
+    normalized.push(ref);
   }
   return normalized;
 }
 
 export const getTableDetailsBatch = async (
   config: ConnectionConfig,
-  tableNames: string[],
+  tables: Array<string | TableIdentifier>,
   options: FetchOptions = {}
 ): Promise<ApiResponse<TableDetails[]>> => {
   const normalizedConfig = normalizeConfig(config);
-  const requestedNames = normalizeTableNames(tableNames);
-  if (requestedNames.length === 0) {
+  const requestedRefs = normalizeTableRefs(tables, normalizedConfig.schema);
+  if (requestedRefs.length === 0) {
     return { success: true, data: [] };
   }
 
@@ -383,21 +412,21 @@ export const getTableDetailsBatch = async (
   const missingNames: string[] = [];
 
   if (!options.forceRefresh) {
-    for (const tableName of requestedNames) {
-      const detailKey = makeTableDetailsCacheKey(configKey, tableName);
+    for (const table of requestedRefs) {
+      const detailKey = makeTableDetailsCacheKey(configKey, table.schema, table.name);
       const cached = tableDetailsCache.get(detailKey);
       if (cached && cached.expiresAt > now && cached.value.success && cached.value.data) {
-        fromCache.set(normalizeTableName(tableName), cached.value.data);
+        fromCache.set(tableRefKey(table), cached.value.data);
       } else {
-        missingNames.push(tableName);
+        missingNames.push(tableRefKey(table));
       }
     }
   } else {
-    missingNames.push(...requestedNames);
+    missingNames.push(...requestedRefs.map(tableRefKey));
   }
 
   if (missingNames.length === 0) {
-    const ordered = buildOrderedTableDetails(requestedNames, fromCache);
+    const ordered = buildOrderedTableDetails(requestedRefs, fromCache);
     if (ordered) {
       return { success: true, data: ordered };
     }
@@ -407,29 +436,30 @@ export const getTableDetailsBatch = async (
     };
   }
 
-  const batchKey = `${makeTableDetailsBatchInflightKey(configKey, requestedNames)}|refresh:${Boolean(options.forceRefresh)}`;
+  const missingRefs = requestedRefs.filter((table) => missingNames.includes(tableRefKey(table)));
+  const batchKey = `${makeTableDetailsBatchInflightKey(configKey, requestedRefs)}|refresh:${Boolean(options.forceRefresh)}`;
   const inflight = tableDetailsBatchInflight.get(batchKey);
   if (inflight) {
     return inflight;
   }
 
   const request = (async () => {
-    const fetchSingleDetails = async (names: string[], forceRefresh: boolean) => {
+    const fetchSingleDetails = async (refs: TableIdentifier[], forceRefresh: boolean) => {
       const byRequestedName = new Map<string, TableDetails>();
       let hasFailure = false;
       let nextIndex = 0;
-      const workerCount = Math.min(SINGLE_DETAIL_FALLBACK_CONCURRENCY, names.length);
+      const workerCount = Math.min(SINGLE_DETAIL_FALLBACK_CONCURRENCY, refs.length);
 
       await Promise.all(
         Array.from({ length: workerCount }, async () => {
-          while (nextIndex < names.length && !hasFailure) {
-            const tableName = names[nextIndex++];
-            const result = await getTableDetails(normalizedConfig, tableName, { forceRefresh });
+          while (nextIndex < refs.length && !hasFailure) {
+            const tableRef = refs[nextIndex++];
+            const result = await getTableDetails(normalizedConfig, tableRef, { forceRefresh });
             if (!result.success || !result.data) {
               hasFailure = true;
               return;
             }
-            byRequestedName.set(normalizeTableName(tableName), result.data);
+            byRequestedName.set(tableRefKey(tableRef), result.data);
           }
         })
       );
@@ -442,38 +472,47 @@ export const getTableDetailsBatch = async (
       const combined = new Map<string, TableDetails>(fromCache);
       let batchError: string | undefined;
 
-      for (const chunk of chunkArray(missingNames, TABLE_DETAILS_BATCH_SIZE)) {
-        const payload = {
-          ...normalizedConfig,
-          table_schema: normalizedConfig.schema,
-          tables: chunk,
-          force_refresh: Boolean(options.forceRefresh),
-        };
-        const response = await api.post<ApiResponse<TableDetails[]>>(
-          '/tables/details/batch',
-          payload
-        );
+      const refsBySchema = new Map<string, TableIdentifier[]>();
+      for (const table of missingRefs) {
+        const refs = refsBySchema.get(table.schema) ?? [];
+        refs.push(table);
+        refsBySchema.set(table.schema, refs);
+      }
 
-        if (response.data.success && response.data.data) {
-          const canAliasByOrder = response.data.data.length === chunk.length;
-          response.data.data.forEach((detail, index) => {
-            rememberTableDetails(configKey, detail.name, detail, combined);
+      for (const [schema, refs] of refsBySchema) {
+        for (const chunk of chunkArray(refs, TABLE_DETAILS_BATCH_SIZE)) {
+          const payload = {
+            ...normalizedConfig,
+            table_schema: schema,
+            tables: chunk.map((table) => table.name),
+            force_refresh: Boolean(options.forceRefresh),
+          };
+          const response = await api.post<ApiResponse<TableDetails[]>>(
+            '/tables/details/batch',
+            payload
+          );
 
-            const requestedName = canAliasByOrder ? chunk[index] : undefined;
-            if (
-              requestedName &&
-              normalizeTableName(requestedName) !== normalizeTableName(detail.name)
-            ) {
-              rememberTableDetails(configKey, requestedName, detail, combined);
-            }
-          });
-        } else {
-          batchError = response.data.error || batchError;
+          if (response.data.success && response.data.data) {
+            const canAliasByOrder = response.data.data.length === chunk.length;
+            response.data.data.forEach((detail, index) => {
+              rememberTableDetails(configKey, schema, detail.name, detail, combined);
+
+              const requestedName = canAliasByOrder ? chunk[index]?.name : undefined;
+              if (
+                requestedName &&
+                normalizeTableName(requestedName) !== normalizeTableName(detail.name)
+              ) {
+                rememberTableDetails(configKey, schema, requestedName, detail, combined);
+              }
+            });
+          } else {
+            batchError = response.data.error || batchError;
+          }
         }
       }
       enforceCacheLimit(tableDetailsCache);
 
-      const unresolved = requestedNames.filter((name) => !combined.has(normalizeTableName(name)));
+      const unresolved = requestedRefs.filter((table) => !combined.has(tableRefKey(table)));
       if (unresolved.length > 0) {
         // Preserve old behavior by falling back to per-table API when batch data is incomplete.
         const fallbackDetails = await fetchSingleDetails(unresolved, true);
@@ -488,7 +527,7 @@ export const getTableDetailsBatch = async (
         }
       }
 
-      const ordered = buildOrderedTableDetails(requestedNames, combined);
+      const ordered = buildOrderedTableDetails(requestedRefs, combined);
       if (!ordered) {
         return {
           success: false,
@@ -501,13 +540,13 @@ export const getTableDetailsBatch = async (
         data: ordered,
       };
     } catch (error) {
-      const fallbackDetails = await fetchSingleDetails(missingNames, Boolean(options.forceRefresh));
+      const fallbackDetails = await fetchSingleDetails(missingRefs, Boolean(options.forceRefresh));
       if (fallbackDetails) {
         const combined = new Map<string, TableDetails>(fromCache);
         for (const [requestedName, detail] of fallbackDetails) {
           combined.set(requestedName, detail);
         }
-        const ordered = buildOrderedTableDetails(requestedNames, combined);
+        const ordered = buildOrderedTableDetails(requestedRefs, combined);
         if (ordered) {
           return {
             success: true,

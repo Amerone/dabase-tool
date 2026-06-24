@@ -277,9 +277,25 @@ fn export_table_rows(
         let mut values = Vec::with_capacity(source_table.columns.len());
         let mut large_blobs: Vec<(usize, Vec<u8>)> = Vec::new();
 
-        for (col_index, logical_type) in logical_types.iter().enumerate() {
-            let raw: Option<String> = row.get::<_, Option<String>>(col_index).unwrap_or(None);
-            let val = parse_value(logical_type, raw);
+        for (col_index, (column, logical_type)) in source_table
+            .columns
+            .iter()
+            .zip(logical_types.iter())
+            .enumerate()
+        {
+            let raw: Option<String> =
+                row.get::<_, Option<String>>(col_index).with_context(|| {
+                    format!(
+                        "Failed to decode Shentong value for {}.{} column '{}'",
+                        source_schema, source_table.name, column.name
+                    )
+                })?;
+            let val = parse_value(logical_type, raw).with_context(|| {
+                format!(
+                    "Failed to parse Shentong value for {}.{} column '{}'",
+                    source_schema, source_table.name, column.name
+                )
+            })?;
             // Detect large binary values that need DBMS_LOB treatment
             if let CanonicalValue::Binary(ref bytes) = val {
                 if bytes.len() > SHENTONG_INLINE_BLOB_MAX_BYTES {
@@ -304,12 +320,14 @@ fn export_table_rows(
             }
             // Format non-blob values as SQL literals
             let formatted_values: Vec<String> = values.iter().map(shentong_format_value).collect();
+            let where_predicate = shentong_primary_key_predicate(target_table, &values);
             crate::dialect::write_shentong_lob_insert_block(
                 writer,
                 &target_ident,
                 &columns_str,
                 &formatted_values,
                 &large_blobs,
+                where_predicate.as_deref(),
             )?;
             total_rows += 1;
         } else {
@@ -339,38 +357,74 @@ fn export_table_rows(
     Ok(total_rows)
 }
 
-fn parse_value(logical_type: &LogicalType, raw: Option<String>) -> CanonicalValue {
+fn shentong_primary_key_predicate(
+    table: &crate::domain::canonical::CanonicalTable,
+    values: &[CanonicalValue],
+) -> Option<String> {
+    if table.primary_keys.is_empty() {
+        return None;
+    }
+
+    let mut predicates = Vec::with_capacity(table.primary_keys.len());
+    for pk in &table.primary_keys {
+        let column_index = table
+            .columns
+            .iter()
+            .position(|col| col.name.eq_ignore_ascii_case(pk))?;
+        let value = values.get(column_index)?;
+        if matches!(value, CanonicalValue::Null) {
+            return None;
+        }
+        predicates.push(format!(
+            "{} = {}",
+            shentong_quote_ident(pk),
+            shentong_format_value(value)
+        ));
+    }
+
+    Some(predicates.join(" AND "))
+}
+
+fn parse_value(logical_type: &LogicalType, raw: Option<String>) -> Result<CanonicalValue> {
     let Some(raw) = raw else {
-        return CanonicalValue::Null;
+        return Ok(CanonicalValue::Null);
     };
 
-    match logical_type {
+    Ok(match logical_type {
         LogicalType::Integer => raw
             .trim()
             .parse::<i64>()
             .map(CanonicalValue::Integer)
-            .unwrap_or_else(|_| CanonicalValue::Decimal(raw)),
+            .with_context(|| format!("Invalid Shentong integer literal '{}'", raw))?,
         LogicalType::Decimal => CanonicalValue::Decimal(raw),
         LogicalType::Float => raw
             .trim()
             .parse::<f64>()
             .map(CanonicalValue::Float)
-            .unwrap_or(CanonicalValue::Null),
+            .with_context(|| format!("Invalid Shentong float literal '{}'", raw))?,
         LogicalType::Boolean => {
             let normalized = raw.trim().to_ascii_lowercase();
-            let value = matches!(normalized.as_str(), "1" | "true" | "t" | "y" | "yes");
-            CanonicalValue::Boolean(value)
+            if matches!(normalized.as_str(), "1" | "true" | "t" | "y" | "yes") {
+                CanonicalValue::Boolean(true)
+            } else if matches!(normalized.as_str(), "0" | "false" | "f" | "n" | "no") {
+                CanonicalValue::Boolean(false)
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Invalid Shentong boolean literal '{}'",
+                    raw
+                ));
+            }
         }
         LogicalType::Binary => parse_hex_bytes(&raw)
             .map(CanonicalValue::Binary)
-            .unwrap_or_else(|| CanonicalValue::Binary(raw.into_bytes())),
+            .ok_or_else(|| anyhow::anyhow!("Invalid Shentong hex binary literal '{}'", raw))?,
         LogicalType::Date => CanonicalValue::Date(raw),
         LogicalType::DateTime => CanonicalValue::DateTime(raw),
         LogicalType::Json => CanonicalValue::Json(raw),
         LogicalType::String | LogicalType::Text | LogicalType::Unknown => {
             CanonicalValue::String(raw)
         }
-    }
+    })
 }
 
 fn parse_hex_bytes(raw: &str) -> Option<Vec<u8>> {
@@ -390,4 +444,29 @@ fn parse_hex_bytes(raw: &str) -> Option<Vec<u8>> {
 
 fn quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_value_rejects_invalid_literals() {
+        assert!(parse_value(&LogicalType::Integer, Some("abc".to_string())).is_err());
+        assert!(parse_value(&LogicalType::Float, Some("not-float".to_string())).is_err());
+        assert!(parse_value(&LogicalType::Boolean, Some("maybe".to_string())).is_err());
+        assert!(parse_value(&LogicalType::Binary, Some("ABC".to_string())).is_err());
+    }
+
+    #[test]
+    fn parse_value_preserves_null_and_text() {
+        assert_eq!(
+            parse_value(&LogicalType::Integer, None).unwrap(),
+            CanonicalValue::Null
+        );
+        assert_eq!(
+            parse_value(&LogicalType::String, Some("hello".to_string())).unwrap(),
+            CanonicalValue::String("hello".to_string())
+        );
+    }
 }

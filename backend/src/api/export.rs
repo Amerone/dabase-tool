@@ -130,6 +130,7 @@ pub async fn export_ddl(
         &target_schema,
         "ddl",
         &date_suffix,
+        req.identifier_case.as_deref(),
     ) {
         Ok(p) => p,
         Err(e) => return response::err(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -238,6 +239,7 @@ pub async fn export_data(
         &target_schema,
         "data",
         &date_suffix,
+        req.identifier_case.as_deref(),
     ) {
         Ok(p) => p,
         Err(e) => return response::err(StatusCode::INTERNAL_SERVER_ERROR, e),

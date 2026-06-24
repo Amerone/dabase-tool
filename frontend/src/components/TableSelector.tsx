@@ -6,6 +6,7 @@ import type { TableDetails } from '@/types';
 import { getTableDetailsBatch } from '@/services/api';
 import { useExportStore } from '@/store/useExportStore';
 import { buildConnectionKey } from '@/utils/connectionKey';
+import { parseTableKey, tableDisplayNameFromKey, tableFromKey, tableKey } from '@/utils/tableIdentity';
 import { SectionHeader } from './common/SectionHeader';
 import { TechCard } from './common/TechCard';
 
@@ -50,8 +51,8 @@ export default function TableSelector() {
   }, [config]);
 
   const summaryMap = useMemo(() => {
-    return new Map(tables.map((table) => [table.name, table]));
-  }, [tables]);
+    return new Map(tables.map((table) => [tableKey(table, config?.schema ?? ''), table]));
+  }, [config?.schema, tables]);
 
   const fetchDetailsBatch = async (tableNames: string[], force = false) => {
     if (!config) {
@@ -85,7 +86,11 @@ export default function TableSelector() {
     const requestConfigKey = configKey;
 
     try {
-      const response = await getTableDetailsBatch(config, pendingNames, { forceRefresh: force });
+      const response = await getTableDetailsBatch(
+        config,
+        pendingNames.map((key) => parseTableKey(key, config.schema)),
+        { forceRefresh: force }
+      );
       if (configKeyRef.current !== requestConfigKey) {
         return;
       }
@@ -199,13 +204,16 @@ export default function TableSelector() {
             const summary = summaryMap.get(tableName);
             const details = detailsMap[tableName];
             const loading = loadingMap[tableName];
+            const fallbackSchema = config?.schema ?? '';
+            const displayName = tableDisplayNameFromKey(tableName, fallbackSchema);
+            const table = tableFromKey(tableName, tables, fallbackSchema);
 
             return (
               <Panel
                 header={
                   <div className="selected-table-panel-header">
                     <span className="selected-table-name" title={tableName}>
-                      {tableName}
+                      {displayName}
                     </span>
                     <Space className="selected-table-actions" size={6}>
                       {summary && (
@@ -255,6 +263,11 @@ export default function TableSelector() {
 
                 {!loading && details && (
                   <div className="selected-table-metadata">
+                    {table?.schema && (
+                      <p>
+                        Schema: <span>{table.schema}</span>
+                      </p>
+                    )}
                     <p>
                       列数: <span>{details.columns.length}</span>
                     </p>

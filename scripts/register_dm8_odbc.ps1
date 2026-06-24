@@ -2,10 +2,12 @@
 # 以管理员身份运行，将 DM8 ODBC 驱动注册到 HKLM
 param(
     [Parameter(Mandatory=$true)]
-    [string]$DriverDll
+    [string]$DriverDll,
+
+    [string]$DriverName = "Amarone DM8 ODBC Driver"
 )
 
-$driverName = "DM8 ODBC Driver"
+$driverName = $DriverName
 
 try {
     # HKLM\SOFTWARE\ODBC\ODBCINST.INI\ODBC Drivers
